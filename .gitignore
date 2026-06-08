@@ -1,0 +1,64 @@
+# .gitignore
+
+# ── 依赖与构建产物 ──
+node_modules/
+dist/
+build/
+.next/
+out/
+release/
+pnpm-lock.yaml
+electron-builder.yml
+
+# ── 环境变量文件 ──
+.env
+.env.*
+!.env.example
+
+# ── 系统与临时文件 ──
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.log
+
+# ── IDE 与编辑器 ──
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── 构建/运行缓存 ──
+.minicodeide/
+.vite/
+.turbo/
+.npm/
+coverage/
+
+# ── 构建时下载的 VS Code 服务端资源 ──
+# Bundled code-server (downloaded at build time by scripts/stage-code-server.mjs)
+apps/electron/resources/code-server/
+
+# ── 防御性规则：禁止将 tsc 直接编译的产物提交到源码目录 ──
+# 原因：packages/*/src/index.ts 里写的是 `export * from './x.js'`（ESM 风格），
+# 如果有人误跑 `tsc`（不带 `--noEmit`），产出的旧 `.js` 会被 esbuild bundle 优先解析，
+# 覆盖最新的 `.ts` 源码，导致"No matching export"这类难查 bug。
+packages/*/src/**/*.js
+packages/*/src/**/*.js.map
+packages/*/src/**/*.d.ts
+packages/*/src/**/*.d.ts.map
+
+# ── Prisma 生成产物（编译生成，不用提交） ──
+src/generated/
+prisma/*.env
+prisma/migrations/.env
+
+# ── 文档 ──
+docs/
+doc-img/
+
+# ── 顶层数据库数据 ──
+# ⚠️ 注意：pg-data、redis-data 在 ai-bot-root，写在顶层 .gitignore，不要写子项目

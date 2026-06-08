@@ -1,0 +1,34 @@
+{
+  "name": "minicodeide",
+  "private": true,
+  "version": "0.0.1",
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "dev": "pnpm -r --parallel --filter=./apps/* --filter=./packages/* run dev",
+    "devapp": "pnpm --filter @mini/desktop run dev",
+    "devserver": "pnpm --filter @mini/server-node run dev",
+    "devserverexpress": "pnpm --filter @mini/server run dev",
+    "develectron": "pnpm --filter @mini/electron run dev",
+    "vscode": "bash scripts/start-opensvscode.sh",
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck",
+    "clean": "pnpm -r --if-present run clean && rm -rf apps/electron/release apps/electron/resources/server apps/electron/resources/renderer apps/server/release apps/server-node/dist apps/desktop/dist",
+    "cleanlinks": "node scripts/clean-dead-links.mjs",
+    "dist:clean": "node scripts/clean-dead-links.mjs --reinstall && pnpm dist",
+    "dist:macclean": "node scripts/clean-dead-links.mjs --reinstall && pnpm dist:mac",
+    "dist:mac:clean": "node scripts/clean-dead-links.mjs --reinstall && pnpm dist:mac:fast",
+    "dist:mac:fast:clean": "node scripts/clean-dead-links.mjs --reinstall && pnpm dist:mac:fast",
+    "evals": "pnpm --filter @mini/evals run eval",
+    "eval:quick": "pnpm --filter @mini/evals run eval --quick",
+    "dist": "pnpm --filter @mini/server-node build && pnpm --filter @mini/desktop build && pnpm --filter @mini/electron run dist",
+    "dist:mac": "pnpm --filter @mini/server-node build && pnpm --filter @mini/desktop build && pnpm --filter @mini/electron run dist:mac",
+    "dist:mac:fast": "pnpm --filter @mini/server-node build && pnpm --filter @mini/desktop build && pnpm --filter @mini/electron run dist:mac:fast",
+    "dist:win": "pnpm --filter @mini/server-node build && pnpm --filter @mini/desktop build && pnpm --filter @mini/electron run dist:win",
+    "dist:linux": "pnpm --filter @mini/server-node build && pnpm --filter @mini/desktop build && pnpm --filter @mini/electron run dist:linux",
+    "dist:express": "pnpm --filter @mini/server build && pnpm --filter @mini/desktop build && pnpm --filter @mini/electron run dist"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "tsx": "^4.7.0"
+  }
+}

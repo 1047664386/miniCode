@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "jsx": "react-jsx",
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true,
+    "allowSyntheticDefaultImports": true,
+    "baseUrl": ".",
+    "paths": {
+      "@mini/core": ["packages/core/src/index.ts"],
+      "@mini/core/*": ["packages/core/src/*"],
+      "@mini/indexer": ["packages/indexer/src/index.ts"],
+      "@mini/storage": ["packages/storage/src/index.ts"],
+      "@mini/storage/*": ["packages/storage/src/*"],
+      "@mini/sandbox": ["packages/sandbox/src/index.ts"]
+    }
+  }
+}

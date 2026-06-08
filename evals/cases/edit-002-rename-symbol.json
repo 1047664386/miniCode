@@ -1,0 +1,19 @@
+{
+  "id": "edit-002-rename-symbol",
+  "category": "edit",
+  "description": "重命名一个函数名 + 更新所有调用点",
+  "fixture": "fixture-tiny-ts",
+  "prompt": "把 src/util.ts 里的 `greet` 函数改名为 `sayHello`（保留参数和返回值），并同步更新 src/index.ts 里的调用。",
+  "expected": {
+    "filesTouched": ["src/util.ts", "src/index.ts"],
+    "toolsUsed": ["read_file", "edit_file"],
+    "verify": [
+      { "type": "fileContains", "path": "src/util.ts", "needle": "export function sayHello" },
+      { "type": "fileNotContains", "path": "src/util.ts", "needle": "function greet" },
+      { "type": "fileContains", "path": "src/index.ts", "needle": "sayHello(" },
+      { "type": "fileNotContains", "path": "src/index.ts", "needle": "greet(" }
+    ]
+  },
+  "maxSteps": 12,
+  "budgetTokens": 12000
+}

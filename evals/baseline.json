@@ -1,0 +1,5 @@
+{
+  "ts": "initial",
+  "_comment": "运行 `pnpm --filter @mini/evals eval -- --update-baseline` 把当前结果存为基线；之后每次跑 eval 都会自动 diff，token +20% 或 pass→fail 都算回归。",
+  "cases": []
+}

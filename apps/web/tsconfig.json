@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["vite/client"],
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "baseUrl": ".",
+    "paths": {
+      "@desktop/*": ["../desktop/src/*"],
+      "@mini/core": ["../../packages/core/src/index.ts"],
+      "@mini/core/*": ["../../packages/core/src/*"],
+      "@mini/storage": ["../../packages/storage/src/index.ts"]
+    }
+  },
+  "include": ["src/**/*", "../desktop/src/agents-window/**/*", "../desktop/src/hooks/**/*"]
+}

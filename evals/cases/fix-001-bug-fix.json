@@ -1,0 +1,18 @@
+
+{
+  "id": "fix-001-bug-fix",
+  "category": "fix",
+  "description": "修一个明显的 off-by-one bug",
+  "fixture": "fixture-bug-ts",
+  "prompt": "src/sum.ts 里的 sumArray 在求和时漏掉了最后一个元素，请修复。",
+  "expected": {
+    "filesTouched": ["src/sum.ts"],
+    "toolsUsed": ["read_file", "edit_file"],
+    "verify": [
+      { "type": "fileContains", "path": "src/sum.ts", "needle": "i < arr.length" },
+      { "type": "fileNotContains", "path": "src/sum.ts", "needle": "i < arr.length - 1" }
+    ]
+  },
+  "maxSteps": 8,
+  "budgetTokens": 8000
+}

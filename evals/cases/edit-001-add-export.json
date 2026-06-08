@@ -1,0 +1,17 @@
+{
+  "id": "edit-001-add-export",
+  "category": "edit",
+  "description": "在已有文件里追加一个导出函数",
+  "fixture": "fixture-tiny-ts",
+  "prompt": "请在 src/util.ts 末尾追加一个导出函数 `add(a: number, b: number): number`，返回两数之和。",
+  "expected": {
+    "filesTouched": ["src/util.ts"],
+    "toolsUsed": ["read_file", "edit_file"],
+    "verify": [
+      { "type": "fileContains", "path": "src/util.ts", "needle": "export function add" },
+      { "type": "fileContains", "path": "src/util.ts", "needle": "a + b" }
+    ]
+  },
+  "maxSteps": 8,
+  "budgetTokens": 8000
+}

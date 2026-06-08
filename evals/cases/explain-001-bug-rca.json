@@ -1,0 +1,30 @@
+{
+  "id": "explain-001-bug-rca",
+  "category": "explain",
+  "description": "解释 sumArray 中的 bug（用 llmJudge 评质量）",
+  "fixture": "fixture-bug-ts",
+  "prompt": "请阅读 src/sum.ts 中的 sumArray 函数，指出其中的 bug、解释 bug 的成因、并给出修复方案。不要直接修改文件。",
+  "expected": {
+    "toolsUsed": ["read_file"],
+    "toolsForbidden": ["edit_file", "write_file"],
+    "verify": [
+      {
+        "type": "llmJudge",
+        "question": "回答是否准确指出了 sumArray 的 off-by-one bug 并给出了正确修复方案？",
+        "expectedConcepts": [
+          "循环边界 arr.length - 1 导致最后一个元素未累加",
+          "应当改为 < arr.length 或 <= arr.length - 1",
+          "属于 off-by-one 错误"
+        ],
+        "passThreshold": 7
+      },
+      {
+        "type": "retrievalIncludes",
+        "pathPattern": "src/sum.ts",
+        "maxRank": 6
+      }
+    ]
+  },
+  "maxSteps": 6,
+  "budgetTokens": 6000
+}

@@ -1,0 +1,14 @@
+{
+  "id": "search-001-find-symbol",
+  "category": "search",
+  "description": "查询一个函数定义并准确返回其签名",
+  "fixture": "fixture-tiny-ts",
+  "prompt": "请告诉我 `greet` 函数定义在哪个文件、什么签名。",
+  "expected": {
+    "toolsUsed": ["find_symbol"],
+    "answerContains": ["src/util.ts", "greet"],
+    "filesTouched": []
+  },
+  "maxSteps": 6,
+  "budgetTokens": 6000
+}

@@ -1,0 +1,32 @@
+
+{
+  "name": "@mini/server-node",
+  "version": "0.0.1",
+  "type": "module",
+  "private": true,
+  "description": "Bare-Node implementation of mini server (gateway-style). No Express. No NestJS. Manual http+ws router. NOTE: shares pure-logic stores with @mini/server via relative imports (../server/src/*). Cleanup target: move shared modules to packages/server-core.",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/main.mjs",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@mini/core": "workspace:*",
+    "@mini/indexer": "workspace:*",
+    "tree-sitter": "^0.21.1",
+    "tree-sitter-javascript": "^0.23.1",
+    "tree-sitter-typescript": "^0.23.2",
+    "chokidar": "^5.0.0",
+    "ws": "^8.17.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/ws": "^8.5.10",
+    "esbuild": "^0.28.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.5"
+  }
+}

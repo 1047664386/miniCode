@@ -1,0 +1,25 @@
+{
+  "id": "memory-001-recall-pref",
+  "category": "memory",
+  "description": "用户偏好被 seed 到 memory 后，新对话应当召回该偏好",
+  "fixture": "fixture-tiny-ts",
+  "seedMemory": [
+    {
+      "scope": "user",
+      "title": "Always use 2-space indentation",
+      "content": "用户偏好 TypeScript 文件使用 2 空格缩进，禁止 tab。所有新建 / 修改的 .ts 文件都必须遵守。",
+      "category": "user_preference",
+      "keywords": ["indent", "indentation", "缩进", "style"],
+      "importance": 5
+    }
+  ],
+  "prompt": "请新建 src/format.ts 并写一个导出函数 format(n:number):string 返回 n.toString()，注意我的代码风格偏好。",
+  "expected": {
+    "memoryRecall": ["indentation"],
+    "verify": [
+      { "type": "fileContains", "path": "src/format.ts", "needle": "export function format" }
+    ]
+  },
+  "maxSteps": 8,
+  "budgetTokens": 10000
+}

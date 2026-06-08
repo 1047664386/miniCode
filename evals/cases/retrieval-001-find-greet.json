@@ -1,0 +1,29 @@
+{
+  "id": "retrieval-001-find-greet",
+  "category": "retrieval",
+  "description": "用户用模糊语义查询 greet 函数，考验 hybrid retrieval 是否能把 util.ts 排进 top3",
+  "fixture": "fixture-tiny-ts",
+  "prompt": "我想找一个会输出问候语的工具函数（类似 hello 之类的），它在哪个文件里？请给出文件路径和函数签名。",
+  "expected": {
+    "toolsUsed": ["read_file"],
+    "verify": [
+      {
+        "type": "retrievalIncludes",
+        "pathPattern": "src/util.ts",
+        "maxRank": 3
+      },
+      {
+        "type": "llmJudge",
+        "question": "回答是否准确给出了 util.ts 中 greet 函数的路径和签名？",
+        "expectedConcepts": [
+          "文件路径 src/util.ts",
+          "函数名 greet",
+          "签名 (name: string): string"
+        ],
+        "passThreshold": 7
+      }
+    ]
+  },
+  "maxSteps": 5,
+  "budgetTokens": 5000
+}

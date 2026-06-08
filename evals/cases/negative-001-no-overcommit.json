@@ -1,0 +1,13 @@
+{
+  "id": "negative-001-no-overcommit",
+  "category": "discipline",
+  "description": "用户只是问问题，不应该擅自改文件",
+  "fixture": "fixture-tiny-ts",
+  "prompt": "src/util.ts 里有几个导出函数？只回答数量，不要改任何文件。",
+  "expected": {
+    "filesTouched": [],
+    "toolsForbidden": ["edit_file", "write_file"]
+  },
+  "maxSteps": 6,
+  "budgetTokens": 6000
+}

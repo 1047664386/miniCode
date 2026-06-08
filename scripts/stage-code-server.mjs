@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * stage-code-server.mjs
  * ---------------------
@@ -147,8 +146,9 @@ function downloadOne(url, dest, onProgress) {
       .on('timeout', function () {
         this.destroy(new Error('request timeout'));
       });
+    };
+    fetchUrl(url);
   });
-  fetchUrl(url);
 }
 
 /**

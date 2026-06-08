@@ -39,8 +39,6 @@ export interface LLMRouterOpts {
   modelOverride?: string;
   /** 切换通知（用于 SSE 推前端） */
   onSwitch?: (info: RouterSwitchInfo) => void;
-  /** 网络/HTTP 错误判定（默认按状态码） */
-  isRetryable?: (err: unknown) => boolean;
 }
 
 export class LLMRouter implements LLMProvider {
@@ -194,16 +192,6 @@ function classifyError(e: unknown): RouterSwitchInfo['errorKind'] {
   if (/timeout|ETIMEDOUT|ESOCKETTIMEDOUT/i.test(s)) return 'timeout';
   if (/ECONNREFUSED|ENOTFOUND|ECONNRESET|fetch failed|network/i.test(s)) return 'network';
   return 'unknown';
-}
-
-function isCommonRetryable(e: unknown): boolean {
-  const s = stringifyError(e);
-  return (
-    /HTTP 5\d\d/.test(s) ||
-    /HTTP 429/.test(s) ||
-    /timeout/i.test(s) ||
-    /ECONNREFUSED|ENOTFOUND|ECONNRESET|fetch failed/i.test(s)
-  );
 }
 
 function stringifyError(e: unknown): string {

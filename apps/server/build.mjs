@@ -1,5 +1,4 @@
 
-#!/usr/bin/env node
 /**
  * build.mjs —— esbuild bundle for Express server (SINGLE-FILE 模式)
  * ---------------------------------------------------------------

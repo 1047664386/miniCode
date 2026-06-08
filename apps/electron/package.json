@@ -1,4 +1,3 @@
-
 {
   "name": "@mini/electron",
   "version": "0.0.1",
@@ -11,7 +10,7 @@
     "pack": "pnpm run build && electron-builder --dir",
     "dist": "pnpm run build && electron-builder",
     "dist:mac": "pnpm run build && electron-builder --mac",
-    "dist:mac:fast": "pnpm run build && electron-builder --mac zip --arm64",
+    "dist:mac:fast": "pnpm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac zip --arm64 && node ../../scripts/resign-mac-app.mjs",
     "dist:win": "pnpm run build && electron-builder --win",
     "dist:linux": "pnpm run build && electron-builder --linux"
   },
@@ -32,6 +31,7 @@
     "files": [
       "main.js",
       "preload.js",
+      "agents-window.js",
       "package.json"
     ],
     "extraResources": [

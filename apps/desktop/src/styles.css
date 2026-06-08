@@ -2248,6 +2248,31 @@ body,
   font-size: 11px;
 }
 
+/* ── Tool Result Image (read_image / screenshot __image) ── */
+.tool-image-result {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.tool-image-result__img {
+  max-width: 400px;
+  max-height: 300px;
+  border-radius: 6px;
+  border: 1px solid #3a3a4a;
+  cursor: pointer;
+}
+.tool-image-result__img:hover {
+  border-color: #6a6a8a;
+}
+.toolchain-result-img {
+  display: block;
+  max-width: 200px;
+  max-height: 150px;
+  border-radius: 4px;
+  margin-top: 4px;
+  border: 1px solid #3a3a4a;
+}
+
 /* ====== Folder Picker Modal (web mode) ====== */
 .fpm-backdrop {
   position: fixed;

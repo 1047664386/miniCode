@@ -279,11 +279,29 @@ function transformMessages(messages: ChatMessage[], useCache: boolean): any[] {
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
     if (m.role === 'user') {
-      const block: any = { type: 'text', text: m.content };
-      if (useCache && m.cacheHint === 'ephemeral') {
-        block.cache_control = { type: 'ephemeral' };
+      // 多模态：当 user message 携带 _multimodal（来自 buildMessages 的 images 字段）时，
+      // 直接使用 Anthropic 原生 content block 格式：[{type:'text',...}, {type:'image',...}]
+      const multimodal = (m as any)._multimodal as any[] | undefined;
+      if (multimodal) {
+        const blocks = multimodal.map((b: any) => {
+          if (b.type === 'text') {
+            const block: any = { type: 'text', text: b.text };
+            if (useCache && m.cacheHint === 'ephemeral') {
+              block.cache_control = { type: 'ephemeral' };
+            }
+            return block;
+          }
+          if (b.type === 'image') return { type: 'image', source: b.source };
+          return b;
+        });
+        out.push({ role: 'user', content: blocks });
+      } else {
+        const block: any = { type: 'text', text: m.content };
+        if (useCache && m.cacheHint === 'ephemeral') {
+          block.cache_control = { type: 'ephemeral' };
+        }
+        out.push({ role: 'user', content: [block] });
       }
-      out.push({ role: 'user', content: [block] });
     } else if (m.role === 'assistant') {
       const blocks: any[] = [];
       if (m.content) blocks.push({ type: 'text', text: m.content });

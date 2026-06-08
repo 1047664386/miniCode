@@ -28,12 +28,33 @@ export class OpenAICompatProvider implements LLMProvider {
     const body: Record<string, unknown> = {
       model: opts.model ?? this.opts.defaultModel ?? 'gpt-4o-mini',
       messages: messages.map((m) => {
+        // 多模态 content blocks 转换（_multimodal 来自 buildMessages 的 images 或 agent loop 的 __image）
+        const multimodal = (m as any)._multimodal as any[] | undefined;
+        let content: any;
+        if (multimodal) {
+          // 把内部 _multimodal 格式转成 OpenAI content 数组格式
+          content = multimodal.map((block: any) => {
+            if (block.type === 'text') return { type: 'text', text: block.text };
+            if (block.type === 'image' && block.source) {
+              return {
+                type: 'image_url',
+                image_url: {
+                  url: `data:${block.source.media_type};base64,${block.source.data}`,
+                  detail: 'auto',
+                },
+              };
+            }
+            return block;
+          });
+        } else if (useAnthropicCache && m.cacheHint === 'ephemeral') {
+          content = [{ type: 'text', text: m.content, cache_control: { type: 'ephemeral' } }];
+        } else {
+          content = m.content;
+        }
+
         const base: any = {
           role: m.role,
-          content:
-            useAnthropicCache && m.cacheHint === 'ephemeral'
-              ? [{ type: 'text', text: m.content, cache_control: { type: 'ephemeral' } }]
-              : m.content,
+          content,
           tool_calls: m.tool_calls?.map((t) => ({
             id: t.id,
             type: 'function',

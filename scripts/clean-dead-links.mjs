@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * clean-dead-links.mjs
  * --------------------

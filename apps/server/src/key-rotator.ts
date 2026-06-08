@@ -34,7 +34,7 @@ export class KeyRotator {
   private keys: KeyState[];
   private cursor = 0;
 
-  constructor(keys: string[]) {
+  constructor(private profileId: string, keys: string[]) {
     if (keys.length === 0) throw new Error('KeyRotator: at least 1 key required');
     this.keys = keys.map((k) => ({ key: k, cooldownUntil: 0, successCount: 0, failCount: 0 }));
   }
@@ -55,7 +55,7 @@ export class KeyRotator {
     }
     // 全冷却 → 算下一个能用的
     const nextAt = Math.min(...this.keys.map((k) => k.cooldownUntil));
-    throw new AllKeysCooldownError('unknown', Math.max(0, nextAt - now));
+    throw new AllKeysCooldownError(this.profileId, Math.max(0, nextAt - now));
   }
 
   markSuccess(key: string) {
@@ -119,7 +119,7 @@ export function getOrCreateRotator(profileId: string, keys: string[]): KeyRotato
   const sig = profileId + ':' + keys.length + ':' + keys.map((k) => k.slice(-4)).join(',');
   const cached = rotators.get(profileId);
   if (cached && (cached as any).__sig === sig) return cached;
-  const r = new KeyRotator(keys);
+  const r = new KeyRotator(profileId, keys);
   (r as any).__sig = sig;
   rotators.set(profileId, r);
   return r;

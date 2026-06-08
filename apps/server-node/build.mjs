@@ -1,5 +1,4 @@
 
-#!/usr/bin/env node
 /**
  * build.mjs —— esbuild single-file bundle for @mini/server-node
  * ---------------------------------------------------------------

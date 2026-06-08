@@ -1023,9 +1023,12 @@ export function registerHandlers(r: Router, s: Services) {
   r.post('/api/chat', async (c) => {
     const body = (await readBody(c.req, { limit: 10 * 1024 * 1024 })) ?? {};
     const { messages = [], userMessage: rawUserMessage,
-      mode = 'agent', sessionId: rawSessionId } = body as {
+      mode = 'agent', sessionId: rawSessionId,
+      images = [],
+    } = body as {
       messages: ChatMessage[]; userMessage: string;
       mode?: 'ask' | 'agent'; sessionId?: string;
+      images?: Array<{ type: 'image'; media_type: string; data: string }>;
     };
     const persistSession = rawSessionId && s.sessions.get(rawSessionId);
     const chatSessionId = rawSessionId ||
@@ -1110,6 +1113,7 @@ export function registerHandlers(r: Router, s: Services) {
       userMessage, history: messages, autoContext: autoCtx, explicitContext,
       memory: s.memory,
       meta: { cwd: s.workspace, os: `${os.platform()} ${os.release()}` },
+      images,
       systemExtras: [
         s.projectMemory.renderForSystem(),
         s.skills.renderForSystem(),

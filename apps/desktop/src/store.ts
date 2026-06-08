@@ -51,6 +51,8 @@ export interface ChatMsg {
   _toolArgs?: string;
   /** 思考计时（ms），由 frontend 计算填入 */
   _thinkingMs?: number;
+  /** tool_result 里的图片数据（来自 read_image / screenshot tool 的 __image 字段） */
+  _imageData?: { media_type: string; data: string };
 }
 
 interface State {
@@ -326,7 +328,7 @@ export const useStore = create<State>((set, get) => ({
   },
   async acceptPending(id) {
     await fetch(`/api/edits/${id}/accept`, { method: 'POST' });
-    // accept 后从磁盘重新拉一次最新内容
+    // accept 后从磁盘重新拉一次最新内容，并清除 diff/pendingEdit 状态
     const tab = get().tabs.find((t) => t.pendingEditId === id);
     if (tab) {
       const r = await fetch(`/api/file?path=${encodeURIComponent(tab.path)}`);
@@ -334,7 +336,7 @@ export const useStore = create<State>((set, get) => ({
       set((s) => ({
         tabs: s.tabs.map((t) =>
           t.pendingEditId === id
-            ? { path: t.path, content: data.content ?? '', dirty: false }
+            ? { path: t.path, content: data.content ?? '', dirty: false, diffOld: undefined, pendingEditId: undefined }
             : t,
         ),
       }));

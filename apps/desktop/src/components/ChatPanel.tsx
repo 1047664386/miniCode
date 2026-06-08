@@ -49,6 +49,23 @@ export function ChatPanel() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   /** push-announce 队列：子 Agent 完成的 announce message，跑完本 turn 自动续发 */
   const pendingAnnouncesRef = useRef<string[]>([]);
+  /** 追踪上一帧 running 状态，用于检测 true→false 跳变 */
+  const prevRunningRef = useRef<boolean>(false);
+
+  // Push-Announce 续接：running 从 true 变为 false 时，若有积压的 subagent announce，
+  // 合并成一条 user 消息自动续发（避免 finally 中 setTimeout 的竞态问题）
+  useEffect(() => {
+    if (prevRunningRef.current && !running && pendingAnnouncesRef.current.length > 0) {
+      const merged = pendingAnnouncesRef.current.join('\n\n');
+      pendingAnnouncesRef.current = [];
+      setInput(merged);
+      // 延迟一帧让 setInput 落地后再发
+      setTimeout(() => {
+        void send();
+      }, 0);
+    }
+    prevRunningRef.current = running;
+  }, [running]);
   /** 思考计时：第一个 tool_call 的时间戳，用于计算"思考中... Ns" */
   const thinkingSinceRef = useRef<number>(0);
   /** 当前 turn 的工具调用计数 */
@@ -193,8 +210,8 @@ export function ChatPanel() {
 
   const send = async () => {
     const text = input.trim();
-    const atts = composerAttachments;
-    const imgs = imageAttachments;
+    const atts = [...composerAttachments];
+    const imgs = [...imageAttachments];
     if ((!text && atts.length === 0 && imgs.length === 0) || running) return;
     setInput('');
     setImageAttachments([]);
@@ -247,10 +264,29 @@ export function ChatPanel() {
     }
 
     try {
+      // 构建 history：保留 tool_result 消息（让 LLM 知道上轮工具调用结果），
+      // 跳过纯 UI 标记消息（slash / rules / pending_edit / subagent 等）和 tool_call（前端渲染用）
       const history = useStore.getState().messages
         .slice(0, -1) // 不含本轮 user
-        .filter((m) => m.role !== 'tool') // 简化：第一版不回传 tool history
-        .map((m) => ({ role: m.role, content: m.content }));
+        .filter((m) => {
+          if (m.role !== 'tool') return true;
+          // 只保留有实质内容的 tool_result（排除 UI 标记类）
+          const toolRole = (m as any)._toolRole;
+          const toolName = (m as any)._toolName;
+          if (toolRole !== 'result') return false;
+          // 跳过纯 UI 反馈类消息（slash/rules/pending_edit/subagent）
+          const skipNames = new Set(['pending_edit', 'extended_thinking']);
+          if (skipNames.has(toolName)) return false;
+          return true;
+        })
+        .map((m) => {
+          if (m.role === 'tool') {
+            // 将 tool_result 转为 assistant 角色的摘要，让 LLM 理解这是工具输出
+            const toolName = (m as any)._toolName ?? 'tool';
+            return { role: 'assistant' as const, content: `[${toolName} result]: ${m.content.slice(0, 800)}` };
+          }
+          return { role: m.role, content: m.content };
+        });
 
       const resp = await fetch('/api/chat', {
         method: 'POST',
@@ -296,17 +332,7 @@ export function ChatPanel() {
       setRunning(false);
       // 若 Agent 改了文件，重新拉一下文件树
       loadTree('.');
-      // Push-Announce 续接：若刚才有子 Agent 完成的 announce，把它们合并成一条
-      // user 消息自动续发（zero-token 设计：父 Agent 视角等同收到 follow-up question）
-      if (pendingAnnouncesRef.current.length > 0) {
-        const merged = pendingAnnouncesRef.current.join('\n\n');
-        pendingAnnouncesRef.current = [];
-        setInput(merged);
-        // 用微任务延迟一次，让 setInput 落地后再发
-        setTimeout(() => {
-          void send();
-        }, 0);
-      }
+      // subagent announce 续发已移至 useEffect（避免竞态）
     }
   };
 
@@ -365,11 +391,14 @@ export function ChatPanel() {
         const summary = typeof ev.toolResult === 'string'
           ? ev.toolResult.slice(0, 300)
           : JSON.stringify(ev.toolResult).slice(0, 300);
+        // 多模态图片：tool_result 里的 __image 字段（来自 read_image / screenshot）
+        const imgData = (ev.toolResult as any)?.__image;
         pushMessage({
           role: 'tool',
           content: summary,
           _toolRole: 'result',
           _toolName: ev.toolCall?.name ?? 'unknown',
+          ...(imgData?.type === 'image' ? { _imageData: { media_type: imgData.media_type, data: imgData.data } } : {}),
         } as any);
         break;
       }
@@ -921,6 +950,7 @@ function ToolChainCard({
     result: string;
     status: 'running' | 'done';
     isThink?: boolean;
+    imageData?: { media_type: string; data: string };
   }> = [];
 
   for (const c of calls) {
@@ -935,11 +965,13 @@ function ToolChainCard({
   }
   for (const r of results) {
     const name = (r as any)._toolName ?? 'unknown';
+    const imgData = (r as any)._imageData;
     // 找到匹配的 call
     const callIdx = items.findIndex((it) => it.name === name && it.status === 'running');
     if (callIdx >= 0) {
       items[callIdx].result = r.content;
       items[callIdx].status = 'done';
+      if (imgData) items[callIdx].imageData = imgData;
     } else {
       items.push({
         name,
@@ -947,6 +979,7 @@ function ToolChainCard({
         args: '',
         result: r.content,
         status: 'done',
+        imageData: imgData,
       });
     }
   }
@@ -980,6 +1013,13 @@ function ToolChainCard({
               )}
               {it.status === 'done' && it.result && (
                 <span className="toolchain-result">{it.result.slice(0, 200)}</span>
+              )}
+              {it.imageData && (
+                <img
+                  className="toolchain-result-img"
+                  src={`data:${it.imageData.media_type};base64,${it.imageData.data}`}
+                  alt={it.label + ' image'}
+                />
               )}
             </div>
           ))}
@@ -1030,6 +1070,19 @@ function ToolChainItem({ m, i, messages, running }: { m: ChatMsg; i: number; mes
       return (
         <div className="pending-edit-card">
           <span className="msg-plain">{r.content}</span>
+        </div>
+      );
+    }
+    // 含图片的 tool_result（read_image / screenshot）
+    if (rAny._imageData) {
+      return (
+        <div className="tool-image-result">
+          <span className="msg-plain">{r.content}</span>
+          <img
+            className="tool-image-result__img"
+            src={`data:${rAny._imageData.media_type};base64,${rAny._imageData.data}`}
+            alt={(rAny._toolName ?? 'tool') + ' image'}
+          />
         </div>
       );
     }

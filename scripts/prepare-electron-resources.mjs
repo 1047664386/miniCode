@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * prepare-electron-resources.mjs
  * ------------------------------
@@ -176,10 +175,7 @@ function copyResources() {
 
   // 1. 复制后端服务 bundle（main.mjs 和 sourcemap）
   log('copying server bundle (main.mjs + sourcemap) → resources/server');
-  cpSync(
-    path.join(RESOURCES, 'server'),
-    { recursive: true }
-  );
+  mkdirSync(path.join(RESOURCES, 'server'), { recursive: true });
   cpSync(
     path.join(SERVER_DIST, 'main.mjs'),
     path.join(RESOURCES, 'server', 'main.mjs'),

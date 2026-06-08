@@ -34,8 +34,8 @@ const WRITE_CLASS_PROGRAMS = new Set([
   'npm', 'pnpm', 'yarn', 'pip', 'pip3', 'brew', 'apt', 'apt-get',
   // git 写操作（由 exec-policy 的 isGitReadOnly 判断）
   // 这里只标记 git 写类子命令 → 在 isGitWrite 里判断
-  // 编译/构建（会写 dist / out 目录）
-  'tsc', 'eslint', 'prettier', 'vitest', 'jest', 'mocha',
+  // 注：tsc/eslint/prettier/vitest/jest/mocha 是读/验证类工具，不在此列
+  // 它们在 read_only sandbox 下仍然可用（类型检查、lint、测试不修改文件）
 ]);
 
 /** git 只读子命令（read_only 下的放行名单） */

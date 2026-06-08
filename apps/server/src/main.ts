@@ -369,6 +369,10 @@ subagents.on('child_tool_result', (p) => {
   // 将 subagent tool_result 进度事件广播给所有 SSE 连接
   // 目前暂存到 pendingProgress，在 chat SSE 循环中 flush
   subagentProgressBuffer.push({ ...p, ts: Date.now() });
+  // 防止无 SSE 连接消费时无界增长，超过 200 条时丢弃最旧的
+  if (subagentProgressBuffer.length > 200) {
+    subagentProgressBuffer.splice(0, subagentProgressBuffer.length - 200);
+  }
 });
 
 /** 缓存 subagent 进度事件，供 chat SSE flush */
@@ -437,14 +441,6 @@ app.use(authMiddleware);
 // ----- Health / Metrics 端点（bypass auth）-----
 app.get('/health', (_req, res) => {
   res.json({ ok: true, ts: Date.now() });
-});
-app.get('/api/health', (_req, res) => {
-  res.json({
-    ok: true,
-    indexReady: !!index,
-    workspace: WORKSPACE,
-    ts: Date.now(),
-  });
 });
 app.get('/api/version', (_req, res) => {
   res.json({
@@ -810,6 +806,9 @@ app.get('/api/grep', async (req, res) => {
         if (globRe && !globRe.test(e.name)) continue;
         scanned++;
         try {
+          // 跳过大文件（> 1MB），避免 lock files / minified JS 拖慢搜索
+          const st = await fs.stat(full);
+          if (st.size > 1024 * 1024) continue;
           const text = await fs.readFile(full, 'utf-8');
           const lines = text.split('\n');
           for (let i = 0; i < lines.length; i++) {
@@ -1804,7 +1803,7 @@ app.post('/api/chat', async (req, res) => {
     mode?: 'ask' | 'agent' | 'plan';
     sessionId?: string;
     profileId?: string;
-    images?: Array<{ type: string; media_type: string; data: string }>;
+    images?: Array<{ type: 'image'; media_type: string; data: string }>;
   };
 
   // chatSessionId：用于 InjectionCache 跨轮去重的 key。
@@ -1969,6 +1968,8 @@ app.post('/api/chat', async (req, res) => {
     // 默认 workspace_write + on_failure；在 plan mode 下限制为 read_only
     sandbox: mode === 'plan' ? 'read_only' : 'workspace_write',
     approvalPolicy: 'on_failure',
+    // 前端粘贴的图片（多模态 content blocks）
+    images,
     systemExtras: [
       // Project Memory（AGENTS.md / CLAUDE.md / MEMORY.md，路径冒泡 + 用户级）
       // 放在最前：作为"项目作者写给所有 AI 的说明"，优先级最高

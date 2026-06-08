@@ -1,0 +1,59 @@
+{
+  "name": "minicodeide-bridge",
+  "displayName": "MiniCodeIDE Bridge",
+  "description": "Bridge between code-server (VSCode) and the MiniCodeIDE shell — sends selection / file to the MCI AI Composer, and exposes editor context.",
+  "version": "0.0.3",
+  "publisher": "minicodeide",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "activationEvents": [
+    "*",
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "mci.addToComposer",
+        "title": "Add Selection to MCI Composer",
+        "category": "MCI",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "mci.addFileToComposer",
+        "title": "Add File to MCI Composer",
+        "category": "MCI",
+        "icon": "$(add)"
+      },
+      {
+        "command": "mci.openAgents",
+        "title": "Open MCI Agents Window",
+        "category": "MCI",
+        "icon": "$(rocket)"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        { "command": "mci.addToComposer", "group": "1_modification@10", "when": "editorHasSelection" },
+        { "command": "mci.addFileToComposer", "group": "1_modification@11" }
+      ],
+      "editor/title": [
+        { "command": "mci.addFileToComposer", "group": "navigation@1" },
+        { "command": "mci.openAgents", "group": "navigation@2" }
+      ],
+      "explorer/context": [
+        { "command": "mci.addFileToComposer", "group": "navigation@10" }
+      ],
+      "commandPalette": [
+        { "command": "mci.addToComposer", "when": "true" },
+        { "command": "mci.addFileToComposer", "when": "true" },
+        { "command": "mci.openAgents", "when": "true" }
+      ]
+    },
+    "keybindings": [
+      { "command": "mci.addToComposer", "key": "cmd+l", "mac": "cmd+l", "when": "editorTextFocus" },
+      { "command": "mci.openAgents", "key": "cmd+shift+a", "mac": "cmd+shift+a" }
+    ]
+  }
+}

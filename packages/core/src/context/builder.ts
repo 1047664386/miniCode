@@ -19,6 +19,13 @@ import { compactHistory, type Summarizer } from './compactor.js';
 import { buildSystemPrompt, type AgentMode, type ProviderFlavor } from '../prompts/index.js';
 import type { SandboxMode, ApprovalPolicy } from '../prompts/index.js';
 
+// ---- 多模态图片附件 ----
+export interface ImageAttachment {
+  type: 'image';
+  media_type: string;  // e.g. 'image/png'
+  data: string;        // base64 (no data URL prefix)
+}
+
 // ---- ExplicitContextItem（@-mentions 解析结果） ----
 export interface ExplicitContextItem {
   type: 'file' | 'symbol' | 'docs' | 'web';
@@ -68,6 +75,8 @@ export interface BuildMessagesOptions {
   };
   /** Memory 召回回调 */
   onMemoryRecalled?: (items: MemoryItem[]) => void;
+  /** 前端粘贴/拖拽的图片（多模态 content blocks） */
+  images?: ImageAttachment[];
 }
 
 /**
@@ -95,6 +104,7 @@ export async function buildMessages(opts: BuildMessagesOptions): Promise<ChatMes
     sessionId,
     compaction,
     onMemoryRecalled,
+    images,
   } = opts;
 
   // ---- 1. 构建 system prompt ----
@@ -193,10 +203,22 @@ export async function buildMessages(opts: BuildMessagesOptions): Promise<ChatMes
   }
 
   // ---- 5. 拼接最终消息列表 ----
+  const userMsg: ChatMessage = { role: 'user', content: userMessage };
+  // 多模态图片：前端粘贴的图片 → _multimodal content blocks（provider 适配层负责转换格式）
+  if (images?.length) {
+    (userMsg as any)._multimodal = [
+      { type: 'text', text: userMessage },
+      ...images.map((img) => ({
+        type: 'image',
+        source: { type: 'base64', media_type: img.media_type, data: img.data },
+      })),
+    ];
+  }
+
   const messages: ChatMessage[] = [
     systemMsg,
     ...compactedHistory,
-    { role: 'user', content: userMessage },
+    userMsg,
   ];
 
   // 挂 debug 信息（上层通过 (initial as any).__compactDebug 读取）

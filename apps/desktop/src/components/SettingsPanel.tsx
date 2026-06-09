@@ -400,8 +400,17 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
   const setAdvancedSettings = useStore((s) => s.setAdvancedSettings);
 
   const refresh = async () => {
-    const r = await fetch('/api/providers');
-    setCfg(await r.json());
+    try {
+      const r = await fetch('/api/providers');
+      if (r.ok) {
+        setCfg(await r.json());
+      } else {
+        // cloud server 不支持 /api/providers → 仅显示高级设置 tab
+        setCfg({ profiles: [], active: {} });
+      }
+    } catch {
+      setCfg({ profiles: [], active: {} });
+    }
   };
 
   useEffect(() => {

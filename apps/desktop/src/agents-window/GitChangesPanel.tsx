@@ -44,6 +44,13 @@ export function GitChangesPanel() {
     setErr(null);
     try {
       const r = await fetch('/api/agents/git/status');
+      if (r.status === 404) {
+        // 路由不存在（本地 server 或 cloud server 未配置 git）
+        setIsRepo(false);
+        setChanges([]);
+        setErr(null); // 不显示错误，面板会显示"非 git 仓库"
+        return;
+      }
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const j = await r.json();
       setIsRepo(!!j.isRepo);
@@ -52,6 +59,8 @@ export function GitChangesPanel() {
       void refreshGitStatus();
     } catch (e: any) {
       setErr(e?.message ?? String(e));
+      setIsRepo(false);
+      setChanges([]);
     } finally {
       setLoading(false);
     }
@@ -63,8 +72,14 @@ export function GitChangesPanel() {
     setDiffLoading(true);
     try {
       const r = await fetch(`/api/agents/git/diff?path=${encodeURIComponent(p)}`);
+      if (!r.ok) {
+        setDiff(`(无法加载 diff: HTTP ${r.status})`);
+        return;
+      }
       const j = await r.json();
       setDiff(j?.diff ?? '');
+    } catch (e: any) {
+      setDiff(`(加载失败: ${e?.message ?? '未知错误'})`);
     } finally {
       setDiffLoading(false);
     }

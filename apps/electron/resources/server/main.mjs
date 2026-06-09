@@ -7951,6 +7951,57 @@ import { performance } from "node:perf_hooks";
 // src/services.ts
 import path24 from "node:path";
 
+// ../../packages/core/src/llm/types.ts
+var DEFAULT_FETCH_TIMEOUT_MS = 3e5;
+var DEFAULT_STREAM_IDLE_TIMEOUT_MS = 12e4;
+function combinedSignal(external, timeoutMs) {
+  if (!timeoutMs || !Number.isFinite(timeoutMs)) {
+    if (external) return external;
+    const ctrl = new AbortController();
+    return ctrl.signal;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`LLM fetch timeout after ${timeoutMs}ms`)), timeoutMs);
+  if (typeof timer.unref === "function") timer.unref();
+  if (external) {
+    if (external.aborted) {
+      clearTimeout(timer);
+      controller.abort(external.reason);
+      return controller.signal;
+    }
+    external.addEventListener("abort", () => {
+      clearTimeout(timer);
+      controller.abort(external.reason);
+    });
+  }
+  controller.signal.addEventListener("abort", () => clearTimeout(timer));
+  return controller.signal;
+}
+function readWithIdleTimeout(reader, idleMs) {
+  if (!idleMs || !Number.isFinite(idleMs)) {
+    return reader.read();
+  }
+  return new Promise((resolve3, reject) => {
+    let timer = setTimeout(() => {
+      timer = null;
+      reader.cancel().catch(() => {
+      });
+      reject(new Error(`Stream idle timeout: no data for ${idleMs}ms`));
+    }, idleMs);
+    if (typeof timer.unref === "function") timer.unref();
+    reader.read().then(
+      (result) => {
+        if (timer) clearTimeout(timer);
+        resolve3(result);
+      },
+      (err) => {
+        if (timer) clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
 // ../../packages/core/src/llm/openai.ts
 var OpenAICompatProvider = class {
   constructor(opts) {
@@ -8028,6 +8079,9 @@ var OpenAICompatProvider = class {
     };
     let body = buildBody(false);
     applyResponseFormat(body);
+    const fetchTimeout = opts.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
+    const idleTimeout = opts.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS;
+    const fetchSig = combinedSignal(opts.signal, fetchTimeout);
     let resp = await fetch(`${this.opts.baseURL.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       headers: {
@@ -8035,7 +8089,7 @@ var OpenAICompatProvider = class {
         "Content-Type": "application/json"
       },
       body: JSON.stringify(body),
-      signal: opts.signal
+      signal: fetchSig
     });
     if (resp.status === 400) {
       const errBody = await resp.text().catch(() => "");
@@ -8051,7 +8105,7 @@ var OpenAICompatProvider = class {
             "Content-Type": "application/json"
           },
           body: JSON.stringify(body),
-          signal: opts.signal
+          signal: fetchSig
         });
         if (resp.ok && resp.body) {
           yield { delta: "\n\n> \u26A0\uFE0F \u5F53\u524D\u6A21\u578B\u4E0D\u652F\u6301\u56FE\u7247\u8BC6\u522B\uFF0C\u5DF2\u81EA\u52A8\u5265\u79BB\u56FE\u7247\u7EE7\u7EED\u5BF9\u8BDD\u3002\u5982\u9700\u56FE\u7247\u8BC6\u522B\uFF0C\u8BF7\u5728\u6A21\u578B\u8BBE\u7F6E\u4E2D\u5207\u6362\u5230\u652F\u6301\u89C6\u89C9\u7684\u6A21\u578B\uFF08\u5982 qwen-vl-max\uFF09\u3002\n\n" };
@@ -8071,7 +8125,7 @@ var OpenAICompatProvider = class {
     const decoder = new TextDecoder("utf-8");
     let buf = "";
     while (true) {
-      const { value, done } = await reader.read();
+      const { value, done } = await readWithIdleTimeout(reader, idleTimeout);
       if (done) break;
       buf += decoder.decode(value, { stream: true });
       const lines = buf.split("\n");
@@ -8196,6 +8250,9 @@ var AnthropicProvider = class {
       body.tools = anthroTools;
     }
     const url = `${(this.opts.baseURL ?? "https://api.anthropic.com").replace(/\/$/, "")}/v1/messages`;
+    const fetchTimeout = opts.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
+    const idleTimeout = opts.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS;
+    const fetchSig = combinedSignal(opts.signal, fetchTimeout);
     const resp = await fetch(url, {
       method: "POST",
       headers: {
@@ -8208,7 +8265,7 @@ var AnthropicProvider = class {
         ...body._betaHeaders?.length ? { "anthropic-beta": body._betaHeaders.join(",") } : {}
       },
       body: JSON.stringify(body),
-      signal: opts.signal
+      signal: fetchSig
     });
     if (!resp.ok || !resp.body) {
       const text = await resp.text().catch(() => "");
@@ -8222,7 +8279,7 @@ var AnthropicProvider = class {
     let usageCachedRead = 0;
     let usageCompletion = 0;
     while (true) {
-      const { value, done } = await reader.read();
+      const { value, done } = await readWithIdleTimeout(reader, idleTimeout);
       if (done) break;
       buf += decoder.decode(value, { stream: true });
       const events = buf.split(/\n\n/);
@@ -8927,7 +8984,8 @@ async function* runAgent(opts) {
     hooks,
     workspace,
     disableSoftCompact,
-    toolDescSubstitutions
+    toolDescSubstitutions,
+    llmTimeout
   } = opts;
   const tools = registry.toLLMSchemas(toolDescSubstitutions);
   const recentSigs = [];
@@ -8943,7 +9001,7 @@ async function* runAgent(opts) {
       });
       if (r.block) {
         yield { type: "error", error: `[hook-block] ${r.blockReason ?? "blocked"}` };
-        yield { type: "done" };
+        yield { type: "done", reason: "hook_block" };
         return;
       }
       if (r.injectSystem) {
@@ -8968,7 +9026,7 @@ async function* runAgent(opts) {
     let llmCallOk = false;
     while (!llmCallOk) {
       try {
-        stream = llm.chatStream(messages, { tools, model, signal });
+        stream = llm.chatStream(messages, { tools, model, signal, ...llmTimeout });
         const it = stream[Symbol.asyncIterator]();
         const first = await it.next();
         stream = (async function* () {
@@ -8986,6 +9044,7 @@ async function* runAgent(opts) {
           const action = decideOverflowAction(recovery);
           if (action.kind === "fatal") {
             yield { type: "error", error: `[fatal] ${action.reason}` };
+            yield { type: "done", reason: "fatal", step };
             return;
           }
           const before = messages.length;
@@ -9001,6 +9060,7 @@ async function* runAgent(opts) {
           const action = decideBackoffAction(recovery, cls);
           if (action.kind === "fatal") {
             yield { type: "error", error: `[fatal] ${action.reason}` };
+            yield { type: "done", reason: "fatal", step };
             return;
           }
           if (action.kind === "backoff") {
@@ -9038,6 +9098,7 @@ async function* runAgent(opts) {
       }
     } catch (e) {
       yield { type: "error", error: `[stream-error] ${e?.message ?? e}` };
+      yield { type: "done", reason: "stream_error", step };
       return;
     }
     const toolCalls = Object.values(toolBuffers).filter((b) => b.name).map((b, idx) => ({
@@ -9069,7 +9130,7 @@ async function* runAgent(opts) {
         messages.push(assistantMsg);
         yield { type: "error", error: `[fatal] ${action.reason}` };
         await maybeStop(hooks, "error", step, messages);
-        yield { type: "done" };
+        yield { type: "done", reason: "fatal", step };
         return;
       }
     }
@@ -9082,7 +9143,7 @@ async function* runAgent(opts) {
           continue;
         }
       }
-      yield { type: "done" };
+      yield { type: "done", reason: "completed", step };
       return;
     }
     const sig = toolCalls.map((c) => `${c.name}::${stableStringify(c.arguments)}`).sort().join("|");
@@ -9231,7 +9292,13 @@ If you need the full content, call read_file with path="${rel}".`;
       yield { type: "error", error: "[max-steps] reached but Stop hook requested forceContinue (ignored to prevent runaway)." };
     }
   }
-  yield { type: "done" };
+  yield {
+    type: "text",
+    text: `
+
+\u26A0\uFE0F \u5DF2\u8FBE\u5230\u6700\u5927\u6B65\u9AA4\u6570 (${maxSteps})\uFF0C\u6267\u884C\u6682\u505C\u3002\u5982\u9700\u7EE7\u7EED\uFF0C\u8BF7\u518D\u6B21\u53D1\u9001\u6D88\u606F\u3002`
+  };
+  yield { type: "done", reason: "max_steps", step: maxSteps };
 }
 async function maybeStop(hooks, reason, step, messages) {
   if (!hooks) return;
@@ -19156,7 +19223,8 @@ ${it.partialAssistant.slice(-2e3)}
       userMessage: rawUserMessage,
       mode = "agent",
       sessionId: rawSessionId,
-      images = []
+      images = [],
+      timeout: clientTimeout
     } = body;
     const persistSession = rawSessionId && s.sessions.get(rawSessionId);
     const chatSessionId = rawSessionId || `anon:${c.req.headers["x-forwarded-for"] ?? c.req.socket.remoteAddress ?? "local"}`;
@@ -19194,6 +19262,7 @@ ${it.partialAssistant.slice(-2e3)}
     }
     let assistantBuf = "";
     let userAbort = false;
+    let agentDoneReason = "completed";
     const autoCtx = s.index ? (await hybridRetrieve(s.index, s.embedder, userMessage, 6, s.reranker)).map((h) => ({
       file: `${h.path}:${h.startLine}-${h.endLine}`,
       text: h.text
@@ -19268,13 +19337,15 @@ ${it.partialAssistant.slice(-2e3)}
           messages: initial,
           toolCtx: { cwd: s.workspace },
           signal: abort.signal,
-          maxSteps: 1
+          maxSteps: 1,
+          llmTimeout: clientTimeout
         })) {
           if (ev.type === "text" && ev.text) {
             assistantBuf += ev.text;
             if (persistSession && currentTurnId)
               s.sessions.appendChunk(rawSessionId, currentTurnId, ev.text).catch(() => void 0);
           }
+          if (ev.type === "done" && ev.reason) agentDoneReason = ev.reason;
           sse.send(ev);
         }
       } else {
@@ -19336,6 +19407,7 @@ ${it.partialAssistant.slice(-2e3)}
             }
           },
           signal: abort.signal,
+          llmTimeout: clientTimeout,
           toolDescSubstitutions: {
             roles: (() => {
               const names = s.subagents.getProfileNames();
@@ -19369,10 +19441,12 @@ ${it.partialAssistant.slice(-2e3)}
                 s.recentActivity.record(chatSessionId, { kind: "search", target: args.regex });
             }
           }
+          if (ev.type === "done" && ev.reason) agentDoneReason = ev.reason;
           sse.send(ev);
         }
       }
     } catch (e) {
+      agentDoneReason = "error";
       sse.send({ type: "error", error: e?.message ?? String(e) });
       if (persistSession && currentTurnId)
         await s.sessions.interruptTurn(rawSessionId, currentTurnId, e?.message ?? String(e)).catch(() => void 0);
@@ -19408,7 +19482,7 @@ ${it.partialAssistant.slice(-2e3)}
           }
         }).catch(() => void 0);
       }
-      sse.send({ type: "done" });
+      sse.send({ type: "done", reason: userAbort ? "aborted" : agentDoneReason });
       sse.end();
     }
   });

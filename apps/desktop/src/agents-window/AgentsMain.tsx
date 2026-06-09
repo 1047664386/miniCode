@@ -1,9 +1,11 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { useAgentsStore } from './store';
+import { sessionFetch } from '../store';
 import { ModeToggle } from './ModeToggle';
 import { WorkspacePicker } from './WorkspacePicker';
 import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
+import { MentionTag, parseMentions } from '../components/MentionTag';
 
 interface ChatMsg {
   role: 'user' | 'assistant';
@@ -80,6 +82,17 @@ export function AgentsMain() {
   const [skillFilter, setSkillFilter] = useState('');
   const [skillIndex, setSkillIndex] = useState(0);
 
+  /** 安全更新最后一条消息；若数组为空则忽略 */
+  function patchLastMessage(updater: (last: ChatMsg) => ChatMsg) {
+    setMessages((m) => {
+      const c = [...m];
+      const last = c[c.length - 1];
+      if (!last) return m;
+      c[c.length - 1] = updater(last);
+      return c;
+    });
+  }
+
   const abortRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -117,7 +130,7 @@ export function AgentsMain() {
       return;
     }
     let cancelled = false;
-    void fetch(`/api/sessions/${activeId}`)
+    void sessionFetch(`/api/sessions/${activeId}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((j) => {
         if (cancelled || !j) return;
@@ -167,6 +180,23 @@ export function AgentsMain() {
     e.preventDefault();
     setDragHover(false);
     if (e.dataTransfer.files?.length) void processFiles(e.dataTransfer.files);
+  }
+
+  function handlePaste(e: React.ClipboardEvent) {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    const imageFiles: File[] = [];
+    for (const item of Array.from(items)) {
+      if (item.kind === 'file' && item.type.startsWith('image/')) {
+        const file = item.getAsFile();
+        if (file) imageFiles.push(file);
+      }
+    }
+    if (imageFiles.length > 0) {
+      e.preventDefault(); // 阻止默认粘贴行为（避免在 textarea 里插入乱码）
+      void processFiles(imageFiles as any);
+    }
+    // 纯文本粘贴不拦截，走默认行为
   }
 
   // ----- Skill popover 控制 -----
@@ -223,12 +253,21 @@ export function AgentsMain() {
 
     let sid = activeId;
     if (!sid) {
-      const meta = await createSession();
-      sid = meta.id;
+      try {
+        const meta = await createSession();
+        sid = meta.id;
+      } catch (e: any) {
+        setMessages((m) => [
+          ...m,
+          { role: 'assistant', content: `⚠️ 创建会话失败: ${e?.message ?? '未知错误'}，请重试。`, ts: Date.now() },
+        ]);
+        return;
+      }
     }
 
     // 把附件拼接到用户消息（V1：作为 markdown 引用块附在末尾）
     let composed = text;
+    const imagePayload: Array<{ type: 'image'; media_type: string; data: string }> = [];
     for (const a of allAtts) {
       if (a.text) {
         let head: string;
@@ -242,6 +281,11 @@ export function AgentsMain() {
         composed += `\n\n---\n${head}\n\`\`\`\n${a.text.slice(0, 8000)}\n\`\`\``;
       } else if (a.dataUrl) {
         composed += `\n\n---\n🖼️ **${a.name}** (${(a.size / 1024).toFixed(1)} KB)`;
+        // 提取 base64 数据作为多模态图片传给 LLM
+        const match = a.dataUrl.match(/^data:(image\/[^;]+);base64,(.+)$/);
+        if (match) {
+          imagePayload.push({ type: 'image', media_type: match[1], data: match[2] });
+        }
       }
     }
 
@@ -259,25 +303,23 @@ export function AgentsMain() {
 
     const ac = new AbortController();
     abortRef.current = ac;
+    let receivedDone = false;
 
     try {
-      const r = await fetch('/api/chat', {
+      const r = await sessionFetch('/api/chat', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           sessionId: sid,
           userMessage: composed,
-          mode: mode === 'work' ? 'ask' : 'agent',
+          mode: mode === 'agent' ? 'code' : mode === 'ask' ? 'work' : 'plan', // 映射到后端 SessionMode
           messages: messages.map((m) => ({ role: m.role, content: m.content })),
+          ...(imagePayload.length > 0 ? { images: imagePayload } : {}),
         }),
         signal: ac.signal,
       });
       if (!r.ok || !r.body) {
-        setMessages((m) => {
-          const c = [...m];
-          c[c.length - 1] = { ...c[c.length - 1], content: `[error] HTTP ${r.status}` };
-          return c;
-        });
+        patchLastMessage((last) => ({ ...last, content: `⚠️ 请求失败 (HTTP ${r.status})，请检查网络或重新发送。` }));
         return;
       }
       const reader = r.body.getReader();
@@ -304,31 +346,28 @@ export function AgentsMain() {
             if (data.type === 'text' || evType === 'text') {
               const delta: string = data.text ?? data.delta ?? '';
               if (delta) {
-                setMessages((m) => {
-                  const c = [...m];
-                  const last = c[c.length - 1];
-                  c[c.length - 1] = { ...last, content: last.content + delta };
-                  return c;
-                });
+                patchLastMessage((last) => ({ ...last, content: last.content + delta }));
               }
+            } else if (evType === 'done' || data.type === 'done') {
+              receivedDone = true;
+              // 非正常结束 → 给用户提示
+              if (data.reason === 'stream_error' || data.reason === 'fatal') {
+                patchLastMessage((last) => ({ ...last, content: (last.content || '') + '\n\n⚠️ 回答因错误中断，请重新发送。' }));
+              } else if (data.reason === 'max_steps') {
+                patchLastMessage((last) => ({ ...last, content: (last.content || '') + '\n\n⚠️ 已达到最大步骤数，执行暂停。' }));
+              }
+            } else if (evType === 'error' || data.type === 'error') {
+              patchLastMessage((last) => ({ ...last, content: (last.content || '') + `\n\n⚠️ ${data.message ?? '发生错误'}` }));
             } else if (evType === 'tool_call') {
               // AI 调用某个工具，追加 pending 卡片
-              setMessages((m) => {
-                const c = [...m];
-                const last = c[c.length - 1];
+              patchLastMessage((last) => {
                 const events = last.toolEvents ?? [];
                 const id = `${data.name}-${Date.now()}-${events.length}`;
-                c[c.length - 1] = {
-                  ...last,
-                  toolEvents: [...events, { id, name: data.name, args: data.args, status: 'pending' }],
-                };
-                return c;
+                return { ...last, toolEvents: [...events, { id, name: data.name, args: data.args, status: 'pending' }] };
               });
             } else if (evType === 'tool_result') {
               // 把最后一个 pending 工具卡标记为 done/error
-              setMessages((m) => {
-                const c = [...m];
-                const last = c[c.length - 1];
+              patchLastMessage((last) => {
                 const events = (last.toolEvents ?? []).slice();
                 for (let k = events.length - 1; k >= 0; k--) {
                   if (events[k].status === 'pending') {
@@ -338,15 +377,13 @@ export function AgentsMain() {
                       ok: data.ok !== false,
                       summary: data.summary,
                     };
-                    // AI 写过文件 / 跑过命令 → 沙箱视为脏，触发 beforeunload 提示
                     if (data.ok !== false && /^(write_file|run_command|edit_file|create_file|delete_file)$/.test(events[k].name)) {
                       useAgentsStore.getState().setSandboxDirty(true);
                     }
                     break;
                   }
                 }
-                c[c.length - 1] = { ...last, toolEvents: events };
-                return c;
+                return { ...last, toolEvents: events };
               });
             }
           } catch {
@@ -354,8 +391,19 @@ export function AgentsMain() {
           }
         }
       }
+      // 连接断开检测：SSE 流结束但没收到 done 事件
+      if (!receivedDone) {
+        patchLastMessage((last) =>
+          last.content
+            ? { ...last, content: last.content + '\n\n⚠️ 连接已断开，回答可能不完整。请检查网络后重新发送。' }
+            : last
+        );
+      }
     } catch (e: any) {
-      if (e?.name !== 'AbortError') console.error('chat error', e);
+      if (e?.name !== 'AbortError') {
+        console.error('chat error', e);
+        patchLastMessage((last) => ({ ...last, content: `⚠️ 连接失败: ${e?.message ?? '未知错误'}。请检查网络后重试。` }));
+      }
     } finally {
       setStreaming(false);
       abortRef.current = null;
@@ -388,7 +436,7 @@ export function AgentsMain() {
       onDrop={handleDrop}
     >
       <div className="agents-breadcrumb">
-        {mode === 'code' && workspace ? <span>📁 {workspace.split('/').pop()} / </span> : null}
+        {mode !== 'ask' && workspace ? <span>📁 {workspace.split('/').pop()} / </span> : null}
         <span>{messages.find((m) => m.role === 'user')?.content?.slice(0, 50) ?? '新对话'}</span>
       </div>
 
@@ -396,41 +444,74 @@ export function AgentsMain() {
         {messages.length === 0 ? (
           <div className="agents-hero">
             <div className="agents-hero-title">
-              {mode === 'work' ? 'Chat' : 'Coding'} With <span className="hero-badge">[ ✦ ]</span> MyWorker
+              {mode === 'ask' ? 'Ask' : mode === 'plan' ? 'Plan' : 'Agent'} With <span className="hero-badge">▣</span> MyWorker
             </div>
             <div className="agents-hero-sub">
-              {mode === 'work'
-                ? '通用对话 · 不绑定仓库'
-                : `编码模式 · 当前仓库 ${workspace?.split('/').pop() ?? '未设置'}`}
+              {mode === 'ask'
+                ? '问答模式 · 不绑定仓库'
+                : mode === 'plan'
+                  ? '规划模式 · 制定执行计划'
+                  : `智能体模式 · 当前仓库 ${workspace?.split('/').pop() ?? '未设置'}`}
               <span className="agents-hero-tip"> · 拖拽文件上传 · 输入 / 唤起技能 · 🎤 语音输入</span>
             </div>
           </div>
         ) : (
-          messages.map((m, i) => (
-            <div key={i} className={`agents-msg agents-msg-${m.role}`}>
-              <div className="agents-msg-role">{m.role === 'user' ? '你' : 'Assistant'}</div>
-              <div className="agents-msg-content">
-                {m.attachments?.filter((a) => a.dataUrl).map((a, j) => (
-                  <img key={j} src={a.dataUrl} alt={a.name} className="agents-msg-img" />
-                ))}
-                {m.toolEvents && m.toolEvents.length > 0 && (
-                  <div className="agents-tool-events">
-                    {m.toolEvents.map((te) => (
-                      <ToolEventBubble key={te.id} ev={te} />
-                    ))}
-                  </div>
-                )}
-                <RichText text={m.content || (streaming && i === messages.length - 1 ? '…' : '')} />
+          messages.map((m, i) => {
+            // 解析 @file / @selection 等提及
+            const { mentions, cleanText } = parseMentions(m.content || '');
+            const displayText = cleanText || m.content || '';
+            return (
+              <div key={i} className={`agents-msg agents-msg-${m.role}`}>
+                <div className="agents-msg-role">{m.role === 'user' ? '你' : 'Assistant'}</div>
+                <div className="agents-msg-content">
+                  {/* 图片附件 */}
+                  {m.attachments?.filter((a) => a.dataUrl).map((a, j) => (
+                    <img key={j} src={a.dataUrl} alt={a.name} className="agents-msg-img" />
+                  ))}
+                  {/* 文件提及标签 */}
+                  {mentions.length > 0 && (
+                    <div className="agents-msg-mentions">
+                      {mentions.map((mt, idx) => (
+                        <MentionTag
+                          key={idx}
+                          kind={mt.kind}
+                          label={mt.label}
+                          path={mt.path}
+                          line1={mt.line1}
+                          line2={mt.line2}
+                          onOpen={(p) => {
+                            const ws = useAgentsStore.getState().workspaceRoot;
+                            if (ws) useAgentsStore.getState().openFile(p);
+                          }}
+                        />
+                      ))}
+                    </div>
+                  )}
+                  {/* 非图片附件（文件引用 chip） */}
+                  {m.attachments?.filter((a) => !a.dataUrl && a.wsPath).map((a, j) => (
+                    <span key={`file-${j}`} className="agents-msg-file-chip" title={a.wsPath}>
+                      📄 {a.wsPath}{a.line1 ? `:L${a.line1}-${a.line2}` : ''}
+                    </span>
+                  ))}
+                  {m.toolEvents && m.toolEvents.length > 0 && (
+                    <div className="agents-tool-events">
+                      {m.toolEvents.map((te) => (
+                        <ToolEventBubble key={te.id} ev={te} />
+                      ))}
+                    </div>
+                  )}
+                  <RichText text={displayText || (streaming && i === messages.length - 1 ? '…' : '')} />
+                </div>
               </div>
-            </div>
-          ))
+            );
+          })
         )}
       </div>
 
       <div className="agents-composer">
         <div className="agents-composer-top">
           <ModeToggle />
-          {mode === 'code' && <WorkspacePicker />}
+          {mode !== 'ask' && <WorkspacePicker />}
         </div>
 
         {/* 附件预览：本地拖拽/上传 + 工作区文件 */}
@@ -501,10 +582,11 @@ export function AgentsMain() {
                 ? '语音模型加载中…'
                 : speech.isListening
                   ? '语音识别中…'
-                  : '输入问题，⏎ 发送 · ⇧⏎ 换行 · / 唤起技能 · 拖入文件'
+                  : '输入问题，⏎ 发送 · ⇧⏎ 换行 · / 唤起技能 · 拖入文件 · 粘贴图片'
             }
             value={input}
             onChange={(e) => handleInputChange(e.target.value)}
+            onPaste={handlePaste}
             onKeyDown={(e) => {
               if (skillOpen) {
                 if (e.key === 'ArrowDown') {
@@ -573,12 +655,19 @@ export function AgentsMain() {
               }}
             />
             <button
-              className="agents-tool-btn"
+              className="composer-chip composer-chip--img"
               title="上传文件 / 图片"
               onClick={() => fileInputRef.current?.click()}
-            >📎</button>
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                <path d="M14 2v6h6" />
+                <path d="M12 18v-6" />
+                <path d="M9 15h6" />
+              </svg>
+            </button>
             <button
-              className={`agents-tool-btn${speech.isListening ? ' agents-tool-btn--active' : ''}`}
+              className={`composer-chip${speech.isListening ? ' composer-chip--voice-active' : ''}`}
               title={
                 !speech.supported
                   ? '语音识别不可用'
@@ -586,14 +675,32 @@ export function AgentsMain() {
                     ? '语音模型加载中…'
                     : speech.isListening
                       ? '停止语音'
-                      : '开始语音输入（离线识别）'
+                      : '语音输入'
               }
               onClick={toggleVoice}
               disabled={!speech.supported || speech.modelLoading}
-            >{speech.modelLoading ? '⏳' : '🎤'}</button>
+            >
+              {speech.modelLoading ? (
+                <span className="composer-send__spinner" />
+              ) : speech.isListening ? (
+                <span className="voice-waves">
+                  <span className="voice-wave" />
+                  <span className="voice-wave" />
+                  <span className="voice-wave" />
+                  <span className="voice-wave" />
+                </span>
+              ) : (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                  <rect x="9" y="3" width="6" height="11" rx="3" />
+                  <path d="M5 10v1c0 3.866 3.134 7 7 7s7-3.134 7-7v-1" strokeLinecap="round" />
+                  <path d="M12 18v4" strokeLinecap="round" />
+                  <path d="M8 21h8" strokeLinecap="round" />
+                </svg>
+              )}
+            </button>
             <button
-              className="agents-tool-btn"
-              title="唤起技能"
+              className="composer-chip"
+              title="唤起技能 (/)"
               onClick={() => {
                 const ta = textareaRef.current;
                 if (!ta) return;
@@ -611,18 +718,37 @@ export function AgentsMain() {
                 });
               }}
             >/</button>
-            <span className="agents-mode-hint">
-              {mode === 'work' ? '💬 Work' : '⚡ Code'}
-            </span>
+            <button
+              type="button"
+              className={`composer-chip composer-chip--mode ${mode === 'agent' ? 'is-agent' : mode === 'plan' ? 'is-plan' : 'is-ask'}`}
+              title={`切换模式：当前 ${mode === 'agent' ? '智能体' : mode === 'plan' ? '规划' : '问答'}`}
+              onClick={() => {
+                const next = mode === 'ask' ? 'agent' : mode === 'agent' ? 'plan' : 'ask';
+                useAgentsStore.getState().setMode(next);
+              }}
+            >
+              {mode === 'agent' ? '∞ 智能体' : mode === 'plan' ? '◇ Plan' : '✦ Ask'}
+              <span className="composer-chip__caret">▾</span>
+            </button>
+            <ModelChip />
           </div>
           {streaming ? (
-            <button className="agents-send-btn agents-stop-btn" onClick={stop}>停止</button>
+            <button className="composer-send" onClick={stop} title="停止">
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                <rect x="2" y="2" width="12" height="12" rx="2" />
+              </svg>
+            </button>
           ) : (
             <button
-              className="agents-send-btn"
+              className="composer-send"
               onClick={() => void send()}
               disabled={!input.trim() && attachments.length === 0 && pendingAttachments.length === 0}
-            >发送</button>
+              title="发送（⏎）"
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                <path d="M2 8L14 2L8 14L7 9L2 8Z" fill="currentColor" />
+              </svg>
+            </button>
           )}
         </div>
       </div>
@@ -750,4 +876,60 @@ function formatArgs(name: string, args: any): string {
 
 function truncatePreview(s: string): string {
   return s.length > 60 ? s.slice(0, 60) + '…' : s;
+}
+
+/** 模型选择 chip — 复用主 IDE 的 /api/providers 接口，与设置面板联动 */
+function ModelChip() {
+  const selectedProfileId = useAgentsStore((s) => s.selectedProfileId);
+  const providerProfiles = useAgentsStore((s) => s.providerProfiles);
+  const handleModelSelect = useAgentsStore((s) => s.handleModelSelect);
+  const loadProviderProfiles = useAgentsStore((s) => s.loadProviderProfiles);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => { void loadProviderProfiles(); }, [loadProviderProfiles]);
+  // 监听设置面板 / 其他组件的 provider 变更，保持联动
+  useEffect(() => {
+    const handler = () => void loadProviderProfiles();
+    window.addEventListener('providers-changed', handler);
+    return () => window.removeEventListener('providers-changed', handler);
+  }, [loadProviderProfiles]);
+
+  const label = selectedProfileId
+    ? (providerProfiles.find((p) => p.id === selectedProfileId)?.model ??
+       providerProfiles.find((p) => p.id === selectedProfileId)?.name ??
+       selectedProfileId)
+    : 'Auto';
+
+  return (
+    <span className="composer-chip--model" style={{ position: 'relative' }}>
+      <button
+        type="button"
+        className="composer-chip composer-chip--model"
+        title={selectedProfileId ? `当前模型：${label}` : '自动路由（点击选择模型）'}
+        onClick={() => setOpen((b) => !b)}
+      >
+        {label}
+        <span className="composer-chip__caret">▾</span>
+      </button>
+      {open && (
+        <div className="model-dropdown" onClick={() => setOpen(false)}>
+          <div
+            className={`model-dropdown-item${!selectedProfileId ? ' active' : ''}`}
+            onClick={() => { handleModelSelect(null); setOpen(false); }}
+          >
+            ⚡ Auto (router)
+          </div>
+          {providerProfiles.map((p) => (
+            <div
+              key={p.id}
+              className={`model-dropdown-item${selectedProfileId === p.id ? ' active' : ''}`}
+              onClick={() => { handleModelSelect(p.id); setOpen(false); }}
+            >
+              {p.model ?? p.name}
+            </div>
+          ))}
+        </div>
+      )}
+    </span>
+  );
 }

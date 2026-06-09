@@ -62,7 +62,7 @@ export function AgentsSidebar() {
 
   return (
     <aside className="agents-sidebar">
-      <div className="agents-sidebar-header">MyWorker</div>
+      <div className="agents-sidebar-header">▣ MyWorker</div>
       <button
         type="button"
         className="agents-new-chat"
@@ -137,7 +137,7 @@ export function AgentsSidebar() {
         )}
       </div>
 
-      {mode === 'code' && !workspace && (
+      {mode !== 'ask' && !workspace && (
         <div className="agents-empty agents-empty-sub" style={{ padding: '8px 12px' }}>
           请在中间选择一个工作区
         </div>

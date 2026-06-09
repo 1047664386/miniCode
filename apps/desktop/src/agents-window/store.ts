@@ -15,7 +15,7 @@
 import { create } from 'zustand';
 import { sessionFetch } from '../store';
 
-export type AgentsMode = 'work' | 'code';
+export type AgentsMode = 'agent' | 'ask' | 'plan';
 
 const RECENT_KEY = 'mci.agents.recentWs';
 const RECENT_MAX = 8;
@@ -109,10 +109,17 @@ interface State {
   gitStatus: Record<string, string> | null;
   /** 触发拉一次 git status；防抖在调用方控制 */
   refreshGitStatus(): Promise<void>;
+
+  // ---- 模型选择 ----
+  selectedProfileId: string | null;  // null = auto-routing
+  providerProfiles: Array<{ id: string; name: string; model?: string }>;
+  setSelectedProfileId(id: string | null): void;
+  loadProviderProfiles(): Promise<void>;
+  handleModelSelect(profileId: string | null): void;
 }
 
 export const useAgentsStore = create<State>((set, get) => ({
-  mode: 'work',
+  mode: 'agent',
   workspaceRoot: null,
   branch: null,
   recentWorkspaces: loadRecent(),
@@ -154,7 +161,7 @@ export const useAgentsStore = create<State>((set, get) => ({
     try {
       const { mode } = get();
       const params = new URLSearchParams();
-      params.set('mode', mode);
+      params.set('mode', mode === 'agent' ? 'code' : mode === 'ask' ? 'work' : 'plan');
       // ⚠️ 不再按 workspaceRoot 过滤 —— 侧栏要展示所有工作区的会话，前端自己分组
       const r = await sessionFetch(`/api/sessions?${params.toString()}`);
       const list: SessionMeta[] = r.ok ? await r.json() : [];
@@ -171,8 +178,8 @@ export const useAgentsStore = create<State>((set, get) => ({
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         title,
-        mode,
-        workspaceRoot: mode === 'code' ? workspaceRoot ?? undefined : undefined,
+        mode: mode === 'agent' ? 'code' : mode === 'ask' ? 'work' : 'plan',
+        workspaceRoot: mode !== 'ask' ? workspaceRoot ?? undefined : undefined,
       }),
     });
     const meta: SessionMeta = await r.json();
@@ -335,5 +342,33 @@ export const useAgentsStore = create<State>((set, get) => ({
   },
   clearPendingAttachments() {
     set({ pendingAttachments: [] });
+  },
+
+  // ---- 模型选择 ----
+  selectedProfileId: null,
+  providerProfiles: [],
+  setSelectedProfileId(id) { set({ selectedProfileId: id }); },
+  async loadProviderProfiles() {
+    try {
+      const r = await fetch('/api/providers');
+      if (!r.ok) return;
+      const data = await r.json();
+      const profiles = (data?.profiles ?? []).filter((p: any) => !p.hash);
+      set({
+        providerProfiles: profiles.map((p: any) => ({ id: p.id, name: p.name, model: p.model })),
+        selectedProfileId: data?.active?.chat ?? null,
+      });
+    } catch { /* ignore */ }
+  },
+  handleModelSelect(profileId) {
+    const targetId = (profileId === get().selectedProfileId) ? null : profileId;
+    fetch('/api/providers/active', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role: 'chat', id: targetId }),
+    }).then(() => {
+      void get().loadProviderProfiles();
+      window.dispatchEvent(new Event('providers-changed'));
+    }).catch(() => {});
   },
 }));

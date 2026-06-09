@@ -68,7 +68,7 @@ export function AgentsRight() {
 
   // 加载根目录：依赖 ws / mode / tab；切换工作区 → 重置树
   useEffect(() => {
-    if (tab !== 'files' || !ws || mode !== 'code') return;
+    if (tab !== 'files' || !ws || mode !== 'ask') return;
     let cancelled = false;
     setRootLoading(true);
     setLoadErr(null);
@@ -92,7 +92,7 @@ export function AgentsRight() {
 
   // 拉 git status：当 ws 改变 / 沙箱被工具改写 / 切回 files tab 时
   useEffect(() => {
-    if (!ws || mode !== 'code') return;
+    if (!ws || mode !== 'ask') return;
     void refreshGitStatus();
   }, [ws, mode, sandboxDirty, tab, refreshGitStatus]);
 
@@ -281,9 +281,9 @@ export function AgentsRight() {
       <div className="agents-right-body">
         {tab === 'assets' && <div className="agents-empty">暂无资产</div>}
         {tab === 'changes' && (
-          mode !== 'code' ? (
+          mode !== 'ask' ? (
             <div className="agents-empty">
-              <div>切换到 Code 模式查看变更</div>
+              <div>切换到 智能体模式查看变更</div>
             </div>
           ) : !ws ? (
             <div className="agents-empty">
@@ -294,8 +294,8 @@ export function AgentsRight() {
           )
         )}
         {tab === 'history' && (
-          mode !== 'code' ? (
-            <div className="agents-empty"><div>切换到 Code 模式查看历史</div></div>
+          mode !== 'ask' ? (
+            <div className="agents-empty"><div>切换到 智能体模式查看历史</div></div>
           ) : !ws ? (
             <div className="agents-empty"><div>未选择工作区</div></div>
           ) : (
@@ -303,9 +303,9 @@ export function AgentsRight() {
           )
         )}
         {tab === 'files' && (
-          mode !== 'code' ? (
+          mode !== 'ask' ? (
             <div className="agents-empty">
-              <div>切换到 Code 模式查看文件</div>
+              <div>切换到 智能体模式查看文件</div>
             </div>
           ) : !ws ? (
             <div className="agents-empty">

@@ -48,6 +48,7 @@ interface ChatBody {
   text?: string;
   mode?: string;
   messages?: { role: string; content: string }[];
+  timeout?: { fetchTimeoutMs?: number; streamIdleTimeoutMs?: number };
 }
 
 interface Deps {
@@ -59,6 +60,7 @@ async function runChat(req: FastifyRequest, reply: FastifyReply, app: any, deps:
   const sessionId = String(body.sessionId ?? '');
   const text = String(body.userMessage ?? body.text ?? '').trim();
   const mode = String(body.mode ?? 'work').toLowerCase();
+  const clientTimeout = body.timeout; // { fetchTimeoutMs?, streamIdleTimeoutMs? } | undefined
   if (!sessionId || !text) return reply.code(400).send({ error: 'sessionId + userMessage required' });
 
   const storage = new PgStorage(app.prisma, req.userId);
@@ -114,6 +116,7 @@ async function runChat(req: FastifyRequest, reply: FastifyReply, app: any, deps:
   let finalText = '';
   let promptTokens = 0;
   let completionTokens = 0;
+  let doneReason = 'completed'; // 跟踪 Agent 结束原因
 
   try {
     if (mode === 'code') {
@@ -131,6 +134,7 @@ async function runChat(req: FastifyRequest, reply: FastifyReply, app: any, deps:
         maxSteps: 10,
         model,
         signal: ctl.signal,
+        llmTimeout: clientTimeout,
       })) {
         if (ev.type === 'text' && ev.text) {
           finalText += ev.text;
@@ -155,21 +159,32 @@ async function runChat(req: FastifyRequest, reply: FastifyReply, app: any, deps:
           completionTokens = ev.usage?.completionTokens ?? completionTokens;
         } else if (ev.type === 'error') {
           write('error', { message: ev.error });
+        } else if (ev.type === 'done' && ev.reason) {
+          doneReason = ev.reason;
         }
       }
     } else {
       // === Work 模式：纯流式 ===
-      for await (const chunk of provider.chatStream(messages, { model, signal: ctl.signal })) {
-        if (chunk.delta) {
-          finalText += chunk.delta;
-          await storage.appendChunk(sessionId, turnId, chunk.delta);
-          write('text', { delta: chunk.delta });
+      const streamOpts: any = { model, signal: ctl.signal };
+      if (clientTimeout?.fetchTimeoutMs !== undefined) streamOpts.fetchTimeoutMs = clientTimeout.fetchTimeoutMs;
+      if (clientTimeout?.streamIdleTimeoutMs !== undefined) streamOpts.streamIdleTimeoutMs = clientTimeout.streamIdleTimeoutMs;
+
+      try {
+        for await (const chunk of provider.chatStream(messages, streamOpts)) {
+          if (chunk.delta) {
+            finalText += chunk.delta;
+            await storage.appendChunk(sessionId, turnId, chunk.delta);
+            write('text', { delta: chunk.delta });
+          }
+          if (chunk.usage) {
+            promptTokens = chunk.usage.promptTokens ?? promptTokens;
+            completionTokens = chunk.usage.completionTokens ?? completionTokens;
+          }
+          if (chunk.done) break;
         }
-        if (chunk.usage) {
-          promptTokens = chunk.usage.promptTokens ?? promptTokens;
-          completionTokens = chunk.usage.completionTokens ?? completionTokens;
-        }
-        if (chunk.done) break;
+      } catch (streamErr: any) {
+        doneReason = 'stream_error';
+        write('error', { message: streamErr?.message ?? 'stream interrupted' });
       }
     }
 
@@ -183,11 +198,13 @@ async function runChat(req: FastifyRequest, reply: FastifyReply, app: any, deps:
       });
     }
 
-    write('done', { turnId, finalText, usage: { promptTokens, completionTokens, byok } });
+    write('done', { turnId, finalText, reason: doneReason, usage: { promptTokens, completionTokens, byok } });
   } catch (e: any) {
     app.log.error({ err: e }, 'chat stream failed');
+    doneReason = 'fatal';
     await storage.interruptTurn(sessionId, turnId, 'error');
     write('error', { message: e?.message ?? 'stream failed' });
+    write('done', { turnId, reason: doneReason });
   } finally {
     reply.raw.end();
   }

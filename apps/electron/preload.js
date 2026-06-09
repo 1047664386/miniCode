@@ -90,6 +90,24 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onUpdateAvailable: (cb) => {
     ipcRenderer.on('update-available', (_e, info) => cb(info));
   },
+  // ─── Vosk 语音识别 ───
+  speech: {
+    getStatus: () => ipcRenderer.invoke('speech:get-status'),
+    ensureModel: () => ipcRenderer.invoke('speech:ensure-model'),
+    start: () => ipcRenderer.invoke('speech:start'),
+    sendAudio: (buffer) => ipcRenderer.send('speech:audio', buffer),
+    stop: () => ipcRenderer.invoke('speech:stop'),
+    onResult: (cb) => {
+      const h = (_e, r) => cb(r);
+      ipcRenderer.on('speech:result', h);
+      return () => ipcRenderer.removeListener('speech:result', h);
+    },
+    onModelStatus: (cb) => {
+      const h = (_e, s) => cb(s);
+      ipcRenderer.on('speech:model-status', h);
+      return () => ipcRenderer.removeListener('speech:model-status', h);
+    },
+  },
 });
 
 // Agents Window：独立 namespace，与主 IDE API 不冲突
@@ -109,5 +127,23 @@ contextBridge.exposeInMainWorld('mciAgents', {
     const handler = (_e, p) => cb(p);
     ipcRenderer.on('agents:attach-selection', handler);
     return () => ipcRenderer.removeListener('agents:attach-selection', handler);
+  },
+  // ─── Vosk 语音识别（Agents Window 同样需要）───
+  speech: {
+    getStatus: () => ipcRenderer.invoke('speech:get-status'),
+    ensureModel: () => ipcRenderer.invoke('speech:ensure-model'),
+    start: () => ipcRenderer.invoke('speech:start'),
+    sendAudio: (buffer) => ipcRenderer.send('speech:audio', buffer),
+    stop: () => ipcRenderer.invoke('speech:stop'),
+    onResult: (cb) => {
+      const h = (_e, r) => cb(r);
+      ipcRenderer.on('speech:result', h);
+      return () => ipcRenderer.removeListener('speech:result', h);
+    },
+    onModelStatus: (cb) => {
+      const h = (_e, s) => cb(s);
+      ipcRenderer.on('speech:model-status', h);
+      return () => ipcRenderer.removeListener('speech:model-status', h);
+    },
   },
 });

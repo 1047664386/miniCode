@@ -7,12 +7,13 @@ import { SubagentPanel } from './SubagentPanel';
 import { SubagentLauncher } from './SubagentLauncher';
 import { CostMiniPanel } from './CostMiniPanel';
 import { McpSettingsPanel } from './McpSettingsPanel';
+import { ModelSettingsPanel } from './ModelSettingsPanel';
 import { ContextStatusBar } from './ContextStatusBar';
 import { SessionsDrawer } from './SessionsDrawer';
 import { MentionInput } from './MentionInput';
 import { AddContextPopover } from './AddContextPopover';
 import { vsBridge } from '../vscode-bridge';
-import { useWebSpeech } from '../hooks/useWebSpeech';
+import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
 
 interface SlashSpec {
   name: string;
@@ -37,6 +38,7 @@ export function ChatPanel() {
   const [slashActive, setSlashActive] = useState(0);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [mcpOpen, setMcpOpen] = useState(false);
+  const [modelSettingsOpen, setModelSettingsOpen] = useState(false);
   const [addCtxOpen, setAddCtxOpen] = useState(false);
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
   const [providerProfiles, setProviderProfiles] = useState<Array<{ id: string; name: string; model?: string }>>([]);
@@ -47,6 +49,7 @@ export function ChatPanel() {
   >([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   /** push-announce 队列：子 Agent 完成的 announce message，跑完本 turn 自动续发 */
   const pendingAnnouncesRef = useRef<string[]>([]);
   /** 追踪上一帧 running 状态，用于检测 true→false 跳变 */
@@ -119,31 +122,48 @@ export function ChatPanel() {
     }
   };
 
-  // 语音输入（Web Speech API）
-  const speech = useWebSpeech({ lang: 'zh-CN' });
-  const lastSpeechRef = useRef('');
+  // 图片文件选择器上传
+  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files) return;
+    for (const f of Array.from(files)) {
+      if (!f.type.startsWith('image/')) continue;
+      if (f.size > MAX_IMAGE_BYTES) {
+        alert(`图片 ${f.name} 超过 5MB`);
+        continue;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = String(reader.result);
+        setImageAttachments((prev) => [
+          ...prev,
+          { id: `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, name: f.name, type: f.type, dataUrl },
+        ]);
+      };
+      reader.readAsDataURL(f);
+    }
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  // 语音输入（Electron→Vosk / Web→WebSpeech 自动选择）
+  const speech = useSpeechRecognition({ lang: 'zh-CN' });
+  const inputBeforeVoiceRef = useRef('');
   useEffect(() => {
-    if (!speech.isListening) return;
-    const incoming = speech.transcript;
-    const delta = incoming.slice(lastSpeechRef.current.length);
-    if (delta) {
-      setInput((s) => s + delta);
-      lastSpeechRef.current = incoming;
+    // 只在有实际语音结果时更新 input（避免 resetTranscript 的空字符串覆盖 input）
+    if (speech.transcript) {
+      setInput(inputBeforeVoiceRef.current + speech.transcript);
     }
   }, [speech.transcript]);
-  useEffect(() => {
-    if (!speech.isListening) {
-      lastSpeechRef.current = '';
-    }
-  }, [speech.isListening]);
   const toggleVoice = () => {
     if (!speech.supported) {
-      alert('当前浏览器不支持 Web Speech API（建议 Chrome / Edge / Safari）');
+      alert('语音识别不可用（桌面端需 Electron，Web 端需 Chrome / Edge）');
       return;
     }
-    if (speech.isListening) speech.stopListening();
-    else {
-      lastSpeechRef.current = '';
+    if (speech.modelLoading) return;
+    if (speech.isListening) {
+      speech.stopListening();
+    } else {
+      inputBeforeVoiceRef.current = input;
       speech.resetTranscript();
       speech.startListening();
     }
@@ -180,13 +200,18 @@ export function ChatPanel() {
   useEffect(() => {
     fetch('/api/slash').then((r) => r.json()).then(setSlashList).catch(() => {});
   }, []);
-  // 加载 provider profiles（一次性）
-  useEffect(() => {
+  // 加载 provider profiles（一次性 + settings 关闭后刷新）
+  const loadProfiles = () => {
     fetch('/api/providers').then((r) => r.json()).then((data: any) => {
       const profiles = (data?.profiles ?? []).filter((p: any) => !p.hash);
       setProviderProfiles(profiles.map((p: any) => ({ id: p.id, name: p.name, model: p.model })));
     }).catch(() => {});
-  }, []);
+  };
+  useEffect(() => { loadProfiles(); }, []);
+  // 模型设置关闭后刷新列表
+  useEffect(() => {
+    if (!modelSettingsOpen) loadProfiles();
+  }, [modelSettingsOpen]);
 
   // 当且仅当输入以 / 开头、且第一行没有空格时，展示候选
   const slashSuggestions = useMemo(() => {
@@ -232,8 +257,9 @@ export function ChatPanel() {
     // 图片：提取 base64 data + media_type → 传给后端作为 multimodal content blocks
     const multimodalImages = imgs.map((img) => {
       // dataUrl 格式: "data:image/png;base64,xxxxx"
+      const dataUrlMatch = img.dataUrl.match(/^data:([^;]+);base64,/);
       const base64Data = img.dataUrl.split(',')[1] ?? '';
-      const mediaType = img.type || 'image/png';
+      const mediaType = dataUrlMatch?.[1] || img.type || 'image/png';
       return { type: 'image', media_type: mediaType, data: base64Data };
     });
     try {
@@ -250,7 +276,7 @@ export function ChatPanel() {
       /* bridge 不在就降级，保持原文 */
     }
 
-    pushMessage({ role: 'user', content: finalText });
+    pushMessage({ role: 'user', content: finalText, _images: imgs.length > 0 ? imgs.map(img => ({ name: img.name, dataUrl: img.dataUrl })) : undefined, _displayText: text });
     setRunning(true);
 
     // 没有 active session → 自动创建一个；首条消息内容会被 server 用作 title
@@ -300,6 +326,10 @@ export function ChatPanel() {
           ...(multimodalImages.length > 0 ? { images: multimodalImages } : {}),
         }),
       });
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => '');
+        throw new Error(`HTTP ${resp.status}: ${errText || resp.statusText}`);
+      }
       if (!resp.body) throw new Error('No response body');
 
       const reader = resp.body.getReader();
@@ -582,7 +612,6 @@ export function ChatPanel() {
       <PlanPanel />
       <SubagentLauncher />
       <SubagentPanel />
-      <CostMiniPanel />
       {mcpOpen && (
         <div
           style={{
@@ -599,6 +628,25 @@ export function ChatPanel() {
         >
           <div onClick={(e) => e.stopPropagation()} style={{ maxHeight: '90vh', overflow: 'auto' }}>
             <McpSettingsPanel onClose={() => setMcpOpen(false)} />
+          </div>
+        </div>
+      )}
+      {modelSettingsOpen && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(0,0,0,0.6)',
+            zIndex: 100,
+            display: 'flex',
+            alignItems: 'flex-start',
+            justifyContent: 'center',
+            paddingTop: 60,
+          }}
+          onClick={() => setModelSettingsOpen(false)}
+        >
+          <div onClick={(e) => e.stopPropagation()} style={{ maxHeight: '90vh', overflow: 'auto' }}>
+            <ModelSettingsPanel onClose={() => setModelSettingsOpen(false)} />
           </div>
         </div>
       )}
@@ -649,6 +697,7 @@ export function ChatPanel() {
         </div>
       )}
       <div className="messages" ref={scrollRef}>
+        <div className="messages-spacer" />
         {!messages.length && (
           <div style={{ color: '#666', textAlign: 'center', marginTop: 40 }}>
             Ask me anything about the codebase.
@@ -656,37 +705,9 @@ export function ChatPanel() {
             Try: "list the project structure"
           </div>
         )}
-        {messages.map((m, i) => {
-          const hasThink = (m as any).thinkFull != null || (m as any).isThink;
-          const hasPending =
-            (m as any).pendingEditId != null || (m as any).pendingEditPath != null;
-
-          return (
-            <div key={i} className={`msg ${m.role}${hasThink ? ' has-think' : ''}${hasPending ? ' has-pending' : ''}`}>
-              {m.role !== 'tool' && <div className="role-tag">{m.role}</div>}
-              {m.role === 'assistant' ? (
-                <>
-                  {(m as any)._thinkingMs != null && (m as any)._thinkingMs > 0 && (
-                    <div className="thinking-indicator">
-                      <span className="thinking-indicator__dot" />
-                      <span>{formatThinkingTime((m as any)._thinkingMs)}</span>
-                    </div>
-                  )}
-                  {m.content ? (
-                    <MarkdownMessage text={m.content} />
-                  ) : running && i === messages.length - 1 ? (
-                    <span className="thinking">…</span>
-                  ) : null}
-                </>
-              ) : m.role === 'tool' ? (
-                <ToolChainItem m={m} i={i} messages={messages} running={running} />
-              ) : (
-                <span className="msg-plain">{m.content}</span>
-              )}
-            </div>
-          );
-        })}
+        {renderMessages(messages, running, scrollRef)}
       </div>
+      <CostMiniPanel />
       <div className="input-area">
         {slashSuggestions.length > 0 && (
           <div className="slash-popup">
@@ -787,6 +808,22 @@ export function ChatPanel() {
           <div className="composer-toolbar">
             <div className="composer-toolbar__left">
               <button
+                type="button"
+                className="composer-chip composer-chip--img"
+                title="上传图片"
+                onClick={() => fileInputRef.current?.click()}
+              >
+                🖼
+              </button>
+              <input
+                type="file"
+                ref={fileInputRef}
+                accept="image/jpeg,image/png,image/gif,image/webp"
+                multiple
+                onChange={handleImageUpload}
+                style={{ display: 'none' }}
+              />
+              <button
                 ref={addCtxBtnRef}
                 type="button"
                 className="composer-chip"
@@ -839,6 +876,16 @@ export function ChatPanel() {
                       {p.model ?? p.name}
                     </div>
                   ))}
+                  <div className="model-dropdown-divider" />
+                  <div
+                    className="model-dropdown-item model-dropdown-item--settings"
+                    onClick={() => {
+                      setModelDropdownOpen(false);
+                      setModelSettingsOpen(true);
+                    }}
+                  >
+                    ⚙ 配置模型 Provider
+                  </div>
                 </div>
               )}
             </div>
@@ -846,18 +893,35 @@ export function ChatPanel() {
               <button
                 type="button"
                 onClick={toggleVoice}
-                disabled={!speech.supported}
-                className={`composer-chip${speech.isListening ? ' composer-chip--voice-active' : ''}`}
+                disabled={!speech.supported || speech.modelLoading}
+                className={`composer-chip composer-chip--voice${speech.isListening ? ' composer-chip--voice-active' : ''}`}
                 title={
                   !speech.supported
-                    ? '当前浏览器不支持语音识别'
-                    : speech.isListening
-                      ? '停止语音输入'
-                      : '语音输入（中文）'
+                    ? '语音识别不可用'
+                    : speech.modelLoading
+                      ? '语音模型加载中…'
+                      : speech.isListening
+                        ? '停止语音输入'
+                        : '语音输入（中文·离线识别）'
                 }
-                style={{ marginRight: 6 }}
               >
-                {speech.isListening ? '⏺' : '🎤'}
+                {speech.modelLoading ? (
+                  <span className="composer-send__spinner" />
+                ) : speech.isListening ? (
+                  <span className="voice-waves">
+                    <span className="voice-wave" />
+                    <span className="voice-wave" />
+                    <span className="voice-wave" />
+                    <span className="voice-wave" />
+                  </span>
+                ) : (
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                    <rect x="9" y="3" width="6" height="11" rx="3" />
+                    <path d="M5 10v1c0 3.866 3.134 7 7 7s7-3.134 7-7v-1" strokeLinecap="round" />
+                    <path d="M12 18v4" strokeLinecap="round" />
+                    <path d="M8 21h8" strokeLinecap="round" />
+                  </svg>
+                )}
               </button>
               <button
                 type="button"
@@ -1109,4 +1173,375 @@ function ThinkBubble({ preview, full }: { preview: string; full: string }) {
       )}
     </div>
   );
+}
+
+/** 工具图标映射 */
+const TOOL_ICONS: Record<string, string> = {
+  read_file: '📄', write_to_file: '✏️', replace_in_file: '✂️',
+  search_file: '🔍', list_files: '📁', grep_search: '🔎',
+  execute_command: '⚡', view_code_item: '🧩', view_file_outline: '🗂',
+  search_web: '🌐', fetch_web: '📡', think: '💭',
+  task: '📝', pending_edit: '📝', extended_thinking: '🧠',
+  update_plan: '🗓', read_lints: '✅', write_todo: '☑️',
+  use_subagent: '🤖', use_skill: '🎯', search_memory: '🧠',
+  update_memory: '💾', project_preview: '👁', browser_agent: '🌐',
+};
+
+/** 思考过程面板 - 借鉴 Ai-bot 的 ThinkingProcess 组件 */
+function ThinkingProcess({ steps, isRunning }: {
+  steps: ChatMsg[];
+  isRunning: boolean;
+}) {
+  const [expanded, setExpanded] = useState(false);
+
+  // 分类步骤
+  const thinkSteps = steps.filter(s => {
+    const name = (s as any)._toolName;
+    return name === 'think' || name === 'extended_thinking';
+  });
+  const toolCalls = steps.filter(s => (s as any)._toolRole === 'call');
+  const toolResults = steps.filter(s => (s as any)._toolRole === 'result' && (s as any)._toolName !== 'think' && (s as any)._toolName !== 'extended_thinking');
+  const otherSteps = steps.filter(s => {
+    const name = (s as any)._toolName;
+    const role = (s as any)._toolRole;
+    return !thinkSteps.includes(s) && !toolCalls.includes(s) && !toolResults.includes(s);
+  });
+
+  const toolCallCount = toolCalls.length;
+  const doneCount = toolResults.length;
+  const successCount = toolResults.filter(r => !(r.content?.startsWith('✗') || r.content?.startsWith('❌'))).length;
+  const isInProgress = isRunning && toolCallCount > doneCount;
+
+  const summaryParts: string[] = [];
+  if (thinkSteps.length > 0) summaryParts.push(`${thinkSteps.length} 步思考`);
+  if (toolCallCount > 0) summaryParts.push(`${toolCallCount} 次工具调用`);
+  const summary = summaryParts.length > 0 ? summaryParts.join(' · ') : '思考过程';
+
+  return (
+    <div className={`thinking-process ${expanded ? 'thinking-process--expanded' : 'thinking-process--collapsed'}`}>
+      <div className="thinking-process__header" onClick={() => setExpanded(!expanded)}>
+        <span className="thinking-process__icon">
+          {isInProgress ? <span className="tp-spinner" /> : '🧠'}
+        </span>
+        <span className="thinking-process__title">{summary}</span>
+        {isInProgress && <span className="thinking-process__badge">进行中</span>}
+        {doneCount > 0 && (
+          <span className="thinking-process__stats">
+            {successCount}/{doneCount} 完成
+          </span>
+        )}
+        <svg
+          className={`thinking-process__chevron ${expanded ? 'thinking-process__chevron--up' : ''}`}
+          width="12" height="12" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2"
+        >
+          <path d="M5 7l5 5 5-5" />
+        </svg>
+      </div>
+
+      {expanded && (
+        <div className="thinking-process__body">
+          {/* 思考步骤 */}
+          {thinkSteps.length > 0 && (
+            <div className="thinking-process__section">
+              <div className="thinking-process__section-header">
+                <span className="thinking-process__section-icon">💭</span>
+                推理过程
+              </div>
+              {thinkSteps.map((step, i) => (
+                <div key={i} className="thinking-process__step">
+                  <span className="thinking-process__step-dot" />
+                  <span className="thinking-process__step-msg">
+                    {(step as any).thinkFull
+                      ? String((step as any).thinkFull).slice(0, 300)
+                      : step.content}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* 工具调用 */}
+          {(toolCalls.length > 0 || toolResults.length > 0) && (
+            <div className="thinking-process__section">
+              <div className="thinking-process__section-header">
+                <span className="thinking-process__section-icon">🔧</span>
+                工具调用
+              </div>
+              <ToolCallGroup calls={toolCalls} results={toolResults} />
+            </div>
+          )}
+
+          {/* 其他步骤 */}
+          {otherSteps.length > 0 && (
+            <div className="thinking-process__section">
+              {otherSteps.map((step, i) => (
+                <div key={i} className="thinking-process__step">
+                  <span className="thinking-process__step-dot" />
+                  <span className="thinking-process__step-msg">{step.content}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** 工具调用组 - 配对 call/result 并渲染为独立卡片 */
+function ToolCallGroup({ calls, results }: { calls: ChatMsg[]; results: ChatMsg[] }) {
+  const items: Array<{
+    name: string; label: string; icon: string; args: string;
+    result: string; status: 'running' | 'done' | 'error';
+    imageData?: { media_type: string; data: string };
+  }> = [];
+
+  for (const c of calls) {
+    const name = (c as any)._toolName ?? 'unknown';
+    items.push({
+      name, label: translateToolName(name),
+      icon: TOOL_ICONS[name] ?? '🔧',
+      args: (c as any)._toolArgs ?? '',
+      result: '', status: 'running',
+    });
+  }
+  for (const r of results) {
+    const name = (r as any)._toolName ?? 'unknown';
+    const imgData = (r as any)._imageData;
+    const callIdx = items.findIndex(it => it.name === name && it.status === 'running');
+    const isError = r.content?.startsWith('✗') || r.content?.startsWith('❌');
+    if (callIdx >= 0) {
+      items[callIdx].result = r.content;
+      items[callIdx].status = isError ? 'error' : 'done';
+      if (imgData) items[callIdx].imageData = imgData;
+    } else {
+      items.push({
+        name, label: translateToolName(name),
+        icon: TOOL_ICONS[name] ?? '🔧',
+        args: '', result: r.content,
+        status: isError ? 'error' : 'done',
+        imageData: imgData,
+      });
+    }
+  }
+
+  return (
+    <>
+      {items.map((it, j) => (
+        <ToolCallCard key={j} item={it} />
+      ))}
+    </>
+  );
+}
+
+/** 单个工具调用卡片 - 带图标、状态、可展开详情 */
+function ToolCallCard({ item }: {
+  item: {
+    name: string; label: string; icon: string; args: string;
+    result: string; status: 'running' | 'done' | 'error';
+    imageData?: { media_type: string; data: string };
+  };
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const statusText = item.status === 'running' ? '调用中' : item.status === 'done' ? '✓ 完成' : '✗ 失败';
+
+  return (
+    <div className={`tool-call-card tool-call-card--${item.status}`}>
+      <div className="tool-call-card__header" onClick={() => setExpanded(!expanded)}>
+        <span className="tool-call-card__icon">{item.icon}</span>
+        <span className="tool-call-card__label">{item.label}</span>
+        <span className={`tool-call-card__status tool-call-card__status--${item.status}`}>
+          {item.status === 'running' && <span className="tp-spinner" />}
+          {statusText}
+        </span>
+        <svg
+          className={`tool-call-card__chevron ${expanded ? 'tool-call-card__chevron--up' : ''}`}
+          width="12" height="12" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="2"
+        >
+          <path d="M5 7l5 5 5-5" />
+        </svg>
+      </div>
+      {expanded && (
+        <div className="tool-call-card__detail">
+          {item.args && (
+            <div className="tool-call-card__args">
+              <span className="tool-call-card__args-label">参数</span>
+              <code>{item.args.slice(0, 500)}</code>
+            </div>
+          )}
+          {item.status !== 'running' && item.result && (
+            <div className="tool-call-card__result">
+              <span className="tool-call-card__args-label">返回结果</span>
+              <code>{item.result.slice(0, 500)}</code>
+            </div>
+          )}
+          {item.imageData && (
+            <img
+              className="tool-call-card__img"
+              src={`data:${item.imageData.media_type};base64,${item.imageData.data}`}
+              alt={item.label + ' image'}
+            />
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 消息渲染器 - 智能分组用户消息、助手消息、工具消息
+ */
+function renderMessages(messages: ChatMsg[], running: boolean, scrollRef: React.RefObject<HTMLDivElement | null>) {
+  const elements: React.ReactNode[] = [];
+  let i = 0;
+
+  while (i < messages.length) {
+    const m = messages[i];
+
+    if (m.role === 'user') {
+      // 用户消息：明显的聊天气泡，支持展示图片缩略图
+      const userImages = m._images;
+      elements.push(
+        <div key={i} className="msg msg-user">
+          <div className="user-bubble">
+            {userImages && userImages.length > 0 && (
+              <div className="user-bubble__images">
+                {userImages.map((img, idx) => (
+                  <img
+                    key={idx}
+                    src={img.dataUrl}
+                    alt={img.name}
+                    className="user-bubble__img"
+                    title={img.name}
+                  />
+                ))}
+              </div>
+            )}
+            <div className="user-bubble__text">{m.content || '(empty)'}</div>
+          </div>
+        </div>
+      );
+      i++;
+    } else if (m.role === 'assistant') {
+      // 助手消息
+      const hasThinkingMs = (m as any)._thinkingMs != null && (m as any)._thinkingMs > 0;
+      const isEmpty = !m.content;
+      const isLast = i === messages.length - 1;
+      elements.push(
+        <div key={i} className="msg msg-assistant" style={{ flexShrink: 0 }}>
+          <div className="msg-avatar">AI</div>
+          <div className="msg-assistant-body">
+            {hasThinkingMs && (
+              <div className="thinking-indicator">
+                <span className="thinking-indicator__dot" />
+                <span>{formatThinkingTime((m as any)._thinkingMs)}</span>
+              </div>
+            )}
+            {m.content ? (
+              <MarkdownMessage text={m.content} />
+            ) : running && isLast ? (
+              <div className="dots-loading">
+                <span className="dots-loading__dot" />
+                <span className="dots-loading__dot" />
+                <span className="dots-loading__dot" />
+              </div>
+            ) : null}
+          </div>
+        </div>
+      );
+      i++;
+    } else if (m.role === 'tool') {
+      // 工具消息：收集连续的 tool 消息并分组为 ThinkingProcess
+      const groupStart = i;
+      const group: ChatMsg[] = [];
+      while (i < messages.length && messages[i].role === 'tool' && (messages[i] as any)._toolRole != null) {
+        group.push(messages[i]);
+        i++;
+      }
+      // 检查是否有后续的非 _toolRole tool 消息
+      while (i < messages.length && messages[i].role === 'tool' && (messages[i] as any)._toolRole == null) {
+        group.push(messages[i]);
+        i++;
+      }
+
+      if (group.length === 0) {
+        i++;
+        continue;
+      }
+
+      // 单条非分组消息（如 slash, rules, pending_edit）
+      if (group.length === 1 && !(group[0] as any)._toolRole) {
+        const gm = group[0];
+        const hasPending = (gm as any).pendingEditId != null;
+        elements.push(
+          <div key={groupStart} className={`msg msg-tool${hasPending ? ' has-pending' : ''}`}>
+            <span className="msg-plain">{gm.content}</span>
+          </div>
+        );
+        continue;
+      }
+
+      // 单个 think/extended_thinking 结果（没有 call）
+      const hasCall = group.some(g => (g as any)._toolRole === 'call');
+      const resultsOnly = group.filter(g => (g as any)._toolRole === 'result');
+      if (!hasCall && resultsOnly.length === 1) {
+        const r = resultsOnly[0];
+        const rAny = r as any;
+        if (rAny.thinkFull != null) {
+          elements.push(
+            <div key={groupStart} className="msg msg-tool">
+              <ThinkBubble preview={r.content} full={rAny.thinkFull} />
+            </div>
+          );
+          continue;
+        }
+        if (rAny.pendingEditId != null) {
+          elements.push(
+            <div key={groupStart} className="msg msg-tool has-pending">
+              <span className="msg-plain">{r.content}</span>
+            </div>
+          );
+          continue;
+        }
+        if (rAny._imageData) {
+          elements.push(
+            <div key={groupStart} className="msg msg-tool">
+              <div className="tool-image-result">
+                <span className="msg-plain">{r.content}</span>
+                <img
+                  className="tool-image-result__img"
+                  src={`data:${rAny._imageData.media_type};base64,${rAny._imageData.data}`}
+                  alt={(rAny._toolName ?? 'tool') + ' image'}
+                />
+              </div>
+            </div>
+          );
+          continue;
+        }
+        elements.push(
+          <div key={groupStart} className="msg msg-tool">
+            <span className="msg-plain">{r.content}</span>
+          </div>
+        );
+        continue;
+      }
+
+      // 多条工具 → ThinkingProcess 分组
+      elements.push(
+        <div key={groupStart} className="msg msg-tool">
+          <ThinkingProcess steps={group} isRunning={running} />
+        </div>
+      );
+    } else {
+      // 其他角色
+      elements.push(
+        <div key={i} className={`msg msg-${m.role}`}>
+          <span className="msg-plain">{m.content}</span>
+        </div>
+      );
+      i++;
+    }
+  }
+
+  return <>{elements}</>;
 }

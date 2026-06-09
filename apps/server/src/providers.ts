@@ -47,6 +47,12 @@ export interface ProviderProfile {
    * 设置后优先使用此值。
    */
   contextWindow?: number;
+  /**
+   * 是否支持多模态图片（vision）。
+   * true（默认）= 支持 OpenAI vision content 数组格式
+   * false = API 不支持，图片会被忽略并提示用户
+   */
+  supportsVision?: boolean;
 }
 
 export interface ProviderConfig {
@@ -179,6 +185,7 @@ export class ProviderStore {
       embedModel: p.embedModel,
       embedDim: p.embedDim,
       hash: !!p.hash,
+      supportsVision: p.supportsVision,
     };
     if (existing >= 0) this.cfg.profiles[existing] = next;
     else this.cfg.profiles.push(next);

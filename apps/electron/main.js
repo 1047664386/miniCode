@@ -25,6 +25,12 @@ const https = require('node:https');
 const os = require('node:os');
 const { execFileSync } = require('node:child_process');
 const { openAgentsWindow, getAgentsWindow, isAgentsWindowOpen } = require('./agents-window.js');
+const { getSpeechService, SAMPLE_RATE } = require('./speech-service.js');
+
+// 防止 pnpm 并行进程管道断开时 console.log 导致应用崩溃
+process.stdout?.on('error', (err) => {
+  if (err.code === 'EPIPE') return; // 管道断开，安全忽略
+});
 
 const IS_DEV = process.env.ELECTRON_DEV === '1';
 const SERVER_PORT = Number(process.env.MINI_PORT ?? 5174);
@@ -552,6 +558,15 @@ function createWindow() {
     cb({ redirectURL: `http://127.0.0.1:${SERVER_PORT}${url.pathname}${url.search}` });
   });
 
+  // 授权麦克风权限（语音输入需要）
+  sess.setPermissionRequestHandler((webContents, permission, callback) => {
+    if (permission === 'media') {
+      callback(true);
+    } else {
+      callback(false);
+    }
+  });
+
   if (IS_DEV) {
     mainWindow.loadURL('http://localhost:5173');
     mainWindow.webContents.openDevTools({ mode: 'right' });
@@ -617,6 +632,55 @@ ipcMain.handle('set-config', (_e, patch) => {
   const next = { ...cur, ...patch };
   fs.writeFileSync(cfgPath, JSON.stringify(next, null, 2));
   return next;
+});
+
+// ----- 语音识别 IPC (sherpa-onnx) -----
+ipcMain.handle('speech:get-status', () => {
+  const svc = getSpeechService();
+  return {
+    available: true,
+    modelReady: svc.modelReady,
+    sampleRate: SAMPLE_RATE,
+  };
+});
+
+ipcMain.handle('speech:ensure-model', async (event) => {
+  const svc = getSpeechService();
+  const win = BrowserWindow.fromWebContents(event.sender);
+  await svc.ensureModel((status) => {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('speech:model-status', status);
+    }
+  });
+  // 确保模型加载到内存
+  await svc.loadModel();
+  return { ok: true };
+});
+
+ipcMain.handle('speech:start', (event) => {
+  const svc = getSpeechService();
+  if (!svc.modelReady) {
+    throw new Error('Model not loaded, call speech:ensure-model first');
+  }
+  svc.startRecognition((result) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('speech:result', result);
+    }
+  });
+  return { ok: true };
+});
+
+ipcMain.on('speech:audio', (_event, buffer) => {
+  const svc = getSpeechService();
+  // IPC 传来的 ArrayBuffer → Float32Array（sherpa-onnx 原生格式）
+  svc.feedAudio(new Float32Array(buffer));
+});
+
+ipcMain.handle('speech:stop', () => {
+  const svc = getSpeechService();
+  const result = svc.stopRecognition();
+  return { ok: true, finalResult: result };
 });
 
 // ----- Agents Window IPC -----
@@ -716,6 +780,20 @@ function setupAutoUpdate() {
   }
 }
 
+// ----- dev: 等待 Vite dev server 就绪 -----
+async function waitForVite(maxWaitMs = 30_000) {
+  const url = 'http://localhost:5173';
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(url);
+      if (res.ok || res.status === 404) return true;
+    } catch { /* 还没就绪 */ }
+    await new Promise(r => setTimeout(r, 300));
+  }
+  throw new Error('Vite dev server not ready on port 5173 after 30s');
+}
+
 // ----- app lifecycle -----
 app.whenReady().then(async () => {
   try {
@@ -725,8 +803,38 @@ app.whenReady().then(async () => {
     app.quit();
     return;
   }
+
+  // 开发模式下等待 Vite 就绪后再创建窗口，避免白屏
+  if (IS_DEV) {
+    try {
+      await waitForVite();
+      console.log('[electron] Vite dev server ready');
+    } catch (e) {
+      console.warn('[electron]', e.message, '- creating window anyway');
+    }
+  }
+
   createWindow();
   setupAutoUpdate();
+
+  // 语音模型预加载（postinstall 已下载好，直接加载到内存）
+  const safeLog = (...args) => { try { console.log(...args); } catch {} };
+  const speechService = getSpeechService();
+
+  // 检查模型是否已下载（postinstall 应该已完成）
+  if (speechService._isModelDownloaded()) {
+    // 模型存在，后台加载到内存（~1-2秒，不阻塞 UI）
+    setImmediate(() => {
+      speechService.loadModel()
+        .then(() => safeLog('[speech] model preloaded'))
+        .catch((e) => {
+          try { console.warn('[speech] model preload failed:', e?.message ?? e); } catch {}
+        });
+    });
+  } else {
+    // 模型不存在（可能是 SKIP_SPEECH_MODEL=1 安装的），跳过
+    safeLog('[speech] model not found, voice input disabled until next install');
+  }
 
   // VSCode 模式后端：异步起，不阻塞主窗口（首次启动可能要下载 80MB）
   startCodeServer().catch((e) => {

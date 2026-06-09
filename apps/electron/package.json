@@ -12,10 +12,17 @@
     "dist:mac": "pnpm run build && electron-builder --mac",
     "dist:mac:fast": "pnpm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac zip --arm64 && node ../../scripts/resign-mac-app.mjs",
     "dist:win": "pnpm run build && electron-builder --win",
-    "dist:linux": "pnpm run build && electron-builder --linux"
+    "dist:linux": "pnpm run build && electron-builder --linux",
+    "postinstall": "node scripts/download-speech-model.js"
   },
   "dependencies": {
-    "electron-updater": "^6.3.9"
+    "adm-zip": "^0.5.16",
+    "electron-updater": "^6.3.9",
+    "sherpa-onnx-darwin-arm64": "^1.10.27",
+    "sherpa-onnx-darwin-x64": "^1.10.27",
+    "sherpa-onnx-linux-x64": "^1.10.27",
+    "sherpa-onnx-node": "^1.10.27",
+    "sherpa-onnx-win-x64": "^1.10.27"
   },
   "devDependencies": {
     "electron": "^33.0.0",
@@ -32,6 +39,7 @@
       "main.js",
       "preload.js",
       "agents-window.js",
+      "speech-service.js",
       "package.json"
     ],
     "extraResources": [
@@ -57,6 +65,9 @@
       }
     ],
     "asar": true,
+    "asarUnpack": [
+      "node_modules/sherpa-onnx-*/**/*"
+    ],
     "mac": {
       "category": "public.app-category.developer-tools",
       "target": [

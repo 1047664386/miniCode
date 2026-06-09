@@ -7957,27 +7957,42 @@ var OpenAICompatProvider = class {
   }
   opts;
   name = "openai-compat";
+  /** 自动推断当前模型是否支持 vision（针对 DashScope/通义千问等需要显式区分 VL 模型的端点） */
+  inferVisionSupport() {
+    if (this.opts.supportsVision !== void 0) return this.opts.supportsVision;
+    const baseURL = this.opts.baseURL.toLowerCase();
+    const model = (this.opts.defaultModel ?? "").toLowerCase();
+    if (baseURL.includes("dashscope")) {
+      return /qwen.*-vl|qwen-vl/i.test(model);
+    }
+    return true;
+  }
   async *chatStream(messages, opts = {}) {
     const useAnthropicCache = !!this.opts.enableAnthropicCache;
-    const body = {
+    const supportsVision = this.inferVisionSupport();
+    const buildBody = (stripImages) => ({
       model: opts.model ?? this.opts.defaultModel ?? "gpt-4o-mini",
       messages: messages.map((m) => {
         const multimodal = m._multimodal;
         let content;
-        if (multimodal) {
+        if (multimodal && supportsVision && !stripImages) {
           content = multimodal.map((block) => {
             if (block.type === "text") return { type: "text", text: block.text };
             if (block.type === "image" && block.source) {
               return {
                 type: "image_url",
                 image_url: {
-                  url: `data:${block.source.media_type};base64,${block.source.data}`,
-                  detail: "auto"
+                  url: `data:${block.source.media_type};base64,${block.source.data}`
                 }
               };
             }
             return block;
           });
+        } else if (multimodal && (!supportsVision || stripImages)) {
+          const textBlock = multimodal.find((b) => b.type === "text");
+          const imageCount = multimodal.filter((b) => b.type === "image").length;
+          content = (textBlock?.text ?? m.content) + (imageCount > 0 ? `
+[\u7528\u6237\u9644\u5E26\u4E86 ${imageCount} \u5F20\u56FE\u7247\uFF0C\u4F46\u5F53\u524D\u6A21\u578B\u4E0D\u652F\u6301\u56FE\u7247\u8BC6\u522B]` : "");
         } else if (useAnthropicCache && m.cacheHint === "ephemeral") {
           content = [{ type: "text", text: m.content, cache_control: { type: "ephemeral" } }];
         } else {
@@ -7985,15 +8000,17 @@ var OpenAICompatProvider = class {
         }
         const base = {
           role: m.role,
-          content,
-          tool_calls: m.tool_calls?.map((t) => ({
+          content
+        };
+        if (m.tool_calls?.length) {
+          base.tool_calls = m.tool_calls.map((t) => ({
             id: t.id,
             type: "function",
             function: { name: t.name, arguments: JSON.stringify(t.arguments) }
-          })),
-          tool_call_id: m.tool_call_id,
-          name: m.name
-        };
+          }));
+        }
+        if (m.tool_call_id) base.tool_call_id = m.tool_call_id;
+        if (m.name) base.name = m.name;
         return base;
       }),
       stream: true,
@@ -8002,13 +8019,15 @@ var OpenAICompatProvider = class {
         type: "function",
         function: { name: t.name, description: t.description, parameters: t.parameters }
       }))
-    };
-    if (opts.responseFormat) {
-      body.response_format = opts.responseFormat;
-      if (body.response_format && !body.tools) {
+    });
+    const applyResponseFormat = (body2) => {
+      if (opts.responseFormat) {
+        body2.response_format = opts.responseFormat;
       }
-    }
-    const resp = await fetch(`${this.opts.baseURL.replace(/\/$/, "")}/chat/completions`, {
+    };
+    let body = buildBody(false);
+    applyResponseFormat(body);
+    let resp = await fetch(`${this.opts.baseURL.replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${this.opts.apiKey}`,
@@ -8017,6 +8036,32 @@ var OpenAICompatProvider = class {
       body: JSON.stringify(body),
       signal: opts.signal
     });
+    if (resp.status === 400) {
+      const errBody = await resp.text().catch(() => "");
+      const hasImages = messages.some((m) => !!m._multimodal);
+      if (hasImages) {
+        console.warn("[OpenAI Provider] 400 error with images, retrying without images...", errBody);
+        body = buildBody(true);
+        applyResponseFormat(body);
+        resp = await fetch(`${this.opts.baseURL.replace(/\/$/, "")}/chat/completions`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${this.opts.apiKey}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(body),
+          signal: opts.signal
+        });
+        if (resp.ok && resp.body) {
+          yield { delta: "\n\n> \u26A0\uFE0F \u5F53\u524D\u6A21\u578B\u4E0D\u652F\u6301\u56FE\u7247\u8BC6\u522B\uFF0C\u5DF2\u81EA\u52A8\u5265\u79BB\u56FE\u7247\u7EE7\u7EED\u5BF9\u8BDD\u3002\u5982\u9700\u56FE\u7247\u8BC6\u522B\uFF0C\u8BF7\u5728\u6A21\u578B\u8BBE\u7F6E\u4E2D\u5207\u6362\u5230\u652F\u6301\u89C6\u89C9\u7684\u6A21\u578B\uFF08\u5982 qwen-vl-max\uFF09\u3002\n\n" };
+        } else if (!resp.ok) {
+          const retryErrBody = await resp.text().catch(() => "");
+          throw new Error(`LLM HTTP 400 (\u91CD\u8BD5\u5265\u79BB\u56FE\u7247\u540E\u4ECD\u5931\u8D25): \u539F\u59CB\u9519\u8BEF=${errBody}; \u91CD\u8BD5\u9519\u8BEF=HTTP ${resp.status}: ${retryErrBody}`);
+        }
+      } else {
+        throw new Error(`LLM HTTP 400: ${errBody}`);
+      }
+    }
     if (!resp.ok || !resp.body) {
       const text = await resp.text().catch(() => "");
       throw new Error(`LLM HTTP ${resp.status}: ${text}`);
@@ -13915,7 +13960,8 @@ var ProviderStore = class {
       model: p.model,
       embedModel: p.embedModel,
       embedDim: p.embedDim,
-      hash: !!p.hash
+      hash: !!p.hash,
+      supportsVision: p.supportsVision
     };
     if (existing >= 0) this.cfg.profiles[existing] = next;
     else this.cfg.profiles.push(next);
@@ -15111,7 +15157,9 @@ function createProvider(profile) {
     defaultModel: profile.model || "deepseek-chat",
     embedModel: profile.embedModel || "text-embedding-3-small",
     // 走 OpenAI 兼容代理调 Claude 也支持 cache_control
-    enableAnthropicCache: /claude|anthropic/i.test(profile.model ?? "")
+    enableAnthropicCache: /claude|anthropic/i.test(profile.model ?? ""),
+    // 多模态 vision 支持：默认 true；用户可在 profile 里设为 false
+    supportsVision: profile.supportsVision !== false
   });
 }
 function classifyError2(e) {

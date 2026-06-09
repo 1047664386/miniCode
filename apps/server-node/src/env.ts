@@ -5,7 +5,7 @@
 import path from 'node:path';
 
 export const env = {
-  PORT: Number(process.env.PORT ?? 5174),
+  PORT: Number(process.env.PORT ?? 5175),
   WORKSPACE: process.env.WORKSPACE ? path.resolve(process.env.WORKSPACE) : process.cwd(),
   AUTH_TOKEN: process.env.MINI_AUTH_TOKEN?.trim() || '',
   AUTH_TOKENS: (process.env.MINI_AUTH_TOKENS ?? '').split(',').map((s) => s.trim()).filter(Boolean),

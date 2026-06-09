@@ -53,6 +53,10 @@ export interface ChatMsg {
   _thinkingMs?: number;
   /** tool_result 里的图片数据（来自 read_image / screenshot tool 的 __image 字段） */
   _imageData?: { media_type: string; data: string };
+  /** 用户消息附带的图片缩略图（粘贴/拖拽/上传） */
+  _images?: Array<{ name: string; dataUrl: string }>;
+  /** 用户实际输入的文字（不含 @file:xxx 等附件前缀和 <editor-context> 标签） */
+  _displayText?: string;
 }
 
 interface State {

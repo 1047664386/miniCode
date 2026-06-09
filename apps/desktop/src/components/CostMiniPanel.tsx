@@ -126,24 +126,20 @@ export function CostMiniPanel() {
 
   return (
     <div
+      className="cost-mini-panel"
       style={{
-        position: 'fixed',
-        bottom: 12,
-        right: 12,
-        zIndex: 50,
-        background: 'rgba(20, 24, 32, 0.92)',
-        border: '1px solid rgba(255,255,255,0.12)',
-        borderRadius: 6,
-        padding: collapsed ? '4px 10px' : '8px 12px',
+        padding: collapsed ? '4px 12px' : '8px 12px',
         fontFamily: 'ui-monospace, SFMono-Regular, monospace',
         fontSize: 11,
         color: '#cbd5e1',
         cursor: 'pointer',
         userSelect: 'none',
-        backdropFilter: 'blur(6px)',
-        boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+        background: '#181c24',
+        borderTop: '1px solid rgba(255,255,255,0.08)',
+        borderBottom: '1px solid rgba(255,255,255,0.04)',
         minWidth: collapsed ? undefined : 260,
-        maxWidth: 300,
+        maxWidth: '100%',
+        flexShrink: 0,
       }}
       onClick={() => setCollapsed(!collapsed)}
       title="Click to expand/collapse"

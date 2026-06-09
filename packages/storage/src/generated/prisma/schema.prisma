@@ -1,0 +1,94 @@
+// Prisma schema —— miniCodeIde 云端版（M2）
+//
+// 部署：本地 docker-compose 起 Postgres；线上可换 Supabase / 自建 RDS。
+// 迁移命令：
+//   pnpm --filter @mini/storage prisma migrate dev --name init
+//   pnpm --filter @mini/storage prisma generate
+//
+// 设计要点见 plan/M2-web-cloud-skeleton 的 data-model 段。
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id         String  @id @default(cuid())
+  email      String? @unique
+  wxOpenId   String? @unique
+  name       String?
+  // BYOK / 计费扩展位（M5 用）：用户自己的 LLM key，加密存
+  llmKeyEnc  String?
+  llmBaseUrl String?
+  llmModel   String?
+  llmKind    String? // 'openai' | 'anthropic'
+  // 试用配额：已用 token 数（M5 计费用）
+  usedTokens Int     @default(0)
+  freeQuota  Int     @default(50000) // 默认 5w token 免费试用
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  sessions  Session[]
+}
+
+model Session {
+  id     String @id // sess_xxx，沿用 ID 习惯
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  title         String  @default("New chat")
+  mode          String  @default("work") // 'work' | 'code'
+  workspaceRoot String? // 网页版 Code 模式时指向沙箱路径（M3）
+  remoteUser    String? // 微信 wxid（可选，复用桌面字段语义）
+
+  messageCount    Int   @default(0)
+  interruptedTurn Json? // 与 SessionMeta.interruptedTurn 结构一致
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages Message[]
+  turns    Turn[]
+
+  @@index([userId, updatedAt(sort: Desc)])
+  @@index([remoteUser])
+}
+
+model Message {
+  id        BigInt  @id @default(autoincrement())
+  sessionId String
+  session   Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  role    String // 'user' | 'assistant' | 'tool' | 'system'
+  content String @db.Text
+  ts      BigInt // ms epoch
+
+  toolName        String?
+  pendingEditId   String?
+  pendingEditPath String?
+
+  @@index([sessionId, ts])
+}
+
+model Turn {
+  id        String  @id // t_xxx
+  sessionId String
+  session   Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  userMessage String  @db.Text
+  status      String  @default("pending") // 'pending' | 'done' | 'interrupted'
+  finalText   String? @db.Text
+  startedAt   BigInt
+  endedAt     BigInt?
+
+  // 流式 delta append 进 jsonb 数组：[{delta, ts}]
+  chunks Json @default("[]")
+  // tool 调用记录：[{name, args, result, error?, ts}]
+  tools  Json @default("[]")
+
+  @@index([sessionId, startedAt])
+}

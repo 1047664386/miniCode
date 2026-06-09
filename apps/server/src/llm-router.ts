@@ -179,6 +179,8 @@ export function createProvider(profile: ProviderProfile): LLMProvider {
     embedModel: profile.embedModel || 'text-embedding-3-small',
     // 走 OpenAI 兼容代理调 Claude 也支持 cache_control
     enableAnthropicCache: /claude|anthropic/i.test(profile.model ?? ''),
+    // 多模态 vision 支持：默认 true；用户可在 profile 里设为 false
+    supportsVision: profile.supportsVision !== false,
   });
 }
 

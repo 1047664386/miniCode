@@ -3,7 +3,7 @@ import { useState, useEffect, useRef } from 'react';
 import { useAgentsStore } from './store';
 import { ModeToggle } from './ModeToggle';
 import { WorkspacePicker } from './WorkspacePicker';
-import { useWebSpeech } from '../hooks/useWebSpeech';
+import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
 
 interface ChatMsg {
   role: 'user' | 'assistant';
@@ -84,8 +84,8 @@ export function AgentsMain() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // ----- 语音 -----
-  const speech = useWebSpeech({ lang: 'zh-CN' });
+  // ----- 语音（Electron→Vosk / Web→WebSpeech 自动选择）-----
+  const speech = useSpeechRecognition({ lang: 'zh-CN' });
   const lastSpeechRef = useRef('');
 
   // 把语音 transcript 拼回输入框（增量同步，不覆盖用户手打的内容）
@@ -367,9 +367,10 @@ export function AgentsMain() {
   // ----- 语音按钮 toggle -----
   function toggleVoice() {
     if (!speech.supported) {
-      alert('当前浏览器不支持 Web Speech API（建议 Chrome / Edge / Safari）');
+      alert('语音识别不可用（桌面端需 Electron，Web 端需 Chrome / Edge）');
       return;
     }
+    if (speech.modelLoading) return;
     if (speech.isListening) {
       speech.stopListening();
     } else {
@@ -477,11 +478,17 @@ export function AgentsMain() {
         )}
 
         {/* 语音状态条 */}
+        {speech.modelLoading && (
+          <div className="agents-voice-bar">
+            <span className="agents-voice-dot" />
+            语音模型加载中…
+          </div>
+        )}
         {speech.isListening && (
           <div className="agents-voice-bar">
             <span className="agents-voice-dot" />
             语音识别中…
-            {speech.interim && <em className="agents-voice-interim"> {speech.interim}</em>}
+            {speech.transcript && <em className="agents-voice-interim"> {speech.transcript}</em>}
           </div>
         )}
 
@@ -490,7 +497,11 @@ export function AgentsMain() {
             ref={textareaRef}
             className="agents-input"
             placeholder={
-              speech.isListening ? '语音识别中…' : '输入问题，⏎ 发送 · ⇧⏎ 换行 · / 唤起技能 · 拖入文件'
+              speech.modelLoading
+                ? '语音模型加载中…'
+                : speech.isListening
+                  ? '语音识别中…'
+                  : '输入问题，⏎ 发送 · ⇧⏎ 换行 · / 唤起技能 · 拖入文件'
             }
             value={input}
             onChange={(e) => handleInputChange(e.target.value)}
@@ -568,10 +579,18 @@ export function AgentsMain() {
             >📎</button>
             <button
               className={`agents-tool-btn${speech.isListening ? ' agents-tool-btn--active' : ''}`}
-              title={speech.supported ? (speech.isListening ? '停止语音' : '开始语音输入') : '当前浏览器不支持语音'}
+              title={
+                !speech.supported
+                  ? '语音识别不可用'
+                  : speech.modelLoading
+                    ? '语音模型加载中…'
+                    : speech.isListening
+                      ? '停止语音'
+                      : '开始语音输入（离线识别）'
+              }
               onClick={toggleVoice}
-              disabled={!speech.supported}
-            >🎤</button>
+              disabled={!speech.supported || speech.modelLoading}
+            >{speech.modelLoading ? '⏳' : '🎤'}</button>
             <button
               className="agents-tool-btn"
               title="唤起技能"

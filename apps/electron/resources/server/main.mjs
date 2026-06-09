@@ -7944,6 +7944,7 @@ var require_websocket_server = __commonJS({
 
 // src/main.ts
 import http from "node:http";
+import { execSync } from "node:child_process";
 import { URL as URL2 } from "node:url";
 import { performance } from "node:perf_hooks";
 
@@ -13937,6 +13938,10 @@ var ProviderStore = class {
       active: this.cfg.active
     };
   }
+  /** 内部用：返回完整配置（含明文 apiKey），仅供本地 syncToCloud 等内部调用 */
+  getConfig() {
+    return structuredClone(this.cfg);
+  }
   /** 内部用：拿真实 apiKey */
   get(id) {
     return this.cfg.profiles.find((p) => p.id === id);
@@ -13965,6 +13970,14 @@ var ProviderStore = class {
     };
     if (existing >= 0) this.cfg.profiles[existing] = next;
     else this.cfg.profiles.push(next);
+    if (!next.hash) {
+      if (!this.cfg.active.chat && this.cfg.profiles.filter((p2) => !p2.hash).length <= 1) {
+        this.cfg.active.chat = id;
+      }
+      if (!this.cfg.active.complete && this.cfg.profiles.filter((p2) => !p2.hash).length <= 1) {
+        this.cfg.active.complete = id;
+      }
+    }
     await this.save();
     this.onChange?.();
     return next;
@@ -17419,7 +17432,7 @@ var ApprovalsStore = class {
 // src/env.ts
 import path23 from "node:path";
 var env = {
-  PORT: Number(process.env.PORT ?? 5174),
+  PORT: Number(process.env.PORT ?? 5175),
   WORKSPACE: process.env.WORKSPACE ? path23.resolve(process.env.WORKSPACE) : process.cwd(),
   AUTH_TOKEN: process.env.MINI_AUTH_TOKEN?.trim() || "",
   AUTH_TOKENS: (process.env.MINI_AUTH_TOKENS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
@@ -18771,6 +18784,10 @@ ${answer.trim() || "(empty)"}
     sendJson(c.res, 200, { ok: true, count: s.slash.list().length });
   });
   r.get("/api/providers", (c) => sendJson(c.res, 200, s.providers.list()));
+  r.get("/api/providers/raw", (c) => {
+    const cfg = s.providers.getConfig();
+    sendJson(c.res, 200, cfg);
+  });
   r.post("/api/providers", async (c) => {
     try {
       const body = await readBody(c.req);
@@ -19716,6 +19733,22 @@ async function main() {
   const httpServer = http.createServer(handler);
   attachLspBridge(httpServer, { path: "/lsp", cwd: env.WORKSPACE });
   attachTerminalBridge(httpServer, { path: "/terminal", cwd: env.WORKSPACE });
+  httpServer.on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`[server-node] Port ${env.PORT} already in use, killing...`);
+      try {
+        execSync(`lsof -ti :${env.PORT} | xargs kill -9`, { stdio: "ignore" });
+      } catch {
+      }
+      setTimeout(() => {
+        httpServer.listen(env.PORT, () => {
+          console.log(`[server-node] \u{1F680} listening on http://127.0.0.1:${env.PORT} (retry)`);
+        });
+      }, 1e3);
+    } else {
+      throw err;
+    }
+  });
   httpServer.listen(env.PORT, () => {
     console.log(`[server-node] \u{1F680} listening on http://127.0.0.1:${env.PORT}`);
     console.log(`[server-node] startup total ${(performance.now() - t0).toFixed(1)}ms`);

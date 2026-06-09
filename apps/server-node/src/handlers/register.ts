@@ -1075,6 +1075,7 @@ export function registerHandlers(r: Router, s: Services) {
 
     let assistantBuf = '';
     let userAbort = false;
+    let agentDoneReason = 'completed';
 
     const autoCtx = s.index
       ? (await hybridRetrieve(s.index, s.embedder, userMessage, 6, s.reranker)).map((h) => ({
@@ -1157,6 +1158,7 @@ export function registerHandlers(r: Router, s: Services) {
             if (persistSession && currentTurnId)
               s.sessions.appendChunk(rawSessionId!, currentTurnId, ev.text).catch(() => undefined);
           }
+          if (ev.type === 'done' && ev.reason) agentDoneReason = ev.reason;
           sse.send(ev);
         }
       } else {
@@ -1242,10 +1244,12 @@ export function registerHandlers(r: Router, s: Services) {
                 s.recentActivity.record(chatSessionId, { kind: 'search', target: args.regex });
             }
           }
+          if (ev.type === 'done' && ev.reason) agentDoneReason = ev.reason;
           sse.send(ev);
         }
       }
     } catch (e: any) {
+      agentDoneReason = 'error';
       sse.send({ type: 'error', error: e?.message ?? String(e) });
       if (persistSession && currentTurnId)
         await s.sessions.interruptTurn(rawSessionId!, currentTurnId, e?.message ?? String(e)).catch(() => undefined);
@@ -1271,7 +1275,7 @@ export function registerHandlers(r: Router, s: Services) {
           onSaved: (it) => { try { sse.send({ type: 'memory_saved', title: it.title, category: it.category, scope: it.scope }); } catch { /* */ } },
         }).catch(() => undefined);
       }
-      sse.send({ type: 'done' });
+      sse.send({ type: 'done', reason: userAbort ? 'aborted' : agentDoneReason });
       sse.end();
     }
   });

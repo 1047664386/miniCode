@@ -29,12 +29,21 @@ import {
   type RecoveryState,
 } from './error-recovery.js';
 
+export type AgentDoneReason =
+  | 'completed'      // LLM 不再请求工具 → 正常结束
+  | 'max_steps'      // 达到 maxSteps 上限
+  | 'stream_error'   // LLM 流中途断开
+  | 'fatal'          // 不可恢复的错误（backoff 耗尽、context overflow 等）
+  | 'hook_block';    // 被 Hook 阻止
+
 export interface AgentEvent {
   type: 'text' | 'tool_call' | 'tool_result' | 'done' | 'error' | 'usage' | 'plan';
   text?: string;
   toolCall?: ToolCall;
   toolResult?: unknown;
   error?: string;
+  reason?: AgentDoneReason;
+  step?: number;
   usage?: {
     promptTokens?: number;
     completionTokens?: number;
@@ -96,7 +105,7 @@ export async function* runAgent(opts: RunAgentOptions): AsyncGenerator<AgentEven
       });
       if (r.block) {
         yield { type: 'error', error: `[hook-block] ${r.blockReason ?? 'blocked'}` };
-        yield { type: 'done' };
+        yield { type: 'done', reason: 'hook_block' as AgentDoneReason };
         return;
       }
       if (r.injectSystem) {
@@ -147,6 +156,7 @@ export async function* runAgent(opts: RunAgentOptions): AsyncGenerator<AgentEven
           const action = decideOverflowAction(recovery);
           if (action.kind === 'fatal') {
             yield { type: 'error', error: `[fatal] ${action.reason}` };
+            yield { type: 'done', reason: 'fatal' as AgentDoneReason, step };
             return;
           }
           // reactive compact = hardCompact
@@ -163,6 +173,7 @@ export async function* runAgent(opts: RunAgentOptions): AsyncGenerator<AgentEven
           const action = decideBackoffAction(recovery, cls);
           if (action.kind === 'fatal') {
             yield { type: 'error', error: `[fatal] ${action.reason}` };
+            yield { type: 'done', reason: 'fatal' as AgentDoneReason, step };
             return;
           }
           if (action.kind === 'backoff') {
@@ -204,6 +215,7 @@ export async function* runAgent(opts: RunAgentOptions): AsyncGenerator<AgentEven
     } catch (e) {
       // 流中途抛错：不重试（用户已看到部分内容），转成 error 事件
       yield { type: 'error', error: `[stream-error] ${(e as any)?.message ?? e}` };
+      yield { type: 'done', reason: 'stream_error' as AgentDoneReason, step };
       return;
     }
 
@@ -244,7 +256,7 @@ export async function* runAgent(opts: RunAgentOptions): AsyncGenerator<AgentEven
         messages.push(assistantMsg);
         yield { type: 'error', error: `[fatal] ${action.reason}` };
         await maybeStop(hooks, 'error', step, messages);
-        yield { type: 'done' };
+        yield { type: 'done', reason: 'fatal' as AgentDoneReason, step };
         return;
       }
     }
@@ -260,7 +272,7 @@ export async function* runAgent(opts: RunAgentOptions): AsyncGenerator<AgentEven
           continue;
         }
       }
-      yield { type: 'done' };
+      yield { type: 'done', reason: 'completed' as AgentDoneReason, step };
       return;
     }
 
@@ -445,7 +457,12 @@ export async function* runAgent(opts: RunAgentOptions): AsyncGenerator<AgentEven
       yield { type: 'error', error: '[max-steps] reached but Stop hook requested forceContinue (ignored to prevent runaway).' };
     }
   }
-  yield { type: 'done' };
+  // 通知用户已达步骤上限，建议继续
+  yield {
+    type: 'text',
+    text: `\n\n⚠️ 已达到最大步骤数 (${maxSteps})，执行暂停。如需继续，请再次发送消息。`,
+  };
+  yield { type: 'done', reason: 'max_steps' as AgentDoneReason, step: maxSteps };
 }
 
 async function maybeStop(hooks: HookBus | undefined, reason: 'done' | 'max_steps' | 'error', step: number, messages: ChatMessage[]) {

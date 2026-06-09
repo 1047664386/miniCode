@@ -1,4 +1,5 @@
 import type { ChatChunk, ChatMessage, LLMChatOptions, LLMProvider } from './types.js';
+import { combinedSignal, readWithIdleTimeout, DEFAULT_FETCH_TIMEOUT_MS, DEFAULT_STREAM_IDLE_TIMEOUT_MS } from './types.js';
 
 /**
  * OpenAI 兼容 Provider（DeepSeek / Moonshot / Ollama-OpenAI 兼容接口 / OpenRouter 等都通吃）
@@ -108,6 +109,11 @@ export class OpenAICompatProvider implements LLMProvider {
     let body: Record<string, unknown> = buildBody(false) as any;
     applyResponseFormat(body);
 
+    // 两段式超时：Phase 1 — fetch 首帧等待超时（默认 60s）
+    const fetchTimeout = opts.fetchTimeoutMs ?? DEFAULT_FETCH_TIMEOUT_MS;
+    const idleTimeout = opts.streamIdleTimeoutMs ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS;
+    const fetchSig = combinedSignal(opts.signal, fetchTimeout);
+
     let resp = await fetch(`${this.opts.baseURL.replace(/\/$/, '')}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -115,7 +121,7 @@ export class OpenAICompatProvider implements LLMProvider {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
-      signal: opts.signal,
+      signal: fetchSig,
     });
 
     // 400 错误 + 消息中包含图片 → 自动剥离图片重试（部分 API 如 DashScope qwen-max 不支持 image_url）
@@ -133,7 +139,7 @@ export class OpenAICompatProvider implements LLMProvider {
             'Content-Type': 'application/json',
           },
           body: JSON.stringify(body),
-          signal: opts.signal,
+          signal: fetchSig,
         });
         // 重试成功时，先发送一条提示文本
         if (resp.ok && resp.body) {
@@ -159,7 +165,8 @@ export class OpenAICompatProvider implements LLMProvider {
     let buf = '';
 
     while (true) {
-      const { value, done } = await reader.read();
+      // Phase 2 — 流中途 idle 超时：每次 read 独立计时，收到 chunk 即重置
+      const { value, done } = await readWithIdleTimeout(reader, idleTimeout);
       if (done) break;
       buf += decoder.decode(value, { stream: true });
       const lines = buf.split('\n');

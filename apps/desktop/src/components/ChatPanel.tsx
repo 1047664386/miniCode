@@ -376,6 +376,7 @@ export function ChatPanel() {
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buf = '';
+      let receivedDone = false;
       // 占位一条 assistant 消息
       pushMessage({ role: 'assistant', content: '' });
 
@@ -391,11 +392,20 @@ export function ChatPanel() {
           if (!json) continue;
           try {
             const ev = JSON.parse(json);
+            if (ev.type === 'done') receivedDone = true;
             handleEvent(ev);
           } catch {
             /* */
           }
         }
+      }
+
+      // 连接断开检测：流结束了但没收到 done 事件 → 非正常中断
+      if (!receivedDone) {
+        pushMessage({
+          role: 'assistant',
+          content: '⚠️ 连接已断开，回答可能不完整。请检查网络后重新发送消息。',
+        } as any);
       }
     } catch (e: any) {
       pushMessage({ role: 'assistant', content: `❌ Error: ${e.message}` });
@@ -540,6 +550,13 @@ export function ChatPanel() {
         // Reset per-turn state
         thinkingSinceRef.current = 0;
         turnToolCountRef.current = 0;
+        // 非正常完成时给用户提示（max_steps 已通过 text 事件显示，这里处理其他情况）
+        if (ev.reason === 'stream_error' || ev.reason === 'fatal') {
+          pushMessage({
+            role: 'assistant',
+            content: '⚠️ 回答因错误中断，请查看上方的错误信息。如需继续，请重新发送消息。',
+          } as any);
+        }
         break;
       case 'subagent_spawned':
         pushMessage({

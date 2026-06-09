@@ -26,7 +26,7 @@ function openAgentsWindow({ devUrl, indexHtml, preload }) {
     minHeight: 640,
     x: undefined,
     y: undefined,
-    title: idx === 0 ? 'Agents Window' : `Agents Window (${idx + 1})`,
+    title: idx === 0 ? 'MyWorker' : `MyWorker (${idx + 1})`,
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     webPreferences: {
       contextIsolation: true,

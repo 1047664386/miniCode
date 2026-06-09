@@ -396,7 +396,7 @@ export function AgentsMain() {
         {messages.length === 0 ? (
           <div className="agents-hero">
             <div className="agents-hero-title">
-              {mode === 'work' ? 'Chat' : 'Coding'} With <span className="hero-badge">[ ✦ ]</span> Flicker
+              {mode === 'work' ? 'Chat' : 'Coding'} With <span className="hero-badge">[ ✦ ]</span> MyWorker
             </div>
             <div className="agents-hero-sub">
               {mode === 'work'

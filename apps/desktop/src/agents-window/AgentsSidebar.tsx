@@ -62,7 +62,7 @@ export function AgentsSidebar() {
 
   return (
     <aside className="agents-sidebar">
-      <div className="agents-sidebar-header">MyFlicker</div>
+      <div className="agents-sidebar-header">MyWorker</div>
       <button
         type="button"
         className="agents-new-chat"

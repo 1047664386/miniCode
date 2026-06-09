@@ -40,7 +40,7 @@ export function AgentsApp() {
   return (
     <div className="agents-window">
       <header className="agents-titlebar">
-        <span className="agents-brand">MyFlicker</span>
+        <span className="agents-brand">MyWorker</span>
         <span className="agents-titlebar-spacer" />
       </header>
       <div className={`agents-body ${layoutClass}`}>

@@ -246,6 +246,16 @@ interface State {
   register: (username: string, password: string) => Promise<{ error?: string }>;
   logout: () => Promise<void>;
   setAuthModalOpen: (open: boolean) => void;
+  // ─── 高级设置（localStorage 持久化） ────────────────────
+  advancedSettings: {
+    /** 首帧等待超时（秒），0 = 不限制 */
+    fetchTimeoutSec: number;
+    /** 流中途 idle 超时（秒），0 = 不限制 */
+    streamIdleTimeoutSec: number;
+    /** 是否禁用超时（勾选后上面两个值不生效） */
+    noTimeout: boolean;
+  };
+  setAdvancedSettings: (s: Partial<State['advancedSettings']>) => void;
 }
 
 export const useStore = create<State>((set, get) => ({
@@ -723,5 +733,27 @@ export const useStore = create<State>((set, get) => ({
     set({ authUser: null });
     // 登出后切回本地会话列表
     get().loadSessions().catch(() => {});
+  },
+  // ─── 高级设置 ──────────────────────────────────────────
+  advancedSettings: (() => {
+    try {
+      const raw = localStorage.getItem('mci.advancedSettings');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        return {
+          fetchTimeoutSec: parsed.fetchTimeoutSec ?? 300,
+          streamIdleTimeoutSec: parsed.streamIdleTimeoutSec ?? 120,
+          noTimeout: parsed.noTimeout ?? false,
+        };
+      }
+    } catch { /* */ }
+    return { fetchTimeoutSec: 300, streamIdleTimeoutSec: 120, noTimeout: false };
+  })(),
+  setAdvancedSettings(patch) {
+    set((s) => {
+      const next = { ...s.advancedSettings, ...patch };
+      try { localStorage.setItem('mci.advancedSettings', JSON.stringify(next)); } catch {}
+      return { advancedSettings: next };
+    });
   },
 }));

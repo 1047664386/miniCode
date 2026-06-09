@@ -1,5 +1,6 @@
 
 import { useEffect, useMemo, useState } from 'react';
+import { useStore } from '../store';
 
 type Kind = 'openai' | 'anthropic' | undefined;
 
@@ -394,7 +395,9 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
   const [selectedPreset, setSelectedPreset] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [testResult, setTestResult] = useState<Record<string, string>>({});
-  const [tab, setTab] = useState<'providers' | 'routing'>('providers');
+  const [tab, setTab] = useState<'providers' | 'routing' | 'advanced'>('providers');
+  const advancedSettings = useStore((s) => s.advancedSettings);
+  const setAdvancedSettings = useStore((s) => s.setAdvancedSettings);
 
   const refresh = async () => {
     const r = await fetch('/api/providers');
@@ -579,6 +582,12 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
               onClick={() => setTab('routing')}
             >
               Routing
+            </button>
+            <button
+              className={tab === 'advanced' ? 'active' : ''}
+              onClick={() => setTab('advanced')}
+            >
+              高级
             </button>
           </div>
           <button className="settings-close" onClick={onClose} title="Close (Esc)">
@@ -826,7 +835,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
                 </section>
               </div>
             </>
-          ) : (
+          ) : tab === 'routing' ? (
             <div className="settings-pane settings-pane-full">
               <section className="settings-section">
                 <div className="settings-section-head">
@@ -848,6 +857,69 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
                       onFallbacks={(ids) => setFallbacks(role, ids)}
                     />
                   ))}
+                </div>
+              </section>
+            </div>
+          ) : (
+            <div className="settings-pane settings-pane-full">
+              <section className="settings-section">
+                <div className="settings-section-head">
+                  <h4>LLM 超时设置</h4>
+                </div>
+                <p className="settings-hint">
+                  控制 Agent 与 LLM API 之间的超时行为。超时触发后会自动走 backoff / fallback 机制。
+                  值越大越不容易误杀慢请求，但检测断连也越慢。
+                </p>
+                <div className="advanced-form">
+                  <label className="advanced-toggle">
+                    <input
+                      type="checkbox"
+                      checked={advancedSettings.noTimeout}
+                      onChange={(e) => setAdvancedSettings({ noTimeout: e.target.checked })}
+                    />
+                    <span className="advanced-toggle-label">
+                      不限制超时
+                      <small className="hint">适合本地模型 / 特殊慢场景 / 批量预处理</small>
+                    </span>
+                  </label>
+
+                  <div className={`advanced-row ${advancedSettings.noTimeout ? 'disabled' : ''}`}>
+                    <span className="advanced-label">首帧等待超时</span>
+                    <div className="advanced-input-group">
+                      <input
+                        type="number"
+                        min={10}
+                        max={1800}
+                        step={10}
+                        value={advancedSettings.fetchTimeoutSec}
+                        disabled={advancedSettings.noTimeout}
+                        onChange={(e) =>
+                          setAdvancedSettings({ fetchTimeoutSec: Math.max(0, Number(e.target.value) || 300) })
+                        }
+                      />
+                      <span className="advanced-unit">秒</span>
+                    </div>
+                    <small className="hint">API 多久没响应视为失败（默认 300）</small>
+                  </div>
+
+                  <div className={`advanced-row ${advancedSettings.noTimeout ? 'disabled' : ''}`}>
+                    <span className="advanced-label">流中途空闲超时</span>
+                    <div className="advanced-input-group">
+                      <input
+                        type="number"
+                        min={10}
+                        max={600}
+                        step={10}
+                        value={advancedSettings.streamIdleTimeoutSec}
+                        disabled={advancedSettings.noTimeout}
+                        onChange={(e) =>
+                          setAdvancedSettings({ streamIdleTimeoutSec: Math.max(0, Number(e.target.value) || 120) })
+                        }
+                      />
+                      <span className="advanced-unit">秒</span>
+                    </div>
+                    <small className="hint">两个数据包之间最大等待（默认 120）</small>
+                  </div>
                 </div>
               </section>
             </div>

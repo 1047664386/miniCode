@@ -1030,10 +1030,12 @@ export function registerHandlers(r: Router, s: Services) {
     const { messages = [], userMessage: rawUserMessage,
       mode = 'agent', sessionId: rawSessionId,
       images = [],
+      timeout: clientTimeout,
     } = body as {
       messages: ChatMessage[]; userMessage: string;
       mode?: 'ask' | 'agent'; sessionId?: string;
       images?: Array<{ type: 'image'; media_type: string; data: string }>;
+      timeout?: { fetchTimeoutMs?: number; streamIdleTimeoutMs?: number };
     };
     const persistSession = rawSessionId && s.sessions.get(rawSessionId);
     const chatSessionId = rawSessionId ||
@@ -1152,6 +1154,7 @@ export function registerHandlers(r: Router, s: Services) {
         for await (const ev of runAgent({
           llm: llmRouted, registry: noToolRegistry, messages: initial,
           toolCtx: { cwd: s.workspace }, signal: abort.signal, maxSteps: 1,
+          llmTimeout: clientTimeout,
         })) {
           if (ev.type === 'text' && ev.text) {
             assistantBuf += ev.text;
@@ -1213,6 +1216,7 @@ export function registerHandlers(r: Router, s: Services) {
             },
           },
           signal: abort.signal,
+          llmTimeout: clientTimeout,
           toolDescSubstitutions: {
             roles: (() => {
               const names = s.subagents.getProfileNames();

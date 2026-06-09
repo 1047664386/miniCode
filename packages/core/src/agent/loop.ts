@@ -68,6 +68,8 @@ export interface RunAgentOptions {
   disableSoftCompact?: boolean;
   /** Tool description 运行时占位符替换（如 {roles} → "code-reviewer, test-writer, debugger"） */
   toolDescSubstitutions?: Record<string, string>;
+  /** 透传给 LLM provider 的超时参数（毫秒），来自前端高级设置 */
+  llmTimeout?: { fetchTimeoutMs?: number; streamIdleTimeoutMs?: number };
 }
 
 /** 单次 Agent 运行：流式 yield 所有事件，并把最终 messages 推到 messages 数组里 */
@@ -84,6 +86,7 @@ export async function* runAgent(opts: RunAgentOptions): AsyncGenerator<AgentEven
     workspace,
     disableSoftCompact,
     toolDescSubstitutions,
+    llmTimeout,
   } = opts;
   const tools = registry.toLLMSchemas(toolDescSubstitutions);
 
@@ -137,7 +140,7 @@ export async function* runAgent(opts: RunAgentOptions): AsyncGenerator<AgentEven
     let llmCallOk = false;
     while (!llmCallOk) {
       try {
-        stream = llm.chatStream(messages, { tools, model, signal });
+        stream = llm.chatStream(messages, { tools, model, signal, ...llmTimeout });
         // 拉第一帧探活，让 catch 能捕获 "立即报错"
         const it = (stream as any)[Symbol.asyncIterator]();
         const first = await it.next();

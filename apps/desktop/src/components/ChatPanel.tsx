@@ -50,6 +50,7 @@ export function ChatPanel() {
     openFile, revealLine,
     selectedProfileId, setSelectedProfileId,
     authUser, setAuthModalOpen, logout,
+    advancedSettings,
   } = useStore();
   const [input, setInput] = useState('');
   const [slashList, setSlashList] = useState<SlashSpec[]>([]);
@@ -365,6 +366,13 @@ export function ChatPanel() {
           sessionId: sid,
           profileId: selectedProfileId,
           ...(multimodalImages.length > 0 ? { images: multimodalImages } : {}),
+          // 高级设置：超时参数（0 = 不限制）
+          timeout: advancedSettings.noTimeout
+            ? { fetchTimeoutMs: 0, streamIdleTimeoutMs: 0 }
+            : {
+                fetchTimeoutMs: (advancedSettings.fetchTimeoutSec || 300) * 1000,
+                streamIdleTimeoutMs: (advancedSettings.streamIdleTimeoutSec || 120) * 1000,
+              },
         }),
       });
       if (!resp.ok) {

@@ -160,6 +160,11 @@ export class ProviderStore {
     };
   }
 
+  /** 内部用：返回完整配置（含明文 apiKey），仅供本地 syncToCloud 等内部调用 */
+  getConfig(): ProviderConfig {
+    return structuredClone(this.cfg);
+  }
+
   /** 内部用：拿真实 apiKey */
   get(id: string): ProviderProfile | undefined {
     return this.cfg.profiles.find((p) => p.id === id);
@@ -189,6 +194,17 @@ export class ProviderStore {
     };
     if (existing >= 0) this.cfg.profiles[existing] = next;
     else this.cfg.profiles.push(next);
+
+    // 如果是首个非 hash 真实 provider 且没有 active chat/complete，自动激活
+    if (!next.hash) {
+      if (!this.cfg.active.chat && this.cfg.profiles.filter((p) => !p.hash).length <= 1) {
+        this.cfg.active.chat = id;
+      }
+      if (!this.cfg.active.complete && this.cfg.profiles.filter((p) => !p.hash).length <= 1) {
+        this.cfg.active.complete = id;
+      }
+    }
+
     await this.save();
     this.onChange?.();
     return next;

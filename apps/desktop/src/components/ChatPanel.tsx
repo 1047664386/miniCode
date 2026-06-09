@@ -1,5 +1,5 @@
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useStore, type ChatMsg } from '../store';
 import { MarkdownMessage } from './MarkdownMessage';
 import { PlanPanel } from './PlanPanel';
@@ -10,10 +10,27 @@ import { McpSettingsPanel } from './McpSettingsPanel';
 import { ModelSettingsPanel } from './ModelSettingsPanel';
 import { ContextStatusBar } from './ContextStatusBar';
 import { SessionsDrawer } from './SessionsDrawer';
+import { MentionTag, parseMentions } from './MentionTag';
 import { MentionInput } from './MentionInput';
 import { AddContextPopover } from './AddContextPopover';
 import { vsBridge } from '../vscode-bridge';
 import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
+
+// ── SVG 图标组件（统一线条风格，currentColor 自适应主题色）──
+const I = ({ d, size = 16, ...rest }: { d: string; size?: number } & React.SVGAttributes<SVGSVGElement>) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+    strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" {...rest}>
+    {d.split('|').map((p, i) => <path key={i} d={p} />)}
+  </svg>
+);
+const IconKey     = (p: any) => <I {...p} d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" />;
+const IconUser    = (p: any) => <I {...p} d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2|M12 3a4 4 0 1 0 0 8 4 4 0 0 0 0-8z" />;
+const IconPlus    = (p: any) => <I {...p} d="M12 5v14|M5 12h14" />;
+const IconList    = (p: any) => <I {...p} d="M8 6h13|M8 12h13|M8 18h13|M3 6h.01|M3 12h.01|M3 18h.01" />;
+const IconPlug    = (p: any) => <I {...p} d="M12 22v-5|M9 8V2|M15 8V2|M18 8v5a6 6 0 0 1-12 0V8z" />;
+const IconRefresh = (p: any) => <I {...p} d="M23 4v6h-6|M1 20v-6h6|M3.51 9a9 9 0 0 1 14.85-3.36L23 10|M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />;
+const IconImage   = (p: any) => <I {...p} d="M19 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2z|M8.5 10a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z|M21 15l-5-5L5 21" />;
+const IconLogout  = (p: any) => <I {...p} d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4|M16 17l5-5-5-5|M21 12H9" />;
 
 interface SlashSpec {
   name: string;
@@ -32,6 +49,7 @@ export function ChatPanel() {
     composerAttachments, removeAttachment, clearAttachments,
     openFile, revealLine,
     selectedProfileId, setSelectedProfileId,
+    authUser, setAuthModalOpen, logout,
   } = useStore();
   const [input, setInput] = useState('');
   const [slashList, setSlashList] = useState<SlashSpec[]>([]);
@@ -205,13 +223,36 @@ export function ChatPanel() {
     fetch('/api/providers').then((r) => r.json()).then((data: any) => {
       const profiles = (data?.profiles ?? []).filter((p: any) => !p.hash);
       setProviderProfiles(profiles.map((p: any) => ({ id: p.id, name: p.name, model: p.model })));
+      // 同步下拉框选中状态 = 服务端 active chat
+      setSelectedProfileId(data?.active?.chat ?? null);
     }).catch(() => {});
   };
   useEffect(() => { loadProfiles(); }, []);
-  // 模型设置关闭后刷新列表
+  // 模型设置 / 全局设置关闭后刷新列表
   useEffect(() => {
     if (!modelSettingsOpen) loadProfiles();
   }, [modelSettingsOpen]);
+  // 监听其他组件（SettingsPanel / ModelSettingsPanel）的 provider 变更
+  useEffect(() => {
+    const handler = () => loadProfiles();
+    window.addEventListener('providers-changed', handler);
+    return () => window.removeEventListener('providers-changed', handler);
+  }, []);
+
+  /** 从下拉框选择模型：同步到服务端 active chat，刷新所有面板 */
+  const handleModelSelect = (profileId: string | null) => {
+    setModelDropdownOpen(false);
+    // 点击当前已选中的 → 取消选中（回到 Auto）
+    const targetId = (profileId === selectedProfileId) ? null : profileId;
+    fetch('/api/providers/active', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role: 'chat', id: targetId }),
+    }).then(() => {
+      loadProfiles();
+      window.dispatchEvent(new Event('providers-changed'));
+    }).catch(() => {});
+  };
 
   // 当且仅当输入以 / 开头、且第一行没有空格时，展示候选
   const slashSuggestions = useMemo(() => {
@@ -482,12 +523,17 @@ export function ChatPanel() {
         setUsage(ev.usage);
         break;
       case 'mentions': {
-        const parts: string[] = [];
-        if (ev.resolved?.length)
-          parts.push(`📎 mentioned: ${ev.resolved.map((r: any) => `${r.type}:${r.label}`).join(', ')}`);
-        if (ev.unresolved?.length)
-          parts.push(`⚠ unresolved: ${ev.unresolved.map((u: any) => `${u.kind}:${u.arg} (${u.reason})`).join(', ')}`);
-        if (parts.length) pushMessage({ role: 'tool', content: parts.join('  |  ') } as any);
+        const items: Array<{ kind: string; label: string; path?: string }> = [];
+        if (ev.resolved?.length) {
+          ev.resolved.forEach((r: any) => items.push({ kind: r.type, label: r.label, path: r.label }));
+        }
+        const unresolvedParts = ev.unresolved?.length
+          ? `⚠ unresolved: ${ev.unresolved.map((u: any) => `${u.kind}:${u.arg} (${u.reason})`).join(', ')}`
+          : '';
+        const content = unresolvedParts || (items.length ? `📎 mentioned: ${items.map((i) => `${i.kind}:${i.label}`).join(', ')}` : '');
+        if (content || items.length) {
+          pushMessage({ role: 'tool', content, _mentionItems: items.length ? items : undefined } as any);
+        }
         break;
       }
       case 'done':
@@ -598,13 +644,43 @@ export function ChatPanel() {
       <div className="chat-header">
         <h3>AI Chat</h3>
         <div className="chat-header-actions">
-          <button className="icon-btn" title="Sessions" onClick={() => setDrawerOpen(true)}>
-            ☰
+          {authUser ? (
+            <button
+              className="icon-btn auth-user-btn"
+              data-tip={authUser.isAnonymous ? '点击登录以同步会话' : `${authUser.username || authUser.name}（点击登出）`}
+              title={authUser.isAnonymous ? '点击登录以同步会话' : `${authUser.username || authUser.name}（点击登出）`}
+              onClick={() => authUser.isAnonymous ? setAuthModalOpen(true) : logout()}
+            >
+              {authUser.isAnonymous ? <IconUser size={16} /> : (
+                <span>{(authUser.username || authUser.name || 'U')?.slice(0, 1).toUpperCase()}</span>
+              )}
+            </button>
+          ) : (
+            <button className="icon-btn" data-tip="登录 / 注册" title="登录 / 注册" onClick={() => setAuthModalOpen(true)}>
+              <IconKey size={16} />
+            </button>
+          )}
+          <button
+            className="icon-btn"
+            data-tip="新建会话"
+            title="新建会话"
+            onClick={async () => {
+              resetChat();
+              clearAttachments();
+              try { await createSession(); } catch { /* server 未启动也不阻塞 */ }
+            }}
+          >
+            <IconPlus size={16} />
           </button>
-          <button className="icon-btn" title="MCP Servers" onClick={() => setMcpOpen(true)}>
-            🔌
+          <button className="icon-btn" data-tip="历史会话" title="历史会话" onClick={() => setDrawerOpen(true)}>
+            <IconList size={16} />
           </button>
-          <button className="icon-btn" onClick={resetChat} title="Clear conversation">⟲</button>
+          <button className="icon-btn" data-tip="MCP 服务" title="MCP 服务" onClick={() => setMcpOpen(true)}>
+            <IconPlug size={16} />
+          </button>
+          <button className="icon-btn" onClick={resetChat} data-tip="清空对话" title="清空对话">
+            <IconRefresh size={16} />
+          </button>
         </div>
       </div>
       <SessionsDrawer open={drawerOpen} onClose={() => setDrawerOpen(false)} />
@@ -705,7 +781,7 @@ export function ChatPanel() {
             Try: "list the project structure"
           </div>
         )}
-        {renderMessages(messages, running, scrollRef)}
+        {renderMessages(messages, running, scrollRef, openFile, revealLine)}
       </div>
       <CostMiniPanel />
       <div className="input-area">
@@ -735,7 +811,7 @@ export function ChatPanel() {
                   <button
                     type="button"
                     className="composer-att__x"
-                    title="Remove image"
+                    title="移除图片"
                     onClick={() => setImageAttachments((prev) => prev.filter((x) => x.id !== img.id))}
                   >
                     ×
@@ -747,32 +823,21 @@ export function ChatPanel() {
           {composerAttachments.length > 0 && (
             <div className="composer-attachments">
               {composerAttachments.map((a) => (
-                <span
+                <MentionTag
                   key={a.id}
-                  className={`composer-att composer-att--${a.kind}`}
-                  title={`${a.kind}: ${a.path}${a.line1 ? `:${a.line1}-${a.line2}` : ''} (click to open)`}
-                  onClick={async () => {
+                  kind={a.kind}
+                  label={a.label}
+                  path={a.path}
+                  line1={a.line1}
+                  line2={a.line2}
+                  removable
+                  onRemove={() => removeAttachment(a.id)}
+                  onOpen={(p, l) => {
                     if (a.kind === 'symbol') return;
-                    await openFile(a.path);
-                    if (a.line1) revealLine(a.path, a.line1);
+                    openFile(p);
+                    if (l) revealLine(p, l);
                   }}
-                >
-                  <span className="composer-att__icon">
-                    {a.kind === 'file' ? '📄' : a.kind === 'folder' ? '📁' : a.kind === 'selection' ? '✂' : '🔣'}
-                  </span>
-                  <span className="composer-att__label">{a.label}</span>
-                  <button
-                    type="button"
-                    className="composer-att__x"
-                    title="Remove"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      removeAttachment(a.id);
-                    }}
-                  >
-                    ×
-                  </button>
-                </span>
+                />
               ))}
             </div>
           )}
@@ -810,10 +875,11 @@ export function ChatPanel() {
               <button
                 type="button"
                 className="composer-chip composer-chip--img"
+                data-tip="上传图片"
                 title="上传图片"
                 onClick={() => fileInputRef.current?.click()}
               >
-                🖼
+                <IconImage size={16} />
               </button>
               <input
                 type="file"
@@ -827,7 +893,8 @@ export function ChatPanel() {
                 ref={addCtxBtnRef}
                 type="button"
                 className="composer-chip"
-                title="Add context (file / symbol / docs / selection)"
+                data-tip="添加上下文（文件 / 符号 / 文档 / 选区）"
+                title="添加上下文（文件 / 符号 / 文档 / 选区）"
                 onClick={() => setAddCtxOpen((b) => !b)}
               >
                 +
@@ -841,7 +908,8 @@ export function ChatPanel() {
               <button
                 type="button"
                 className={`composer-chip composer-chip--mode ${mode === 'agent' ? 'is-agent' : mode === 'plan' ? 'is-plan' : 'is-ask'}`}
-                title="Cycle mode: Ask → Agent → Plan"
+                data-tip={`切换模式：当前 ${mode === 'agent' ? '智能体' : mode === 'plan' ? '规划' : '问答'}`}
+                title={`切换模式：当前 ${mode === 'agent' ? '智能体' : mode === 'plan' ? '规划' : '问答'}`}
                 onClick={() => {
                   const next = mode === 'ask' ? 'agent' : mode === 'agent' ? 'plan' : 'ask';
                   setMode(next as any);
@@ -853,7 +921,8 @@ export function ChatPanel() {
               <button
                 type="button"
                 className="composer-chip composer-chip--model"
-                title={selectedProfileId ? `Using: ${providerProfiles.find(p => p.id === selectedProfileId)?.name ?? selectedProfileId}` : 'Auto routing (click to pick model)'}
+                data-tip={selectedProfileId ? `当前模型：${providerProfiles.find(p => p.id === selectedProfileId)?.name ?? selectedProfileId}` : '自动路由（点击选择模型）'}
+                title={selectedProfileId ? `当前模型：${providerProfiles.find(p => p.id === selectedProfileId)?.name ?? selectedProfileId}` : '自动路由（点击选择模型）'}
                 onClick={() => setModelDropdownOpen((b) => !b)}
               >
                 {selectedProfileId ? (providerProfiles.find(p => p.id === selectedProfileId)?.model ?? providerProfiles.find(p => p.id === selectedProfileId)?.name ?? selectedProfileId) : 'Auto'}
@@ -863,7 +932,7 @@ export function ChatPanel() {
                 <div className="model-dropdown" onClick={() => setModelDropdownOpen(false)}>
                   <div
                     className={`model-dropdown-item${!selectedProfileId ? ' active' : ''}`}
-                    onClick={() => setSelectedProfileId(null)}
+                    onClick={() => handleModelSelect(null)}
                   >
                     ⚡ Auto (router)
                   </div>
@@ -871,7 +940,7 @@ export function ChatPanel() {
                     <div
                       key={p.id}
                       className={`model-dropdown-item${selectedProfileId === p.id ? ' active' : ''}`}
-                      onClick={() => setSelectedProfileId(p.id)}
+                      onClick={() => handleModelSelect(p.id)}
                     >
                       {p.model ?? p.name}
                     </div>
@@ -895,6 +964,15 @@ export function ChatPanel() {
                 onClick={toggleVoice}
                 disabled={!speech.supported || speech.modelLoading}
                 className={`composer-chip composer-chip--voice${speech.isListening ? ' composer-chip--voice-active' : ''}`}
+                data-tip={
+                  !speech.supported
+                    ? '语音识别不可用'
+                    : speech.modelLoading
+                      ? '语音模型加载中…'
+                      : speech.isListening
+                        ? '停止语音输入'
+                        : '语音输入（中文·离线识别）'
+                }
                 title={
                   !speech.supported
                     ? '语音识别不可用'
@@ -928,7 +1006,8 @@ export function ChatPanel() {
                 onClick={send}
                 disabled={running || (!input.trim() && composerAttachments.length === 0)}
                 className="composer-send"
-                title={running ? 'Running…' : 'Send (⌘/Ctrl + Enter)'}
+                data-tip={running ? '正在生成…' : '发送（⌘/Ctrl + Enter）'}
+                title={running ? '正在生成…' : '发送（⌘/Ctrl + Enter）'}
               >
                 {running ? (
                   <span className="composer-send__spinner" />
@@ -1271,13 +1350,26 @@ function ThinkingProcess({ steps, isRunning }: {
             </div>
           )}
 
-          {/* 其他步骤 */}
+          {/* 其他步骤（mentions 等） */}
           {otherSteps.length > 0 && (
             <div className="thinking-process__section">
               {otherSteps.map((step, i) => (
                 <div key={i} className="thinking-process__step">
                   <span className="thinking-process__step-dot" />
-                  <span className="thinking-process__step-msg">{step.content}</span>
+                  <span className="thinking-process__step-msg">
+                    {step._mentionItems?.length ? (
+                      <span className="msg-mention-tags">
+                        {step._mentionItems.map((item, idx) => (
+                          <MentionTag
+                            key={idx}
+                            kind={item.kind as any}
+                            label={item.label}
+                            path={item.path || item.label}
+                          />
+                        ))}
+                      </span>
+                    ) : step.content}
+                  </span>
                 </div>
               ))}
             </div>
@@ -1389,9 +1481,36 @@ function ToolCallCard({ item }: {
 }
 
 /**
+ * Tool 消息内容渲染器 — 检测 _mentionItems 并渲染 MentionTag，否则显示纯文本
+ */
+function ToolContent({ m }: { m: ChatMsg }) {
+  if (m._mentionItems?.length) {
+    return (
+      <div className="msg-mention-tags">
+        {m._mentionItems.map((item, idx) => (
+          <MentionTag
+            key={idx}
+            kind={item.kind as any}
+            label={item.label}
+            path={item.path || item.label}
+          />
+        ))}
+      </div>
+    );
+  }
+  return <span className="msg-plain">{m.content}</span>;
+}
+
+/**
  * 消息渲染器 - 智能分组用户消息、助手消息、工具消息
  */
-function renderMessages(messages: ChatMsg[], running: boolean, scrollRef: React.RefObject<HTMLDivElement | null>) {
+function renderMessages(
+  messages: ChatMsg[],
+  running: boolean,
+  scrollRef: React.RefObject<HTMLDivElement | null>,
+  openFile: (p: string) => void | Promise<void>,
+  revealLine: (p: string, l: number) => void | Promise<void>,
+) {
   const elements: React.ReactNode[] = [];
   let i = 0;
 
@@ -1401,6 +1520,9 @@ function renderMessages(messages: ChatMsg[], running: boolean, scrollRef: React.
     if (m.role === 'user') {
       // 用户消息：明显的聊天气泡，支持展示图片缩略图
       const userImages = m._images;
+      // 解析 @file / @selection 提及标签
+      const { mentions, cleanText } = parseMentions(m.content || '');
+      const displayText = m._displayText || cleanText || '(empty)';
       elements.push(
         <div key={i} className="msg msg-user">
           <div className="user-bubble">
@@ -1417,7 +1539,25 @@ function renderMessages(messages: ChatMsg[], running: boolean, scrollRef: React.
                 ))}
               </div>
             )}
-            <div className="user-bubble__text">{m.content || '(empty)'}</div>
+            {mentions.length > 0 && (
+              <div className="user-bubble__mentions">
+                {mentions.map((mt, idx) => (
+                  <MentionTag
+                    key={idx}
+                    kind={mt.kind}
+                    label={mt.label}
+                    path={mt.path}
+                    line1={mt.line1}
+                    line2={mt.line2}
+                    onOpen={(p, l) => {
+                      openFile(p);
+                      if (l) revealLine(p, l);
+                    }}
+                  />
+                ))}
+              </div>
+            )}
+            <div className="user-bubble__text">{displayText}</div>
           </div>
         </div>
       );
@@ -1498,7 +1638,7 @@ function renderMessages(messages: ChatMsg[], running: boolean, scrollRef: React.
         if (rAny.pendingEditId != null) {
           elements.push(
             <div key={groupStart} className="msg msg-tool has-pending">
-              <span className="msg-plain">{r.content}</span>
+              <ToolContent m={r} />
             </div>
           );
           continue;
@@ -1520,7 +1660,7 @@ function renderMessages(messages: ChatMsg[], running: boolean, scrollRef: React.
         }
         elements.push(
           <div key={groupStart} className="msg msg-tool">
-            <span className="msg-plain">{r.content}</span>
+            <ToolContent m={r} />
           </div>
         );
         continue;
@@ -1533,10 +1673,10 @@ function renderMessages(messages: ChatMsg[], running: boolean, scrollRef: React.
         </div>
       );
     } else {
-      // 其他角色
+      // 其他角色（system / 未匹配的 tool）
       elements.push(
         <div key={i} className={`msg msg-${m.role}`}>
-          <span className="msg-plain">{m.content}</span>
+          <ToolContent m={m} />
         </div>
       );
       i++;

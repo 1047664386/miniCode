@@ -1,4 +1,3 @@
-
 {
   "name": "@mini/server-cloud",
   "version": "0.0.1",
@@ -18,14 +17,18 @@
     "@mini/core": "workspace:*",
     "@mini/sandbox": "workspace:*",
     "@mini/storage": "workspace:*",
+    "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "^5.18.0",
+    "bcryptjs": "^3.0.3",
     "dotenv": "^17.4.2",
     "fastify": "^4.28.1",
     "fastify-plugin": "^5.1.0",
     "jszip": "^3.10.1",
+    "pg": "^8.21.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/bcryptjs": "^3.0.0",
     "@types/node": "^20.12.7",
     "tsx": "^4.16.0",
     "typescript": "^5.5.3"

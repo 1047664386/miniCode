@@ -13,7 +13,10 @@
  *   pnpm --filter @mini/storage prisma:migrate
  *   pnpm --filter @mini/server-cloud dev
  */
-import 'dotenv/config';
+import dotenv from 'dotenv';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+dotenv.config({ path: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../.env') });
 import Fastify from 'fastify';
 import cookie from '@fastify/cookie';
 import jwt from '@fastify/jwt';
@@ -21,6 +24,7 @@ import cors from '@fastify/cors';
 // Prisma 7：客户端类型从 @mini/storage 重新导出（指向 src/generated/prisma）
 // runtime + types 都从 storage 包出，server 不再直接吃 @prisma/client
 import { PrismaClient } from '@mini/storage';
+import { PrismaPg } from '@prisma/adapter-pg';
 
 import { registerAuthRoutes } from './routes/auth.js';
 import { registerSessionsRoutes } from './routes/sessions.js';
@@ -31,7 +35,8 @@ import { makeAgentsRoutes } from './routes/agents.js';
 import { authPlugin } from './middleware/auth.js';
 import { createSandboxProvider } from '@mini/sandbox';
 
-const prisma = new PrismaClient();
+const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! });
+const prisma = new PrismaClient({ adapter });
 
 async function main() {
   const app = Fastify({ logger: true, bodyLimit: 50 * 1024 * 1024 });

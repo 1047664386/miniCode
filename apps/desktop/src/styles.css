@@ -674,6 +674,42 @@ body,
 }
 .chat-header-actions .icon-btn:hover { background: #2d2d2d; color: #ddd; }
 
+/* CSS tooltip — hover 即出，不依赖原生 title */
+[data-tip] {
+  position: relative;
+}
+[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: #1a1a1a;
+  color: #ccc;
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 4px 8px;
+  border-radius: 4px;
+  border: 1px solid #333;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 200;
+}
+[data-tip]:hover::after {
+  opacity: 1;
+}
+/* composer toolbar 的 tooltip 朝上 */
+.composer-toolbar [data-tip]::after {
+  bottom: calc(100% + 4px);
+}
+/* chat-header 的 tooltip 朝下（避免被 overflow:hidden 裁切） */
+.chat-header-actions [data-tip]::after {
+  bottom: auto;
+  top: calc(100% + 6px);
+}
+
 /* ========== Command Palette ========== */
 .palette-mask {
   position: fixed; inset: 0; background: rgba(0,0,0,0.4);
@@ -2631,6 +2667,64 @@ body,
 .composer-att--selection { background: #3a3325; border-color: #5b4e2c; color: #f5d97a; }
 .composer-att--folder { background: #2d3a2b; border-color: #486045; color: #b6e2ad; }
 
+/* ====== MentionTag — 消息中的文件提及标签 ====== */
+.mention-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: #2b3a4d;
+  border: 1px solid #3c5170;
+  color: #cfe2ff;
+  border-radius: 12px;
+  padding: 2px 8px 2px 6px;
+  font-size: 11px;
+  cursor: pointer;
+  user-select: none;
+  line-height: 1.4;
+  max-width: 260px;
+  transition: background 0.15s, border-color 0.15s;
+}
+.mention-tag:hover { background: #36475d; border-color: #4d6788; }
+.mention-tag__icon { font-size: 11px; opacity: 0.85; }
+.mention-tag__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 200px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+}
+.mention-tag__x {
+  background: transparent;
+  border: none;
+  color: #aac3e8;
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 13px;
+  line-height: 1;
+}
+.mention-tag__x:hover { color: #fff; background: #5a3a3a; border-radius: 8px; }
+.mention-tag--selection { background: #3a3325; border-color: #5b4e2c; color: #f5d97a; }
+.mention-tag--folder { background: #2d3a2b; border-color: #486045; color: #b6e2ad; }
+.mention-tag--symbol { background: #2d2a3a; border-color: #4a4560; color: #c8b6ff; }
+
+/* 用户气泡中的提及标签行 */
+.user-bubble__mentions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+
+/* 消息区域的提及标签容器（mentioned: 区域） */
+.msg-mention-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+}
+
 /* ── Image Attachment (paste/drop) ── */
 .composer-att--image {
   position: relative;
@@ -3028,4 +3122,165 @@ body,
 .diff-overlay__btn--accept { color: #6acf6a; border-color: #2e6e3a; }
 .diff-overlay__btn--accept:hover { background: #2e6e3a; color: #fff; }
 .diff-overlay__btn--reject { color: #ef6c6c; border-color: #6e2e2e; }
+.diff-overlay__btn--reject:hover { background: #6e2e2e; color: #fff; }
+
+/* ====== Auth Modal ====== */
+.auth-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+}
+.auth-modal {
+  width: 380px;
+  max-width: 92vw;
+  background: #1a1d23;
+  border: 1px solid #2d313a;
+  border-radius: 16px;
+  padding: 32px 28px 20px;
+  box-shadow: 0 16px 48px rgba(0,0,0,0.5);
+}
+.auth-modal__header {
+  text-align: center;
+  margin-bottom: 20px;
+}
+.auth-modal__logo {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 12px;
+}
+.auth-modal__logo-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #4a7cff 0%, #6c5ce7 100%);
+  color: #fff;
+  font-weight: 700;
+  font-size: 14px;
+  letter-spacing: 1px;
+}
+.auth-modal__title {
+  font-size: 18px;
+  font-weight: 600;
+  color: #e4e6ea;
+  margin: 0 0 4px;
+}
+.auth-modal__subtitle {
+  font-size: 12px;
+  color: #6b7280;
+  margin: 0;
+}
+.auth-modal__tabs {
+  display: flex;
+  gap: 0;
+  margin-bottom: 16px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid #2d313a;
+}
+.auth-tab {
+  flex: 1;
+  padding: 8px 0;
+  background: #20232a;
+  color: #8b8f98;
+  border: none;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.auth-tab--active {
+  background: #2b3a4d;
+  color: #7cb3ff;
+  font-weight: 600;
+}
+.auth-tab:hover:not(.auth-tab--active) {
+  background: #262930;
+}
+.auth-modal__error {
+  padding: 8px 12px;
+  background: #3a1c1c;
+  border: 1px solid #5a2a2a;
+  border-radius: 8px;
+  color: #f87171;
+  font-size: 12px;
+  margin-bottom: 12px;
+}
+.auth-modal__form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.auth-modal__label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: #9ca3af;
+}
+.auth-modal__label input {
+  background: #13151a;
+  border: 1px solid #2d313a;
+  border-radius: 8px;
+  padding: 9px 12px;
+  color: #e4e6ea;
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+.auth-modal__label input:focus {
+  border-color: #4a7cff;
+}
+.auth-modal__label input::placeholder {
+  color: #4b5060;
+}
+.auth-modal__submit {
+  margin-top: 4px;
+  padding: 10px 0;
+  border: none;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #4a7cff 0%, #6c5ce7 100%);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.auth-modal__submit:hover { opacity: 0.9; }
+.auth-modal__submit:disabled { opacity: 0.5; cursor: not-allowed; }
+.auth-modal__footer {
+  text-align: center;
+  margin-top: 16px;
+  font-size: 12px;
+}
+.auth-modal__footer-text {
+  color: #6b7280;
+}
+.auth-modal__link {
+  background: none;
+  border: none;
+  color: #7cb3ff;
+  cursor: pointer;
+  font-size: 12px;
+  margin-left: 4px;
+  text-decoration: underline;
+}
+.auth-modal__link:hover { color: #a0cfff; }
+.auth-modal__skip {
+  display: block;
+  margin: 16px auto 0;
+  background: none;
+  border: none;
+  color: #6b7280;
+  font-size: 11px;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.auth-modal__skip:hover { color: #9ca3af; }
 .diff-overlay__btn--reject:hover { background: #6e2e2e; color: #fff; }

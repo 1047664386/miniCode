@@ -700,6 +700,11 @@ export function registerHandlers(r: Router, s: Services) {
 
   // ---- providers ----
   r.get('/api/providers', (c) => sendJson(c.res, 200, s.providers.list()));
+  // 内部端点：返回完整 provider 配置（含明文 apiKey），仅供本机 syncToCloud 使用
+  r.get('/api/providers/raw', (c) => {
+    const cfg = s.providers.getConfig();
+    sendJson(c.res, 200, cfg);
+  });
   r.post('/api/providers', async (c) => {
     try {
       const body = (await readBody(c.req)) as Partial<ProviderProfile> & { name: string; baseUrl: string };

@@ -19,6 +19,8 @@ datasource db {
 model User {
   id         String  @id @default(cuid())
   email      String? @unique
+  username   String? @unique
+  password   String? // bcrypt hash，匿名用户为 null
   wxOpenId   String? @unique
   name       String?
   // BYOK / 计费扩展位（M5 用）：用户自己的 LLM key，加密存
@@ -29,6 +31,9 @@ model User {
   // 试用配额：已用 token 数（M5 计费用）
   usedTokens Int     @default(0)
   freeQuota  Int     @default(50000) // 默认 5w token 免费试用
+
+  // 用户设置（模型 Provider 配置、偏好等，JSON 存储）
+  settings Json?
 
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt

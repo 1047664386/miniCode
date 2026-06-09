@@ -13,6 +13,7 @@
  *  - openFiles / previewFile 控制中间可关闭代码预览面板
  */
 import { create } from 'zustand';
+import { sessionFetch } from '../store';
 
 export type AgentsMode = 'work' | 'code';
 
@@ -155,7 +156,7 @@ export const useAgentsStore = create<State>((set, get) => ({
       const params = new URLSearchParams();
       params.set('mode', mode);
       // ⚠️ 不再按 workspaceRoot 过滤 —— 侧栏要展示所有工作区的会话，前端自己分组
-      const r = await fetch(`/api/sessions?${params.toString()}`);
+      const r = await sessionFetch(`/api/sessions?${params.toString()}`);
       const list: SessionMeta[] = r.ok ? await r.json() : [];
       set({ sessions: list, loading: false });
     } catch {
@@ -165,7 +166,7 @@ export const useAgentsStore = create<State>((set, get) => ({
 
   async createSession(title?: string) {
     const { mode, workspaceRoot } = get();
-    const r = await fetch('/api/sessions', {
+    const r = await sessionFetch('/api/sessions', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -181,7 +182,7 @@ export const useAgentsStore = create<State>((set, get) => ({
   },
 
   async deleteSession(id) {
-    await fetch(`/api/sessions/${id}`, { method: 'DELETE' }).catch(() => undefined);
+    await sessionFetch(`/api/sessions/${id}`, { method: 'DELETE' }).catch(() => undefined);
     if (get().activeSessionId === id) set({ activeSessionId: null });
     await get().loadSessions();
   },

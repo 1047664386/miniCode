@@ -13,7 +13,53 @@
  *      → 返回是否已配置 + base/model/kind 公开字段（永远不回明文 key）
  */
 import type { FastifyPluginAsync } from 'fastify';
-import { encryptApiKey } from '../llm/crypto.js';
+import { encryptApiKey, decryptApiKey } from '../llm/crypto.js';
+
+/**
+ * 遍历 providerConfig，加密 / 解密 apiKey 字段
+ */
+function encryptProfileKeys(profiles: any[]): any[] {
+  return profiles.map((p) => {
+    const out = { ...p };
+    if (out.apiKey) out._apiKeyEnc = encryptApiKey(out.apiKey);
+    delete out.apiKey;
+    if (Array.isArray(out.apiKeys)) {
+      out._apiKeysEnc = out.apiKeys.map((k: string) => encryptApiKey(k));
+      delete out.apiKeys;
+    }
+    return out;
+  });
+}
+
+function decryptProfileKeys(profiles: any[]): any[] {
+  return profiles.map((p) => {
+    const out = { ...p };
+    if (out._apiKeyEnc) {
+      try { out.apiKey = decryptApiKey(out._apiKeyEnc); } catch { /* 解密失败则忽略 */ }
+    }
+    delete out._apiKeyEnc;
+    if (Array.isArray(out._apiKeysEnc)) {
+      try { out.apiKeys = out._apiKeysEnc.map((k: string) => decryptApiKey(k)); } catch { /* */ }
+    }
+    delete out._apiKeysEnc;
+    return out;
+  });
+}
+
+/** 脱敏：只保留末尾 4 位 */
+function maskProfileKeys(profiles: any[]): any[] {
+  return profiles.map((p) => {
+    const out = { ...p };
+    if (out.apiKey) out.apiKey = '***' + out.apiKey.slice(-4);
+    if (Array.isArray(out.apiKeys)) {
+      out.apiKeys = out.apiKeys.map((k: string) => '***' + k.slice(-4));
+    }
+    // 清除加密字段，不暴露给前端
+    delete out._apiKeyEnc;
+    delete out._apiKeysEnc;
+    return out;
+  });
+}
 
 export const registerMeRoutes: FastifyPluginAsync = async (app) => {
   app.get('/api-key', async (req) => {
@@ -65,5 +111,58 @@ export const registerMeRoutes: FastifyPluginAsync = async (app) => {
       freeQuota: u?.freeQuota ?? 0,
       byok: !!u?.llmKeyEnc,
     };
+  });
+
+  // ===== 用户设置（Provider 配置等） =====
+
+  /**
+   * GET /api/me/settings
+   * 返回用户设置 JSON，其中 API key 已脱敏（仅显示末 4 位）
+   */
+  app.get('/settings', async (req) => {
+    const u = await app.prisma.user.findUnique({
+      where: { id: req.userId },
+      select: { settings: true },
+    });
+    const raw = (u?.settings as any) ?? null;
+    if (!raw) return { settings: null };
+
+    // 脱敏 API keys
+    const settings = { ...raw };
+    if (settings.providerConfig?.profiles) {
+      // 从 DB 读出时有 _apiKeyEnc，需要解密再脱敏给前端
+      const decrypted = decryptProfileKeys(settings.providerConfig.profiles);
+      settings.providerConfig = {
+        ...settings.providerConfig,
+        profiles: maskProfileKeys(decrypted),
+      };
+    }
+    return { settings };
+  });
+
+  /**
+   * PUT /api/me/settings
+   * 保存用户设置。body 中 providerConfig.profiles 里的 apiKey / apiKeys 会被加密存储。
+   */
+  app.put('/settings', async (req, reply) => {
+    const body = (req.body ?? {}) as any;
+    if (!body.settings || typeof body.settings !== 'object') {
+      return reply.code(400).send({ error: 'settings object required' });
+    }
+
+    const settings = { ...body.settings };
+    // 加密 API keys
+    if (settings.providerConfig?.profiles) {
+      settings.providerConfig = {
+        ...settings.providerConfig,
+        profiles: encryptProfileKeys(settings.providerConfig.profiles),
+      };
+    }
+
+    await app.prisma.user.update({
+      where: { id: req.userId },
+      data: { settings: settings as any },
+    });
+    return { ok: true };
   });
 };

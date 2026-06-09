@@ -10,7 +10,12 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': 'http://localhost:5174',
+      '/cloud-api': {
+        target: 'http://localhost:4000',
+        changeOrigin: true,
+        rewrite: (path: string) => path.replace(/^\/cloud-api/, ''),
+      },
+      '/api': 'http://localhost:5175',
     },
   },
 });

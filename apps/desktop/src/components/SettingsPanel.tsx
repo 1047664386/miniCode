@@ -405,6 +405,13 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
     refresh();
   }, []);
 
+  // 监听其他组件的 provider 变更
+  useEffect(() => {
+    const handler = () => refresh();
+    window.addEventListener('providers-changed', handler);
+    return () => window.removeEventListener('providers-changed', handler);
+  }, []);
+
   // Esc 关闭
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -435,6 +442,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
       setEditingId(null);
       setSelectedPreset(null);
       await refresh();
+      window.dispatchEvent(new Event('providers-changed'));
     } finally {
       setBusy(false);
     }
@@ -446,6 +454,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
     try {
       await fetch(`/api/providers/${id}`, { method: 'DELETE' });
       await refresh();
+      window.dispatchEvent(new Event('providers-changed'));
     } finally {
       setBusy(false);
     }
@@ -460,6 +469,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
         body: JSON.stringify({ role, id: id || null }),
       });
       await refresh();
+      window.dispatchEvent(new Event('providers-changed'));
     } finally {
       setBusy(false);
     }
@@ -474,6 +484,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
         body: JSON.stringify({ role, ids }),
       });
       await refresh();
+      window.dispatchEvent(new Event('providers-changed'));
     } finally {
       setBusy(false);
     }

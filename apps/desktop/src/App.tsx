@@ -7,6 +7,7 @@ import { VSCodeFrame } from './components/VSCodeFrame';
 import { CommandPalette } from './components/CommandPalette';
 import { ComposerPanel } from './components/ComposerPanel';
 import { SettingsPanel } from './components/SettingsPanel';
+import { AuthModal } from './components/AuthModal';
 import { GitPanel } from './components/GitPanel';
 import { TerminalPanel } from './components/TerminalPanel';
 import { SearchPanel } from './components/SearchPanel';
@@ -54,6 +55,12 @@ export function App() {
   const [composerOpen, setComposerOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [terminalOpen, setTerminalOpen] = useState(false);
+  const authModalOpen = useStore((s) => s.authModalOpen);
+  const setAuthModalOpen = useStore((s) => s.setAuthModalOpen);
+  const checkAuth = useStore((s) => s.checkAuth);
+
+  // 启动时检查登录状态
+  useEffect(() => { checkAuth(); }, [checkAuth]);
 
   // 全局快捷键：⌘P palette；⌘J terminal；⌘⇧F search；⌘⇧O outline；⌘⇧M problems；⌘⇧E explorer
   useEffect(() => {
@@ -372,6 +379,7 @@ export function App() {
       )}
       {composerOpen && <ComposerPanel onClose={() => setComposerOpen(false)} />}
       {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
+      {authModalOpen && <AuthModal onClose={() => setAuthModalOpen(false)} />}
       {terminalOpen && (
         <div className="bottom-drawer">
           <div className="bottom-drawer-handle" onClick={() => setTerminalOpen(false)} title="Close terminal">

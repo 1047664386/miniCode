@@ -11,6 +11,38 @@
  */
 import { create } from 'zustand';
 
+/**
+ * 云端 API 基地址。
+ * - 已登录 + VITE_CLOUD_API 已配置 → 返回云端 URL（带 credentials）
+ * - 已登录 + 开发环境 → 使用 /cloud-api 代理
+ * - 否则 → 返回空字符串（走本地 server）
+ */
+const CLOUD_API = (import.meta as any).env?.VITE_CLOUD_API ?? '';
+
+function sessionApiBase(): string {
+  const user = useStore.getState().authUser;
+  if (user && !user.isAnonymous) {
+    if (CLOUD_API) return CLOUD_API;
+    return '/cloud-api';  // dev proxy → cloud server
+  }
+  return '';
+}
+export function sessionFetch(path: string, init?: RequestInit) {
+  const base = sessionApiBase();
+  return fetch(`${base}${path}`, {
+    ...init,
+    credentials: base ? 'include' : 'omit',
+  });
+}
+/** Always routes to cloud (for auth endpoints that only exist on cloud server). */
+export function cloudFetch(path: string, init?: RequestInit) {
+  const base = CLOUD_API || '/cloud-api';
+  return fetch(`${base}${path}`, {
+    ...init,
+    credentials: 'include',
+  });
+}
+
 /** Pending: 待粘到 chat input 的内容（来自 editor 选区 / 文件树 "Add to Chat"） */
 export interface PendingInputText { text: string; nonce: number; }
 
@@ -57,6 +89,8 @@ export interface ChatMsg {
   _images?: Array<{ name: string; dataUrl: string }>;
   /** 用户实际输入的文字（不含 @file:xxx 等附件前缀和 <editor-context> 标签） */
   _displayText?: string;
+  /** SSE mentions 事件的结构化数据（用于渲染 MentionTag） */
+  _mentionItems?: Array<{ kind: string; label: string; path?: string }>;
 }
 
 interface State {
@@ -203,6 +237,15 @@ interface State {
   addAttachment: (a: { kind: 'file' | 'folder' | 'selection' | 'symbol'; path: string; line1?: number; line2?: number; label?: string }) => void;
   removeAttachment: (id: string) => void;
   clearAttachments: () => void;
+  // ─── 认证状态 ──────────────────────────────────────────
+  authUser: { id: string; username?: string; name?: string; isAnonymous: boolean } | null;
+  authChecked: boolean;  // 启动时是否已完成 auth 检查
+  authModalOpen: boolean;
+  checkAuth: () => Promise<void>;
+  login: (username: string, password: string) => Promise<{ error?: string }>;
+  register: (username: string, password: string) => Promise<{ error?: string }>;
+  logout: () => Promise<void>;
+  setAuthModalOpen: (open: boolean) => void;
 }
 
 export const useStore = create<State>((set, get) => ({
@@ -461,7 +504,7 @@ export const useStore = create<State>((set, get) => ({
   sessionList: [],
   async loadSessions() {
     try {
-      const r = await fetch('/api/sessions');
+      const r = await sessionFetch('/api/sessions');
       const list = await r.json();
       set({ sessionList: list });
     } catch {
@@ -469,7 +512,7 @@ export const useStore = create<State>((set, get) => ({
     }
   },
   async createSession(title) {
-    const r = await fetch('/api/sessions', {
+    const r = await sessionFetch('/api/sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title }),
@@ -477,7 +520,6 @@ export const useStore = create<State>((set, get) => ({
     const meta = await r.json();
     set({
       sessionId: meta.id,
-      messages: [],
       plan: null,
       contextStats: null,
       usage: null,
@@ -486,7 +528,7 @@ export const useStore = create<State>((set, get) => ({
     return meta.id;
   },
   async switchSession(id) {
-    const r = await fetch(`/api/sessions/${id}`);
+    const r = await sessionFetch(`/api/sessions/${id}`);
     if (!r.ok) return;
     const data = await r.json();
     set({
@@ -501,14 +543,14 @@ export const useStore = create<State>((set, get) => ({
     });
   },
   async deleteSession(id) {
-    await fetch(`/api/sessions/${id}`, { method: 'DELETE' });
+    await sessionFetch(`/api/sessions/${id}`, { method: 'DELETE' });
     if (get().sessionId === id) {
       set({ sessionId: null, messages: [] });
     }
     await get().loadSessions();
   },
   async renameSession(id, title) {
-    await fetch(`/api/sessions/${id}`, {
+    await sessionFetch(`/api/sessions/${id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title }),
@@ -516,7 +558,7 @@ export const useStore = create<State>((set, get) => ({
     await get().loadSessions();
   },
   async forkSession(id, untilIndex) {
-    const r = await fetch(`/api/sessions/${id}/fork`, {
+    const r = await sessionFetch(`/api/sessions/${id}/fork`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ untilIndex }),
@@ -535,7 +577,7 @@ export const useStore = create<State>((set, get) => ({
    * 注意：不强制自动发，给用户最后一刻 review 的机会。
    */
   async resumeSession(id) {
-    const r = await fetch(`/api/sessions/${id}/resume-info`);
+    const r = await sessionFetch(`/api/sessions/${id}/resume-info`);
     if (!r.ok) return;
     const info = await r.json();
     if (!info.interrupted) {
@@ -544,7 +586,7 @@ export const useStore = create<State>((set, get) => ({
       return;
     }
     // 载入已落盘 messages
-    const histResp = await fetch(`/api/sessions/${id}`);
+    const histResp = await sessionFetch(`/api/sessions/${id}`);
     const data = await histResp.json();
     const messages = (data.messages ?? []).map((m: any) => ({
       role: m.role,
@@ -568,7 +610,7 @@ export const useStore = create<State>((set, get) => ({
     } as any);
   },
   async discardResume(id) {
-    await fetch(`/api/sessions/${id}/resume-discard`, { method: 'POST' });
+    await sessionFetch(`/api/sessions/${id}/resume-discard`, { method: 'POST' });
     await get().loadSessions();
   },
   pendingInput: null,
@@ -622,5 +664,64 @@ export const useStore = create<State>((set, get) => ({
   },
   clearAttachments() {
     set({ composerAttachments: [] });
+  },
+  // ─── 认证 ──────────────────────────────────────────────
+  authUser: null,
+  authChecked: false,
+  authModalOpen: false,
+  setAuthModalOpen(open) { set({ authModalOpen: open }); },
+  async checkAuth() {
+    try {
+      const r = await cloudFetch('/api/auth/me');
+      if (r.ok) {
+        const data = await r.json();
+        const user = { id: data.userId, username: data.username, name: data.name, isAnonymous: data.isAnonymous ?? !data.username };
+        set({ authUser: user, authChecked: true });
+        // 已登录用户 → 启动时拉取云端会话
+        if (!user.isAnonymous) {
+          get().loadSessions().catch(() => {});
+        }
+      } else {
+        set({ authUser: null, authChecked: true });
+      }
+    } catch {
+      set({ authUser: null, authChecked: true });
+    }
+  },
+  async login(username, password) {
+    try {
+      const r = await cloudFetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+      const data = await r.json();
+      if (!r.ok) return { error: data.error || '登录失败' };
+      set({ authUser: { id: data.user.id, username: data.user.username, name: data.user.name, isAnonymous: false }, authModalOpen: false });
+      // 登录后拉取云端会话列表
+      get().loadSessions().catch(() => {});
+      return {};
+    } catch { return { error: '网络错误' }; }
+  },
+  async register(username, password) {
+    try {
+      const r = await cloudFetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+      const data = await r.json();
+      if (!r.ok) return { error: data.error || '注册失败' };
+      set({ authUser: { id: data.user.id, username: data.user.username, name: data.user.name, isAnonymous: false }, authModalOpen: false });
+      // 注册后拉取云端会话列表
+      get().loadSessions().catch(() => {});
+      return {};
+    } catch { return { error: '网络错误' }; }
+  },
+  async logout() {
+    try { await cloudFetch('/api/auth/logout', { method: 'DELETE' }); } catch {}
+    set({ authUser: null });
+    // 登出后切回本地会话列表
+    get().loadSessions().catch(() => {});
   },
 }));

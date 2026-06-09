@@ -22,6 +22,7 @@
  * 1 个 http.createServer + 1 个 ws.WebSocketServer + 1 个手写 Router.
  */
 import http, { type IncomingMessage, type ServerResponse } from 'node:http';
+import { execSync } from 'node:child_process';
 import { URL } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { Services } from './services.js';
@@ -146,6 +147,20 @@ async function main() {
   // 自己挂 'upgrade' listener 并通过 path 前缀分发
   attachLspBridge(httpServer, { path: '/lsp', cwd: env.WORKSPACE });
   attachTerminalBridge(httpServer, { path: '/terminal', cwd: env.WORKSPACE });
+
+  httpServer.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`[server-node] Port ${env.PORT} already in use, killing...`);
+      try { execSync(`lsof -ti :${env.PORT} | xargs kill -9`, { stdio: 'ignore' }); } catch {}
+      setTimeout(() => {
+        httpServer.listen(env.PORT, () => {
+          console.log(`[server-node] 🚀 listening on http://127.0.0.1:${env.PORT} (retry)`);
+        });
+      }, 1000);
+    } else {
+      throw err;
+    }
+  });
 
   httpServer.listen(env.PORT, () => {
     console.log(`[server-node] 🚀 listening on http://127.0.0.1:${env.PORT}`);

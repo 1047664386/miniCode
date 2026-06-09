@@ -10,6 +10,7 @@
  *  - 测试连通性
  */
 import { useEffect, useState } from 'react';
+import { useStore, cloudFetch } from '../store';
 
 interface ProviderItem {
   id: string;
@@ -50,18 +51,105 @@ export function ModelSettingsPanel({ onClose }: { onClose?: () => void }) {
   const [err, setErr] = useState<string | null>(null);
   const [testing, setTesting] = useState<string | null>(null);
 
+  const authUser = useStore((s) => s.authUser);
+  const isLoggedIn = !!authUser && !authUser.isAnonymous;
+
+  /** 同步当前本地 provider 配置到云端（使用 raw 端点获取明文 apiKey） */
+  const syncToCloud = async () => {
+    if (!isLoggedIn) return;
+    try {
+      const data = await fetch('/api/providers/raw').then((r) => r.json());
+      const providerConfig = {
+        profiles: (data?.profiles ?? []).filter((p: any) => !p.hash),
+        active: data?.active ?? {},
+        fallbacks: data?.fallbacks ?? {},
+      };
+      await cloudFetch('/api/me/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ settings: { providerConfig } }),
+      });
+    } catch {
+      /* 云端同步失败不阻塞本地操作 */
+    }
+  };
+
   const load = async () => {
     try {
-      const data = await fetch('/api/providers').then((r) => r.json());
-      const list = (data?.profiles ?? []).filter((p: any) => !p.hash);
-      setProfiles(list.map((p: any) => ({
-        id: p.id, name: p.name, baseUrl: p.baseUrl,
-        model: p.model, kind: p.kind, supportsVision: p.supportsVision,
-        apiKey: p.apiKey,
-      })));
-      setActiveChat(data?.active?.chat ?? '');
+      // 并行加载本地 + 云端
+      const [localData, cloudResp] = await Promise.all([
+        fetch('/api/providers').then((r) => r.json()).catch(() => null),
+        isLoggedIn
+          ? cloudFetch('/api/me/settings').then((r) => r.ok ? r.json() : null).catch(() => null)
+          : Promise.resolve(null),
+      ]);
+
+      // 判断本地是否有真实（非 hash）的 provider
+      const localReal = (localData?.profiles ?? []).filter((p: any) => !p.hash);
+
+      // 如果云端有设置且本地没有真实 provider，从云端恢复
+      if (cloudResp?.settings?.providerConfig?.profiles?.length && !localReal.length) {
+        // 过滤掉脱敏 key（以 *** 开头）和空 key 的 profile
+        const validProfiles = cloudResp.settings.providerConfig.profiles.filter(
+          (p: any) => p.apiKey && !p.apiKey.startsWith('***') && !p.hash,
+        );
+
+        if (validProfiles.length) {
+          // 将云端 profiles 逐个写入本地
+          for (const p of validProfiles) {
+            await fetch('/api/providers', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                id: p.id, name: p.name, baseUrl: p.baseUrl,
+                apiKey: p.apiKey, model: p.model,
+                supportsVision: p.supportsVision,
+              }),
+            }).catch(() => {});
+          }
+          // 同步 active 设置
+          if (cloudResp.settings.providerConfig.active?.chat) {
+            await fetch('/api/providers/active', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ role: 'chat', id: cloudResp.settings.providerConfig.active.chat }),
+            }).catch(() => {});
+          }
+          // 重新从本地加载（已是云端同步后的数据）
+          const synced = await fetch('/api/providers').then((r) => r.json());
+          await applyLocalData(synced);
+          return;
+        }
+      }
+
+      await applyLocalData(localData);
     } catch (e: any) {
       setErr(e?.message ?? String(e));
+    }
+  };
+
+  const applyLocalData = async (data: any) => {
+    if (!data) return;
+    const list = (data?.profiles ?? []).filter((p: any) => !p.hash);
+    setProfiles(list.map((p: any) => ({
+      id: p.id, name: p.name, baseUrl: p.baseUrl,
+      model: p.model, kind: p.kind, supportsVision: p.supportsVision,
+      apiKey: p.apiKey,
+    })));
+    const currentActive = data?.active?.chat ?? '';
+    setActiveChat(currentActive);
+
+    // 如果有 provider 但没有 active chat，自动激活第一个
+    if (list.length > 0 && !currentActive) {
+      const firstId = list[0].id;
+      try {
+        await fetch('/api/providers/active', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ role: 'chat', id: firstId }),
+        });
+        setActiveChat(firstId);
+      } catch { /* 自动激活失败不阻塞 */ }
     }
   };
 
@@ -119,6 +207,8 @@ export function ModelSettingsPanel({ onClose }: { onClose?: () => void }) {
       setShowForm(false);
       setEditingId(null);
       await load();
+      syncToCloud();
+      window.dispatchEvent(new Event('providers-changed'));
     } catch (e: any) {
       setErr(e?.message ?? String(e));
     } finally {
@@ -137,6 +227,8 @@ export function ModelSettingsPanel({ onClose }: { onClose?: () => void }) {
       }
       setMsg('已删除');
       await load();
+      syncToCloud();
+      window.dispatchEvent(new Event('providers-changed'));
     } catch (e: any) {
       setErr(e?.message ?? String(e));
     } finally {
@@ -157,6 +249,8 @@ export function ModelSettingsPanel({ onClose }: { onClose?: () => void }) {
       }
       setActiveChat(id);
       setMsg(`已设为默认: ${profiles.find(p => p.id === id)?.name}`);
+      syncToCloud();
+      window.dispatchEvent(new Event('providers-changed'));
     } catch (e: any) {
       setErr(e?.message ?? String(e));
     }

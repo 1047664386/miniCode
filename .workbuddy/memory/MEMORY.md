@@ -33,5 +33,15 @@
 - SSE 协议不统一：server/server-node 用 `data:` 格式，server-cloud 用 `event:+data:` 格式
 - server 不支持 workspace 热切换，server-node 支持
 - server-node 架构更优：Services 容器、openSse 封装、ApprovalsStore 抽象、workspace switch
+
+## 后端整合方案 (2026-06-10)
+- 方案文档：docs-new/12-后端整合方案.md
+- 决策：选 bare Node (server-node) 统一本地后端，不用 NestJS/Express
+- 6 Phase：提取重复代码 → 补 API 缺口 → 对齐 Chat Handler → 补 Middleware → 合并 SSE → Electron 切换
+- server-cloud 不动（完全独立：JWT+PostgreSQL+SandboxHandle）
+- 最大工作量：Chat Handler 对齐（14 项特性，占 50% 时间）
+- server 独有 2 个前端使用的路由（subagents/profiles + spawn），server-node 独有 10 个前端使用的路由
+- 3 个前端消费端：Electron IDE(useStore) + Agent Window(useAgentsStore) + Cloud Web(useAgentsStore)
+- Agent Window：独立 Zustand store，无独立 SSE，chat 用 POST 响应体内嵌 SSE，sessionFetch 区分本地/云端
 - 用户准备用此项目面试，需要深入掌握 AI 模块
 - 面试重点方向: Agent Loop、上下文压缩、幻觉处理、记忆系统、代码检索、Skill/MCP/子Agent

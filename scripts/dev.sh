@@ -130,7 +130,7 @@ PIDS+=($!)
 
 # server-node (:5175) — 主 API 服务
 info "启动 server-node (:5175)..."
-pnpm --filter @mini/server-node run dev 2>&1 | tag "server" "$GREEN" &
+WORKSPACE="$(pwd)" pnpm --filter @mini/server-node run dev 2>&1 | tag "server" "$GREEN" &
 PIDS+=($!)
 
 # server-cloud (:4000) — 云端服务（可选）

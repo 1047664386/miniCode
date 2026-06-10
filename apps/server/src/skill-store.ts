@@ -143,23 +143,53 @@ export class SkillStore {
     const matched: Array<{ meta: SkillMeta; score: number }> = [];
 
     for (const meta of this.cache.values()) {
-      if (!meta.triggers.length) continue;
       let score = 0;
-      for (const trigger of meta.triggers) {
-        const tLower = trigger.toLowerCase();
-        // 全串包含匹配（"部署" 匹配 "帮我部署一下"）
-        if (inputLower.includes(tLower)) {
-          score += tLower.length >= 3 ? 2 : 1; // 长关键词权重高
-          continue;
-        }
-        // token 级匹配（"deploy" 匹配 "how to deploy the app"）
-        for (const token of inputTokens) {
-          if (token === tLower || (tLower.length >= 3 && token.includes(tLower))) {
-            score += 1;
-            break;
+
+      // ── triggers 匹配（权重最高） ──
+      if (meta.triggers.length > 0) {
+        for (const trigger of meta.triggers) {
+          const tLower = trigger.toLowerCase();
+          if (inputLower.includes(tLower)) {
+            score += tLower.length >= 3 ? 2 : 1;
+            continue;
+          }
+          for (const token of inputTokens) {
+            if (token === tLower || (tLower.length >= 3 && token.includes(tLower))) {
+              score += 1;
+              break;
+            }
           }
         }
       }
+
+      // ── 兜底：name / description 匹配 ──
+      // 当 triggers 为空或 triggers 未命中时，用 name 和 description 做兜底
+      if (score === 0) {
+        const nameLower = meta.name.toLowerCase();
+        const descLower = meta.description.toLowerCase();
+        // name 子串包含（用户输入完整 skill name 的场景）
+        if (nameLower.length >= 2 && inputLower.includes(nameLower)) {
+          score += 2;
+        }
+        // name token 匹配
+        for (const token of inputTokens) {
+          if (token.length >= 3 && nameLower.includes(token)) {
+            score += 2; // name 匹配权重高于 description
+            break;
+          }
+        }
+        // description 关键词匹配（权重低，且需要至少 2 个 token 命中才算）
+        let descHits = 0;
+        for (const token of inputTokens) {
+          if (token.length >= 3 && descLower.includes(token)) {
+            descHits++;
+          }
+        }
+        if (descHits >= 2) {
+          score += 1; // 至少 2 个 token 命中 description 才加分
+        }
+      }
+
       if (score > 0) {
         matched.push({ meta, score });
       }

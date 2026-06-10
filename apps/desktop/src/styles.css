@@ -2819,6 +2819,7 @@ body,
 .mention-tag--folder { background: #2d3a2b; border-color: #486045; color: #b6e2ad; }
 .mention-tag--symbol { background: #2d2a3a; border-color: #4a4560; color: #c8b6ff; }
 .mention-tag--skill { background: #3a1f5e; border-color: #7c3aed; color: #d4a0ff; }
+.mention-tag--slash { background: #1f3a5e; border-color: #3b82f6; color: #93c5fd; }
 
 /* 用户气泡中的提及标签行 */
 .user-bubble__mentions {

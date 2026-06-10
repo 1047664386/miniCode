@@ -16425,19 +16425,42 @@ var SkillStore = class {
     const inputTokens = tokenizeInput(inputLower);
     const matched = [];
     for (const meta of this.cache.values()) {
-      if (!meta.triggers.length) continue;
       let score = 0;
-      for (const trigger of meta.triggers) {
-        const tLower = trigger.toLowerCase();
-        if (inputLower.includes(tLower)) {
-          score += tLower.length >= 3 ? 2 : 1;
-          continue;
+      if (meta.triggers.length > 0) {
+        for (const trigger of meta.triggers) {
+          const tLower = trigger.toLowerCase();
+          if (inputLower.includes(tLower)) {
+            score += tLower.length >= 3 ? 2 : 1;
+            continue;
+          }
+          for (const token of inputTokens) {
+            if (token === tLower || tLower.length >= 3 && token.includes(tLower)) {
+              score += 1;
+              break;
+            }
+          }
+        }
+      }
+      if (score === 0) {
+        const nameLower = meta.name.toLowerCase();
+        const descLower = meta.description.toLowerCase();
+        if (nameLower.length >= 2 && inputLower.includes(nameLower)) {
+          score += 2;
         }
         for (const token of inputTokens) {
-          if (token === tLower || tLower.length >= 3 && token.includes(tLower)) {
-            score += 1;
+          if (token.length >= 3 && nameLower.includes(token)) {
+            score += 2;
             break;
           }
+        }
+        let descHits = 0;
+        for (const token of inputTokens) {
+          if (token.length >= 3 && descLower.includes(token)) {
+            descHits++;
+          }
+        }
+        if (descHits >= 2) {
+          score += 1;
         }
       }
       if (score > 0) {

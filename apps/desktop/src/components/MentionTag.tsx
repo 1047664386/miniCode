@@ -8,7 +8,7 @@
 
 import type { FC, MouseEvent } from 'react';
 
-export type MentionKind = 'file' | 'folder' | 'selection' | 'symbol' | 'skill';
+export type MentionKind = 'file' | 'folder' | 'selection' | 'symbol' | 'skill' | 'slash';
 
 export interface MentionTagProps {
   kind: MentionKind;
@@ -29,6 +29,7 @@ const ICONS: Record<MentionKind, string> = {
   selection: '✂️',
   symbol: '🔣',
   skill: '⚡',
+  slash: '📎',
 };
 
 export const MentionTag: FC<MentionTagProps> = ({

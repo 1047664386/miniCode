@@ -15,7 +15,7 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path: string) => path.replace(/^\/cloud-api/, ''),
       },
-      '/api': 'http://localhost:5174',
+      '/api': 'http://localhost:5175',
     },
   },
 });

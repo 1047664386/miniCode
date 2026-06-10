@@ -312,12 +312,8 @@ export function FileTree() {
         const picked = await window.electronAPI.openFolderDialog();
         if (!picked) return;
         await window.electronAPI.setConfig?.({ workspace: picked });
-        const restart = window.confirm(
-          `Workspace switched to:\n${picked}\n\nRelaunch the app now to apply?`,
-        );
-        if (restart && window.electronAPI.relaunchApp) {
-          await window.electronAPI.relaunchApp();
-        }
+        // 热切换 server workspace，无需重启
+        await handlePickedFolder(picked);
       } catch (e: any) {
         alert(`Failed: ${e?.message ?? e}`);
       }

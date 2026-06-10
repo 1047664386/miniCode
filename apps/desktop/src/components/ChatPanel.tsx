@@ -71,6 +71,7 @@ export function ChatPanel() {
     selectedProfileId, setSelectedProfileId,
     authUser, setAuthModalOpen, logout,
     advancedSettings,
+    workspace,
   } = useStore();
   const [input, setInput] = useState('');
   const [slashList, setSlashList] = useState<SlashSpec[]>([]);
@@ -239,14 +240,23 @@ export function ChatPanel() {
     }, 0);
   }, [pendingInput]);
 
-  // 加载 slash 命令列表（一次性）
-  useEffect(() => {
+  // 加载 slash 命令列表
+  const loadSlashList = () => {
     fetch('/api/slash').then((r) => r.json()).then(setSlashList).catch(() => {});
-  }, []);
-  // 加载 skill 列表（一次性）
-  useEffect(() => {
+  };
+  useEffect(() => { loadSlashList(); }, []);
+  // 加载 skill 列表（workspace 变化后也刷新）
+  const loadSkillList = () => {
     fetch('/api/skills').then((r) => r.json()).then(setSkillList).catch(() => {});
-  }, []);
+  };
+  useEffect(() => { loadSkillList(); }, []);
+  // workspace 切换后刷新 skill 和 slash 列表
+  useEffect(() => {
+    if (workspace) {
+      loadSkillList();
+      loadSlashList();
+    }
+  }, [workspace]);
   // 加载 provider profiles（一次性 + settings 关闭后刷新）
   const loadProfiles = () => {
     fetch('/api/providers').then((r) => r.json()).then((data: any) => {
@@ -301,24 +311,34 @@ export function ChatPanel() {
         type: 'slash' as const,
       }));
 
-    // Skill
+    // Skill（优先显示匹配的 skill，再显示 slash 命令）
+    // 匹配优先级：name 精确前缀 > triggers 关键词 > description/name 关键词兜底
+    // q 为空（刚输入 /）时，展示所有 skill
     const skillItems: SuggestionItem[] = skillList
       .filter((s) => {
-        // name 匹配
-        if (s.name.toLowerCase().startsWith(q)) return true;
-        // trigger 关键词匹配
+        if (!q) return true; // 只输入 / → 展示全部
+        const sLower = s.name.toLowerCase();
+        const dLower = s.description.toLowerCase();
+        // 1. name 精确前缀匹配
+        if (sLower.startsWith(q)) return true;
+        // 2. triggers 关键词匹配
         if (s.triggers?.some((t) => t.toLowerCase().startsWith(q))) return true;
+        // 3. description 关键词兜底
+        if (q.length >= 2 && dLower.includes(q)) return true;
+        // 4. name 模糊包含匹配（如输入 "front" 匹配 "frontend-design"）
+        if (sLower.includes(q)) return true;
         return false;
       })
       .map((s) => ({
         name: s.name,
         prefix: '⚡',
-        description: s.description + (s.triggers?.length ? ` (triggers: ${s.triggers.join(', ')})` : ''),
+        description: s.description,
         sourceLabel: s.source === 'project' ? 'workspace' : s.source,
         type: 'skill' as const,
       }));
 
-    return [...slashItems, ...skillItems].slice(0, 10);
+    // skill 排在前面（用户安装的 skill 优先于内置 slash 命令），上限提升到 20
+    return [...skillItems, ...slashItems].slice(0, 20);
   }, [input, slashList, skillList]);
 
   useEffect(() => {
@@ -326,22 +346,15 @@ export function ChatPanel() {
   }, [slashSuggestions.length]);
 
   const applySuggestion = (item: SuggestionItem) => {
-    if (item.type === 'slash') {
-      // Slash 命令：替换输入框为 /name + 空格
-      const rest = input.split('\n').slice(1).join('\n');
-      const next = '/' + item.name + ' ' + (rest ? '\n' + rest : '');
-      setInput(next);
-      setTimeout(() => textareaRef.current?.focus(), 0);
-    } else {
-      // Skill：添加为 tag，清掉 / 前缀
-      if (!skillTags.includes(item.name)) {
-        setSkillTags((prev) => [...prev, item.name]);
-      }
-      // 去掉输入框中的 /xxx 部分
-      const rest = input.split('\n').slice(1).join('\n');
-      setInput(rest);
-      setTimeout(() => textareaRef.current?.focus(), 0);
+    // 统一用 tag 形式插入：slash 命令和 skill 都变成 tag
+    const tagKey = item.type === 'skill' ? item.name : `/${item.name}`;
+    if (!skillTags.includes(tagKey)) {
+      setSkillTags((prev) => [...prev, tagKey]);
     }
+    // 去掉输入框中的 /xxx 部分
+    const rest = input.split('\n').slice(1).join('\n');
+    setInput(rest);
+    setTimeout(() => textareaRef.current?.focus(), 0);
   };
 
   const send = async () => {
@@ -365,10 +378,15 @@ export function ChatPanel() {
           .join(' ') + '\n'
       : '';
     let finalText = (attPrefix + text).trim();
-    // 如果有选中的 skill tags，在消息前面添加 skill 调用指令
+    // 如果有选中的 tags（skill + slash），在消息前面添加调用指令
     if (activeSkillTags.length > 0) {
-      const skillPrefix = activeSkillTags.map((n) => `/skill:${n}`).join(' ');
-      finalText = skillPrefix + '\n' + finalText;
+      const tagPrefix = activeSkillTags.map((n) => {
+        // slash 命令 tag 以 / 开头（如 /explain），直接展开
+        if (n.startsWith('/')) return n;
+        // skill tag 是 skill name，用 /skill: 前缀
+        return `/skill:${n}`;
+      }).join(' ');
+      finalText = tagPrefix + '\n' + finalText;
     }
     clearAttachments();
 
@@ -980,21 +998,22 @@ export function ChatPanel() {
             </div>
           )}
           {skillTags.length > 0 && (
-            <div className="composer-attachments composer-attachments--skills">
-              {skillTags.map((name) => (
-                <span key={name} className="skill-tag">
-                  <span className="skill-tag__icon">⚡</span>
-                  <span className="skill-tag__label">{name}</span>
-                  <button
-                    type="button"
-                    className="skill-tag__x"
-                    title="移除"
-                    onClick={() => setSkillTags((prev) => prev.filter((n) => n !== name))}
-                  >
-                    ×
-                  </button>
-                </span>
-              ))}
+            <div className="composer-attachments">
+              {skillTags.map((tag) => {
+                const isSlash = tag.startsWith('/');
+                const kind = isSlash ? 'slash' : 'skill';
+                const label = isSlash ? tag : tag;
+                return (
+                  <MentionTag
+                    key={tag}
+                    kind={kind as any}
+                    label={label}
+                    path={tag}
+                    removable
+                    onRemove={() => setSkillTags((prev) => prev.filter((n) => n !== tag))}
+                  />
+                );
+              })}
             </div>
           )}
           <MentionInput

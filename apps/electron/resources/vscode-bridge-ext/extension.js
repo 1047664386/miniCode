@@ -58,8 +58,22 @@ function snapshotContext() {
   };
 }
 
+function notifyCurrentWorkspace() {
+  const folders = vscode.workspace.workspaceFolders;
+  if (folders && folders.length > 0) {
+    postToShellViaServer('workspace.current', { path: folders[0].uri.fsPath });
+  }
+}
+
 function activate(context) {
   console.log('[mci-bridge] activated, server port =', MCI_SERVER_PORT);
+
+  // 上报当前 workspace，并在变化时同步
+  notifyCurrentWorkspace();
+  const wsDisposable = vscode.workspace.onDidChangeWorkspaceFolders(() => {
+    notifyCurrentWorkspace();
+  });
+  context.subscriptions.push(wsDisposable);
 
   // ---- 命令：Add Selection to MCI Composer ----
   const addToComposer = vscode.commands.registerCommand('mci.addToComposer', () => {

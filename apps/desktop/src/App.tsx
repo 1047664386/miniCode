@@ -196,6 +196,13 @@ export function App() {
         } else if (data.event === 'agents.open') {
           const api = (window as any).mciAgents;
           if (api?.openWindow) void api.openWindow();
+        } else if (data.event === 'workspace.current') {
+          // VSCode 模式下，code-server 上报当前 workspace 路径
+          const incomingWs = data.payload?.path;
+          if (incomingWs && incomingWs !== useStore.getState().workspace) {
+            useStore.setState({ workspace: incomingWs });
+            pushRecent(incomingWs);
+          }
         }
       } catch { /* ignore */ }
     };

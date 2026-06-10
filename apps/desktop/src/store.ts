@@ -29,16 +29,30 @@ function sessionApiBase(): string {
 }
 export function sessionFetch(path: string, init?: RequestInit) {
   const base = sessionApiBase();
+  const token = useStore.getState().authToken;
+  const headers = new Headers(init?.headers);
+  // Electron file:// 协议下 SameSite=Lax cookie 不会被跨站 fetch 发送，
+  // 所以用 Authorization header 传递 JWT token 作为备选
+  if (base && token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
   return fetch(`${base}${path}`, {
     ...init,
+    headers,
     credentials: base ? 'include' : 'omit',
   });
 }
 /** Always routes to cloud (for auth endpoints that only exist on cloud server). */
 export function cloudFetch(path: string, init?: RequestInit) {
   const base = CLOUD_API || '/cloud-api';
+  const token = useStore.getState().authToken;
+  const headers = new Headers(init?.headers);
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
   return fetch(`${base}${path}`, {
     ...init,
+    headers,
     credentials: 'include',
   });
 }
@@ -243,6 +257,8 @@ interface State {
   clearAttachments: () => void;
   // ─── 认证状态 ──────────────────────────────────────────
   authUser: { id: string; username?: string; name?: string; isAnonymous: boolean } | null;
+  /** JWT token（登录后从响应体获取；Electron file:// 下 cookie 不可用，改用 Authorization header） */
+  authToken: string | null;
   authChecked: boolean;  // 启动时是否已完成 auth 检查
   authModalOpen: boolean;
   checkAuth: () => Promise<void>;
@@ -524,10 +540,16 @@ export const useStore = create<State>((set, get) => ({
   async loadSessions() {
     try {
       const r = await sessionFetch('/api/sessions');
+      if (!r.ok) {
+        // 401 等错误 → 不更新 sessionList（保持原值或空数组），避免 .map() 崩溃
+        console.warn('[loadSessions] request failed:', r.status);
+        set((s) => ({ sessionList: Array.isArray(s.sessionList) ? s.sessionList : [] }));
+        return;
+      }
       const list = await r.json();
-      set({ sessionList: list });
+      set({ sessionList: Array.isArray(list) ? list : [] });
     } catch {
-      /* */
+      set((s) => ({ sessionList: Array.isArray(s.sessionList) ? s.sessionList : [] }));
     }
   },
   async createSession(title) {
@@ -686,6 +708,7 @@ export const useStore = create<State>((set, get) => ({
   },
   // ─── 认证 ──────────────────────────────────────────────
   authUser: null,
+  authToken: (() => { try { return localStorage.getItem('mci.authToken'); } catch { return null; } })(),
   authChecked: false,
   authModalOpen: false,
   setAuthModalOpen(open) { set({ authModalOpen: open }); },
@@ -716,7 +739,8 @@ export const useStore = create<State>((set, get) => ({
       });
       const data = await r.json();
       if (!r.ok) return { error: data.error || '登录失败' };
-      set({ authUser: { id: data.user.id, username: data.user.username, name: data.user.name, isAnonymous: false }, authModalOpen: false });
+      set({ authUser: { id: data.user.id, username: data.user.username, name: data.user.name, isAnonymous: false }, authToken: data.token ?? null, authModalOpen: false });
+      if (data.token) { try { localStorage.setItem('mci.authToken', data.token); } catch {} }
       // 登录后拉取云端会话列表
       get().loadSessions().catch(() => {});
       return {};
@@ -731,7 +755,8 @@ export const useStore = create<State>((set, get) => ({
       });
       const data = await r.json();
       if (!r.ok) return { error: data.error || '注册失败' };
-      set({ authUser: { id: data.user.id, username: data.user.username, name: data.user.name, isAnonymous: false }, authModalOpen: false });
+      set({ authUser: { id: data.user.id, username: data.user.username, name: data.user.name, isAnonymous: false }, authToken: data.token ?? null, authModalOpen: false });
+      if (data.token) { try { localStorage.setItem('mci.authToken', data.token); } catch {} }
       // 注册后拉取云端会话列表
       get().loadSessions().catch(() => {});
       return {};
@@ -739,7 +764,8 @@ export const useStore = create<State>((set, get) => ({
   },
   async logout() {
     try { await cloudFetch('/api/auth/logout', { method: 'DELETE' }); } catch {}
-    set({ authUser: null });
+    set({ authUser: null, authToken: null });
+    try { localStorage.removeItem('mci.authToken'); } catch {}
     // 登出后切回本地会话列表
     get().loadSessions().catch(() => {});
   },

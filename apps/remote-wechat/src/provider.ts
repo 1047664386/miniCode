@@ -12,12 +12,16 @@ export interface InboundMessage {
   roomId?: string;
   /** 微信消息原始 id，去重用 */
   msgId?: string;
+  /** iLink 协议回复所需的 context_token */
+  contextToken?: string;
 }
 
 export interface OutboundMessage {
   wxUserId: string;
   roomId?: string;
   text: string;
+  /** iLink 协议回复所需的 context_token */
+  contextToken?: string;
 }
 
 export type InboundHandler = (msg: InboundMessage) => Promise<void>;

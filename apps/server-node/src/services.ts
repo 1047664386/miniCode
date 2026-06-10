@@ -27,21 +27,19 @@ import {
   buildIndex, createEmbedder,
   type CodebaseIndex, type Embedder,
 } from '@mini/indexer';
-import { PendingEditStore } from '../../server/src/pending-edit.js';
-import { CheckpointStore } from '../../server/src/checkpoint.js';
-import { RulesStore } from '../../server/src/rules.js';
-import { ProjectMemoryStore } from '../../server/src/project-memory.js';
-import { SlashCommandRegistry } from '../../server/src/slash-commands.js';
-import { ProviderStore } from '../../server/src/providers.js';
-import { SessionStore } from '../../server/src/session-store.js';
-import { SkillStore } from '../../server/src/skill-store.js';
-import { SubagentManager } from '../../server/src/subagent-manager.js';
-import { McpManager } from '../../server/src/mcp-client.js';
-import { LLMRouter } from '../../server/src/llm-router.js';
-import { buildReranker, type Reranker } from '../../server/src/reranker.js';
-import { hybridRetrieve } from '../../server/src/retrieval.js';
-import { decideCommand } from '../../server/src/exec-policy.js';
-import { IndexWatcher } from '../../server/src/watcher.js';
+import {
+  PendingEditStore, CheckpointStore, RulesStore,
+  ProjectMemoryStore, SlashCommandRegistry,
+  ProviderStore, SessionStore, SkillStore,
+  SubagentManager, McpManager, LLMRouter,
+  buildReranker, type Reranker,
+  hybridRetrieve, IndexWatcher,
+  createSystemHookBus, type HookMetrics,
+  BackgroundTaskManager, type BgTask,
+  VerifyAfterAcceptStore, WorktreeManager,
+  permissionAwareDecide, decideCommand,
+} from '@mini/server-core';
+import { HookBus } from '@mini/core';
 import { ApprovalsStore } from './approvals.js';
 import { env } from './env.js';
 
@@ -63,6 +61,11 @@ export class Services {
   subagents!: SubagentManager;
   mcpManager!: McpManager;
   approvals!: ApprovalsStore;
+  hookBus!: HookBus;
+  hookMetrics!: HookMetrics;
+  bgTasks!: BackgroundTaskManager;
+  verifyAfterAccept!: VerifyAfterAcceptStore;
+  worktrees!: WorktreeManager;
 
   llmChat!: LLMProvider;
   llmComplete!: LLMProvider;
@@ -76,6 +79,8 @@ export class Services {
   watcher!: IndexWatcher;
   /** 文件变更 SSE 客户端集合 */
   fsEventClients = new Set<import('http').ServerResponse>();
+  /** metrics 快照回调（由 main.ts 注入） */
+  metricsProvider: (() => Record<string, unknown>) | null = null;
 
   constructor(workspace: string) {
     this.workspace = workspace;
@@ -212,6 +217,27 @@ export class Services {
       await this.checkpoints.prune(100);
     };
 
+    // ----- Hook 系统 (PreToolUse / PostToolUse / Stop / UserPromptSubmit) -----
+    const { bus: hookBus, metrics: hookMetrics } = createSystemHookBus({ checkpoints: this.checkpoints });
+    this.hookBus = hookBus;
+    this.hookMetrics = hookMetrics;
+    console.log('[hooks] system bus ready');
+
+    // ----- 后台任务管理器 -----
+    this.bgTasks = new BackgroundTaskManager({ workspace: this.workspace });
+    this.bgTasks.on('task_complete', (t: BgTask) => {
+      console.log(`[bg-tasks] ${t.id} ${t.status} (exit=${t.exitCode}) cmd="${t.command}"`);
+    });
+
+    // ----- Accept 后自动 typecheck -----
+    this.verifyAfterAccept = new VerifyAfterAcceptStore(this.workspace);
+
+    // ----- Worktree 隔离 (subagent 并行写文件) -----
+    this.worktrees = new WorktreeManager(this.workspace);
+    const isGitRepoForWorktree = await this.worktrees.isGitRepo();
+    if (isGitRepoForWorktree) console.log('[worktrees] git repo detected, isolation available');
+    else console.log('[worktrees] not a git repo, subagents will share workspace');
+
     // ----- Rules / Slash / Sessions / Skills -----------
     this.rules = new RulesStore(this.workspace);
     await this.rules.load();
@@ -242,9 +268,10 @@ export class Services {
       workspaceRoot: this.workspace,
       defaultModel: () =>
         this.providers.getActive('fast')?.model ?? this.providers.getActive('chat')?.model,
+      worktrees: isGitRepoForWorktree ? this.worktrees : undefined,
       childToolCtxFactory: () => ({
         cwd: this.workspace,
-        execPolicy: (cmd) => decideCommand(cmd),
+        execPolicy: (cmd) => permissionAwareDecide(cmd, { sandbox: 'read_only', approval: 'unless_trusted' }),
         codeIntel: {
           findSymbol: async (q, limit) =>
             this.index ? this.index.symbols.fuzzyFind(q, limit ?? 15) : [],

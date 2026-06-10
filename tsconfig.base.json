@@ -17,6 +17,8 @@
       "@mini/core": ["packages/core/src/index.ts"],
       "@mini/core/*": ["packages/core/src/*"],
       "@mini/indexer": ["packages/indexer/src/index.ts"],
+      "@mini/server-core": ["packages/server-core/src/index.ts"],
+      "@mini/server-core/*": ["packages/server-core/src/*"],
       "@mini/storage": ["packages/storage/src/index.ts"],
       "@mini/storage/*": ["packages/storage/src/*"],
       "@mini/sandbox": ["packages/sandbox/src/index.ts"]

@@ -8,7 +8,7 @@
  * 4. VSCode Bridge 扩展和 code-server
  *
  * 关键逻辑：
- * - 默认使用裸 Node 版后端（apps/server-node），打包后体积 564KB，启动快
+ * - 使用裸 Node 版后端（apps/server-node），打包后体积 564KB，启动快
  * - 可通过环境变量 `SERVER_TARGET=server` 切换为 Express 版后端
  * - 只复制后端 bundle、sourcemap 和必要的原生模块，大幅减小打包体积
  * - 自动同步 Electron 应用版本号
@@ -34,12 +34,10 @@ const ELECTRON_DIR = path.join(ROOT, 'apps', 'electron');
 const RESOURCES = path.join(ELECTRON_DIR, 'resources');
 
 // ===================== 配置：后端服务目标 =====================
-// 默认使用 server-node（裸 Node 实现），可通过环境变量切换
-const SERVER_TARGET = process.env.SERVER_TARGET || 'server-node';
-// 根据目标后端确定对应的 pnpm 包名
-const SERVER_PKG_NAME = SERVER_TARGET === 'server-node'
-  ? '@mini/server-node'
-  : '@mini/server';
+// 使用 server-node（裸 Node 实现），打包后体积小，启动快
+// 注意：apps/server (Express 版) 已废弃并删除，不再支持切换
+const SERVER_TARGET = 'server-node';
+const SERVER_PKG_NAME = '@mini/server-node';
 
 // 后端和前端构建产物路径
 const SERVER_SRC = path.join(ROOT, 'apps', SERVER_TARGET);

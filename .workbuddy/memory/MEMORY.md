@@ -4,9 +4,11 @@
 - MiniCodeIDE 是自建的 Cursor/Claude-Code 风格 AI 编程 IDE
 - pnpm monorepo, ESM-only TypeScript
 - 核心包: packages/core (Agent Loop + LLM + Memory + Context + Prompts), packages/indexer (BM25 + SymbolGraph + Vector)
-- 后端: apps/server (Express), apps/server-node (bare-Node), apps/server-cloud (Fastify + Prisma + PG)
+- **packages/server-core**: 共享业务逻辑包（store/agent/llm/git/indexer/exec/tasks/bridge/utils），由 server-node 导入
+- 后端: apps/server-node (bare-Node, 唯一本地后端), apps/server-cloud (Fastify + Prisma + PG)
 - 前端: apps/desktop (React + Monaco), apps/web (复用desktop)
 - 桌面壳: apps/electron
+- **apps/server (Express) 已于 2026-06-10 删除**，业务逻辑迁移至 packages/server-core
 
 ## 已完成的文档梳理 (2026-06-09)
 - docs-new/ 下 11 篇深度分析文档（含新增第11篇AI工程化专题）
@@ -26,22 +28,17 @@
 - Slash Skill 选择器：/ 唤起 skill 列表 + Tag 样式插入 + /skill:xxx 后端解析注入
 
 ## 后端架构现状 (2026-06-10)
-- 3 个后端并存：server(Express 2488行), server-node(bare-Node 1310行), server-cloud(Fastify+Prisma)
-- Electron 打包用 server(Express)；Vite 开发用 server-node(bare-Node)；Web 版用 server-cloud
-- server-node 17 个业务模块通过相对路径导入 server，路由层 ~80% 重复，3 个函数完全复制粘贴
-- 2 个持久 SSE 通道：/api/fs/events(文件+skill变更) + /api/composer/events(VSCode转发)
-- SSE 协议不统一：server/server-node 用 `data:` 格式，server-cloud 用 `event:+data:` 格式
-- server 不支持 workspace 热切换，server-node 支持
-- server-node 架构更优：Services 容器、openSse 封装、ApprovalsStore 抽象、workspace switch
-
-## 后端整合方案 (2026-06-10)
-- 方案文档：docs-new/12-后端整合方案.md
-- 决策：选 bare Node (server-node) 统一本地后端，不用 NestJS/Express
-- 6 Phase：提取重复代码 → 补 API 缺口 → 对齐 Chat Handler → 补 Middleware → 合并 SSE → Electron 切换
-- server-cloud 不动（完全独立：JWT+PostgreSQL+SandboxHandle）
-- 最大工作量：Chat Handler 对齐（14 项特性，占 50% 时间）
-- server 独有 2 个前端使用的路由（subagents/profiles + spawn），server-node 独有 10 个前端使用的路由
+- **server-node 是唯一本地后端**：Electron 打包 + Vite 开发都用 server-node
+- **packages/server-core** 提供所有共享业务逻辑，通过 `@mini/server-core` barrel 导出
+- server-node 通过 `import { ... } from '@mini/server-core'` 导入，不再有相对路径跨越
+- server-cloud 完全独立（JWT+PostgreSQL+SandboxHandle），不动
 - 3 个前端消费端：Electron IDE(useStore) + Agent Window(useAgentsStore) + Cloud Web(useAgentsStore)
-- Agent Window：独立 Zustand store，无独立 SSE，chat 用 POST 响应体内嵌 SSE，sessionFetch 区分本地/云端
+
+## 后端整合 + server-core 提取 (2026-06-10) — ✅ 已完成
+- 6 Phase 整合全部完成：提取重复代码 → 补 API 缺口 → 对齐 Chat Handler 15项 → 中间件安全加固 → SSE保持双端点 → Electron已默认server-node
+- server-core 提取完成：9 目录 31 文件，全部 < 500 行
+- subagent-manager 拆分：→ subagent-types.ts + profile-watcher.ts
+- 严格 CR 修复：P0 跨目录引用改为 barrel、P1 类型导出补全 + as any 消除 + /tmp 跨平台
+- apps/server 已删除，prepare-electron-resources.mjs 硬编码 server-node
 - 用户准备用此项目面试，需要深入掌握 AI 模块
 - 面试重点方向: Agent Loop、上下文压缩、幻觉处理、记忆系统、代码检索、Skill/MCP/子Agent

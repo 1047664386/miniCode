@@ -455,8 +455,8 @@ var init_parseUtil = __esm({
     init_errors();
     init_en();
     makeIssue = (params) => {
-      const { data, path: path27, errorMaps, issueData } = params;
-      const fullPath = [...path27, ...issueData.path || []];
+      const { data, path: path32, errorMaps, issueData } = params;
+      const fullPath = [...path32, ...issueData.path || []];
       const fullIssue = {
         ...issueData,
         path: fullPath
@@ -764,11 +764,11 @@ var init_types = __esm({
     init_parseUtil();
     init_util();
     ParseInputLazyPath = class {
-      constructor(parent, value, path27, key) {
+      constructor(parent, value, path32, key) {
         this._cachedPath = [];
         this.parent = parent;
         this.data = value;
-        this._path = path27;
+        this._path = path32;
         this._key = key;
       }
       get path() {
@@ -6506,7 +6506,7 @@ var require_extension = __commonJS({
 var require_websocket = __commonJS({
   "../../node_modules/.pnpm/ws@8.21.0/node_modules/ws/lib/websocket.js"(exports, module) {
     "use strict";
-    var EventEmitter3 = __require("events");
+    var EventEmitter4 = __require("events");
     var https = __require("https");
     var http2 = __require("http");
     var net = __require("net");
@@ -6538,7 +6538,7 @@ var require_websocket = __commonJS({
     var protocolVersions = [8, 13];
     var readyStates = ["CONNECTING", "OPEN", "CLOSING", "CLOSED"];
     var subprotocolRegex = /^[!#$%&'*+\-.0-9A-Z^_`|a-z~]+$/;
-    var WebSocket2 = class _WebSocket extends EventEmitter3 {
+    var WebSocket2 = class _WebSocket extends EventEmitter4 {
       /**
        * Create a new `WebSocket`.
        *
@@ -7545,7 +7545,7 @@ var require_subprotocol = __commonJS({
 var require_websocket_server = __commonJS({
   "../../node_modules/.pnpm/ws@8.21.0/node_modules/ws/lib/websocket-server.js"(exports, module) {
     "use strict";
-    var EventEmitter3 = __require("events");
+    var EventEmitter4 = __require("events");
     var http2 = __require("http");
     var { Duplex } = __require("stream");
     var { createHash: createHash4 } = __require("crypto");
@@ -7558,7 +7558,7 @@ var require_websocket_server = __commonJS({
     var RUNNING = 0;
     var CLOSING = 1;
     var CLOSED = 2;
-    var WebSocketServer2 = class extends EventEmitter3 {
+    var WebSocketServer2 = class extends EventEmitter4 {
       /**
        * Create a `WebSocketServer` instance.
        *
@@ -7944,12 +7944,13 @@ var require_websocket_server = __commonJS({
 
 // src/main.ts
 import http from "node:http";
+import crypto3 from "node:crypto";
 import { execSync } from "node:child_process";
 import { URL as URL2 } from "node:url";
 import { performance } from "node:perf_hooks";
 
 // src/services.ts
-import path24 from "node:path";
+import path30 from "node:path";
 
 // ../../packages/core/src/llm/types.ts
 var DEFAULT_FETCH_TIMEOUT_MS = 3e5;
@@ -11186,6 +11187,86 @@ function registerBuiltinTools(registry) {
   return registry;
 }
 
+// ../../packages/core/src/agent/hooks.ts
+var HookBus = class {
+  handlers = {
+    UserPromptSubmit: [],
+    PreToolUse: [],
+    PostToolUse: [],
+    Stop: []
+  };
+  on(event, name, handler) {
+    this.handlers[event].push({ name, handler });
+    return this;
+  }
+  off(event, name) {
+    this.handlers[event] = this.handlers[event].filter((h) => h.name !== name);
+    return this;
+  }
+  list(event) {
+    return this.handlers[event].map((h) => h.name);
+  }
+  /** 触发 UserPromptSubmit；短路语义：第一个 block 直接返回，否则合并 injectSystem */
+  async triggerUserPromptSubmit(p) {
+    const merged = {};
+    const injects = [];
+    for (const h of this.handlers.UserPromptSubmit) {
+      try {
+        const r = await h.handler(p);
+        if (r?.block) {
+          return { block: true, blockReason: r.blockReason ?? `Blocked by hook ${h.name}` };
+        }
+        if (r?.injectSystem) injects.push(r.injectSystem);
+      } catch (e) {
+        console.error(`[HookBus] UserPromptSubmit hook "${h.name}" threw:`, e?.message ?? e);
+      }
+    }
+    if (injects.length) merged.injectSystem = injects.join("\n\n");
+    return merged;
+  }
+  /** 触发 PreToolUse；短路语义：第一个 block 立刻返回 */
+  async triggerPreToolUse(p) {
+    const acc = {};
+    for (const h of this.handlers.PreToolUse) {
+      try {
+        const r = await h.handler(p);
+        if (r?.block) {
+          return { block: true, blockReason: r.blockReason ?? `Blocked by hook ${h.name}` };
+        }
+        if (r?.rewriteArguments) acc.rewriteArguments = r.rewriteArguments;
+      } catch (e) {
+        console.error(`[HookBus] PreToolUse hook "${h.name}" threw:`, e?.message ?? e);
+      }
+    }
+    return acc;
+  }
+  /** 触发 PostToolUse；纯副作用，所有 handler 都跑，异常 swallow */
+  async triggerPostToolUse(p) {
+    for (const h of this.handlers.PostToolUse) {
+      try {
+        await h.handler(p);
+      } catch (e) {
+        console.error(`[HookBus] PostToolUse hook "${h.name}" threw:`, e?.message ?? e);
+      }
+    }
+  }
+  /** 触发 Stop；所有 handler 都跑，forceContinue 取并集 */
+  async triggerStop(p) {
+    let forceContinue = false;
+    const messages = [];
+    for (const h of this.handlers.Stop) {
+      try {
+        const r = await h.handler(p);
+        if (r?.forceContinue) forceContinue = true;
+        if (r?.injectUserMessage) messages.push(r.injectUserMessage);
+      } catch (e) {
+        console.error(`[HookBus] Stop hook "${h.name}" threw:`, e?.message ?? e);
+      }
+    }
+    return forceContinue ? { forceContinue: true, injectUserMessage: messages.join("\n") || "Continue." } : {};
+  }
+};
+
 // ../../packages/core/src/agent/agent-profiles.ts
 import { promises as fs7 } from "node:fs";
 import path7 from "node:path";
@@ -12957,16 +13038,16 @@ function getParser(lang) {
   cachedParsers[lang] = p;
   return p;
 }
-function detectLang(path27) {
-  if (path27.endsWith(".ts")) return "ts";
-  if (path27.endsWith(".tsx")) return "tsx";
-  if (path27.endsWith(".mts") || path27.endsWith(".cts")) return "ts";
-  if (path27.endsWith(".js") || path27.endsWith(".mjs") || path27.endsWith(".cjs")) return "js";
-  if (path27.endsWith(".jsx")) return "jsx";
+function detectLang(path32) {
+  if (path32.endsWith(".ts")) return "ts";
+  if (path32.endsWith(".tsx")) return "tsx";
+  if (path32.endsWith(".mts") || path32.endsWith(".cts")) return "ts";
+  if (path32.endsWith(".js") || path32.endsWith(".mjs") || path32.endsWith(".cjs")) return "js";
+  if (path32.endsWith(".jsx")) return "jsx";
   return null;
 }
-function parseSource(path27, content) {
-  const lang = detectLang(path27);
+function parseSource(path32, content) {
+  const lang = detectLang(path32);
   if (!lang) return null;
   const parser = getParser(lang);
   const tree = parser.parse(content);
@@ -12974,8 +13055,8 @@ function parseSource(path27, content) {
 }
 
 // ../../packages/indexer/src/extractor.ts
-function extractFacts(path27, content) {
-  const parsed = parseSource(path27, content);
+function extractFacts(path32, content) {
+  const parsed = parseSource(path32, content);
   if (!parsed) return null;
   const root = parsed.tree.rootNode;
   const symbols = [];
@@ -12988,10 +13069,10 @@ function extractFacts(path27, content) {
     return lines.slice(s, e + 1).join("\n").slice(0, 200);
   };
   const sym = (name, kind, n, exported, container) => ({
-    id: `${path27}#${name}@${n.startPosition.row + 1}`,
+    id: `${path32}#${name}@${n.startPosition.row + 1}`,
     name,
     kind,
-    path: path27,
+    path: path32,
     startLine: n.startPosition.row + 1,
     endLine: n.endPosition.row + 1,
     container,
@@ -13081,7 +13162,7 @@ function extractFacts(path27, content) {
         break;
       }
       case "import_statement": {
-        imports.push(parseImport(node, path27));
+        imports.push(parseImport(node, path32));
         break;
       }
       case "export_statement": {
@@ -13089,7 +13170,7 @@ function extractFacts(path27, content) {
       }
     }
   }
-  return { path: path27, symbols, imports, calls };
+  return { path: path32, symbols, imports, calls };
   function collectCalls(scope, callerName) {
     walk(scope, (n) => {
       if (n.type === "call_expression") {
@@ -13103,7 +13184,7 @@ function extractFacts(path27, content) {
           }
           if (callee && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(callee)) {
             calls.push({
-              fromPath: path27,
+              fromPath: path32,
               callerSymbol: callerName,
               callee,
               line: n.startPosition.row + 1
@@ -13197,10 +13278,10 @@ var SymbolGraph = class {
       }
     }
   }
-  remove(path27) {
-    const prev = this.byPath.get(path27);
+  remove(path32) {
+    const prev = this.byPath.get(path32);
     if (!prev) return;
-    this.byPath.delete(path27);
+    this.byPath.delete(path32);
     for (const s of prev.symbols) {
       this.byId.delete(s.id);
       const arr = this.byName.get(s.name);
@@ -13253,8 +13334,8 @@ var SymbolGraph = class {
     result.sort((a, b) => b.score - a.score);
     return result.slice(0, limit).map((x) => x.s);
   }
-  symbolsInFile(path27) {
-    return this.byPath.get(path27)?.symbols ?? [];
+  symbolsInFile(path32) {
+    return this.byPath.get(path32)?.symbols ?? [];
   }
   /** 所有已索引的文件路径（供 @file 补全等使用） */
   allFiles() {
@@ -13514,9 +13595,257 @@ function createEmbedder(cfg) {
   return new HashEmbedder();
 }
 
-// ../server/src/pending-edit.ts
+// ../../packages/server-core/src/store/session-store.ts
 import { promises as fs12 } from "node:fs";
 import path12 from "node:path";
+var SessionLock = class {
+  chains = /* @__PURE__ */ new Map();
+  async acquire(sessionId) {
+    const prev = this.chains.get(sessionId) ?? Promise.resolve();
+    let release;
+    const next = new Promise((resolve3) => {
+      release = resolve3;
+    });
+    this.chains.set(sessionId, next);
+    await prev;
+    return () => {
+      release();
+      if (this.chains.get(sessionId) === next) {
+        this.chains.delete(sessionId);
+      }
+    };
+  }
+  /** 检查某个 session 是否正在被锁定（用于快速判断，不阻塞） */
+  isLocked(sessionId) {
+    return this.chains.has(sessionId);
+  }
+};
+var SessionStore = class {
+  dir;
+  /** session id → 内存缓存（避免每次 list 都扫盘） */
+  cache = /* @__PURE__ */ new Map();
+  loaded = false;
+  /** 并发锁：确保同一 session 的 turn 生命周期不会交叉 */
+  lock = new SessionLock();
+  constructor(workspace) {
+    this.dir = path12.join(workspace, ".minicodeide", "sessions");
+  }
+  /** 启动时加载所有 session（jsonl 文件），并对老数据自动补全 mode 字段 */
+  async load() {
+    if (this.loaded) return;
+    await fs12.mkdir(this.dir, { recursive: true });
+    const files = await fs12.readdir(this.dir);
+    for (const f of files) {
+      if (!f.endsWith(".jsonl")) continue;
+      const id = f.replace(/\.jsonl$/, "");
+      try {
+        const sess = await this.readJsonl(id);
+        if (sess) {
+          if (!sess.meta.mode) {
+            sess.meta.mode = "code";
+          }
+          this.cache.set(id, sess);
+        }
+      } catch {
+      }
+    }
+    this.loaded = true;
+  }
+  list() {
+    return [...this.cache.values()].map((s) => s.meta).sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+  get(id) {
+    return this.cache.get(id);
+  }
+  async create(titleOrOpts) {
+    const opts = typeof titleOrOpts === "string" ? { title: titleOrOpts } : titleOrOpts ?? {};
+    const id = `sess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const now = Date.now();
+    const meta = {
+      id,
+      title: opts.title?.trim() || "New chat",
+      createdAt: now,
+      updatedAt: now,
+      messageCount: 0,
+      mode: opts.mode ?? "code",
+      workspaceRoot: opts.workspaceRoot,
+      remoteUser: opts.remoteUser
+    };
+    const sess = { meta, messages: [] };
+    this.cache.set(id, sess);
+    await this.appendLine(id, { t: "meta", ...meta });
+    return meta;
+  }
+  /** Remote 通道：按 wxUserId 找/建 session（一个 wxUser 默认一个 active session） */
+  async findOrCreateForRemote(wxUserId, opts = {}) {
+    const found = [...this.cache.values()].filter((s) => s.meta.remoteUser === wxUserId).sort((a, b) => b.meta.updatedAt - a.meta.updatedAt)[0];
+    if (found) return found.meta;
+    return this.create({
+      title: opts.title ?? `WeChat: ${wxUserId.slice(0, 8)}`,
+      mode: "code",
+      workspaceRoot: opts.workspace,
+      remoteUser: wxUserId
+    });
+  }
+  /** 追加一条消息；自动设置 title（首条 user 消息的前 40 字符） */
+  async append(id, msg) {
+    const sess = this.cache.get(id);
+    if (!sess) throw new Error(`Session not found: ${id}`);
+    const fullMsg = { ...msg, ts: msg.ts ?? Date.now() };
+    sess.messages.push(fullMsg);
+    sess.meta.updatedAt = fullMsg.ts;
+    sess.meta.messageCount = sess.messages.length;
+    if (sess.meta.title === "New chat" && msg.role === "user" && msg.content.trim()) {
+      sess.meta.title = msg.content.trim().slice(0, 40).replace(/\s+/g, " ");
+      await this.appendLine(id, { t: "meta", ...sess.meta });
+    }
+    await this.appendLine(id, { t: "msg", ...fullMsg });
+  }
+  async rename(id, title) {
+    const sess = this.cache.get(id);
+    if (!sess) throw new Error(`Session not found: ${id}`);
+    sess.meta.title = title.slice(0, 80) || sess.meta.title;
+    sess.meta.updatedAt = Date.now();
+    await this.appendLine(id, { t: "meta", ...sess.meta });
+    return sess.meta;
+  }
+  async delete(id) {
+    if (!this.cache.has(id)) return;
+    this.cache.delete(id);
+    const file = path12.join(this.dir, `${id}.jsonl`);
+    await fs12.unlink(file).catch(() => void 0);
+  }
+  // ===== Turn lifecycle (Resume 能力) =====
+  /** 开始一个新 turn，写 turn_start 落盘；返回 turnId */
+  async startTurn(id, userMessage) {
+    const sess = this.cache.get(id);
+    if (!sess) throw new Error(`Session not found: ${id}`);
+    const turnId = `t_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const startedAt = Date.now();
+    sess.pendingTurn = { turnId, userMessage, partialAssistant: "", startedAt };
+    sess.meta.interruptedTurn = { turnId, userMessage, partialAssistant: "", startedAt };
+    await this.appendLine(id, { t: "turn_start", turnId, userMessage, ts: startedAt });
+    return turnId;
+  }
+  /** 流式 delta 落盘（每条都 append；fsync 由 SESSION_FSYNC env 控制） */
+  async appendChunk(id, turnId, delta) {
+    if (!delta) return;
+    const sess = this.cache.get(id);
+    if (!sess) return;
+    if (sess.pendingTurn?.turnId !== turnId) return;
+    sess.pendingTurn.partialAssistant += delta;
+    if (sess.meta.interruptedTurn) sess.meta.interruptedTurn.partialAssistant = sess.pendingTurn.partialAssistant;
+    await this.appendLine(id, { t: "chunk", turnId, delta, ts: Date.now() });
+  }
+  /** 记一次 tool 调用（便于审计 / 续接时知道做过什么） */
+  async appendTool(id, turnId, payload) {
+    await this.appendLine(id, { t: "tool", turnId, ts: Date.now(), ...payload });
+  }
+  /** 正常结束 turn：把 partial 升级为正式 assistant 消息，清空 pending */
+  async endTurn(id, turnId, finalText) {
+    const sess = this.cache.get(id);
+    if (!sess || sess.pendingTurn?.turnId !== turnId) return;
+    const text = (finalText ?? sess.pendingTurn.partialAssistant).trim();
+    sess.pendingTurn = void 0;
+    sess.meta.interruptedTurn = void 0;
+    await this.appendLine(id, { t: "turn_end", turnId, finalText: text, ts: Date.now() });
+    if (text) {
+      await this.append(id, { role: "assistant", content: text });
+    }
+  }
+  /** 主动标记为 interrupted（用户点了 stop / 服务端 catch 到 error） */
+  async interruptTurn(id, turnId, reason) {
+    const sess = this.cache.get(id);
+    if (!sess || sess.pendingTurn?.turnId !== turnId) return;
+    await this.appendLine(id, { t: "turn_interrupted", turnId, reason, ts: Date.now() });
+  }
+  /** Fork：复制现有 session 并截断到指定消息索引（含），创建新 session */
+  async fork(srcId, untilIndex, title) {
+    const src = this.cache.get(srcId);
+    if (!src) throw new Error(`Source session not found: ${srcId}`);
+    const cut = src.messages.slice(0, Math.min(untilIndex + 1, src.messages.length));
+    const meta = await this.create(title || `Fork: ${src.meta.title}`);
+    for (const m of cut) {
+      await this.append(meta.id, m);
+    }
+    return this.cache.get(meta.id).meta;
+  }
+  /** 读取一个 jsonl 文件并 reduce 成 session 状态 */
+  async readJsonl(id) {
+    const file = path12.join(this.dir, `${id}.jsonl`);
+    let raw;
+    try {
+      raw = await fs12.readFile(file, "utf-8");
+    } catch {
+      return null;
+    }
+    const lines = raw.split("\n").filter((l) => l.trim());
+    let meta = null;
+    const messages = [];
+    let curTurn = null;
+    for (const ln of lines) {
+      try {
+        const obj = JSON.parse(ln);
+        if (obj.t === "meta") {
+          meta = {
+            id: obj.id ?? id,
+            title: obj.title ?? "Untitled",
+            createdAt: obj.createdAt ?? Date.now(),
+            updatedAt: obj.updatedAt ?? Date.now(),
+            messageCount: obj.messageCount ?? 0,
+            mode: obj.mode,
+            workspaceRoot: obj.workspaceRoot,
+            remoteUser: obj.remoteUser
+          };
+        } else if (obj.t === "msg") {
+          const { t, ...rest } = obj;
+          messages.push(rest);
+        } else if (obj.t === "turn_start") {
+          curTurn = {
+            turnId: obj.turnId,
+            userMessage: obj.userMessage ?? "",
+            partial: "",
+            startedAt: obj.ts ?? Date.now()
+          };
+        } else if (obj.t === "chunk") {
+          if (curTurn && obj.turnId === curTurn.turnId && typeof obj.delta === "string") {
+            curTurn.partial += obj.delta;
+          }
+        } else if (obj.t === "turn_end" || obj.t === "turn_interrupted") {
+          if (obj.t === "turn_end") curTurn = null;
+        }
+      } catch {
+      }
+    }
+    if (!meta) {
+      meta = {
+        id,
+        title: "Untitled",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        messageCount: messages.length
+      };
+    }
+    meta.messageCount = messages.length;
+    if (curTurn) {
+      meta.interruptedTurn = {
+        turnId: curTurn.turnId,
+        userMessage: curTurn.userMessage,
+        partialAssistant: curTurn.partial,
+        startedAt: curTurn.startedAt
+      };
+    }
+    return { meta, messages };
+  }
+  async appendLine(id, obj) {
+    const file = path12.join(this.dir, `${id}.jsonl`);
+    await fs12.appendFile(file, JSON.stringify(obj) + "\n", "utf-8");
+  }
+};
+
+// ../../packages/server-core/src/store/pending-edit.ts
+import { promises as fs13 } from "node:fs";
+import path13 from "node:path";
 var PendingEditStore = class {
   constructor(cwd) {
     this.cwd = cwd;
@@ -13539,17 +13868,17 @@ var PendingEditStore = class {
   async virtualRead(relPath) {
     const pending = this.byPath.get(relPath);
     if (pending && pending.status === "pending") return pending.newContent;
-    const abs = path12.resolve(this.cwd, relPath);
-    return fs12.readFile(abs, "utf-8");
+    const abs = path13.resolve(this.cwd, relPath);
+    return fs13.readFile(abs, "utf-8");
   }
   /** 提交一次编辑（覆盖同路径的旧 pending） */
   async propose(opts) {
-    const abs = path12.resolve(this.cwd, opts.path);
+    const abs = path13.resolve(this.cwd, opts.path);
     let oldContent = null;
     let mtimeAtPropose = 0;
     try {
-      const stat4 = await fs12.stat(abs);
-      oldContent = await fs12.readFile(abs, "utf-8");
+      const stat4 = await fs13.stat(abs);
+      oldContent = await fs13.readFile(abs, "utf-8");
       mtimeAtPropose = stat4.mtimeMs;
     } catch {
       oldContent = null;
@@ -13578,10 +13907,10 @@ var PendingEditStore = class {
    */
   async checkExternalModification(edit) {
     if (edit.mtimeAtPropose === 0) return;
-    const abs = path12.resolve(this.cwd, edit.path);
+    const abs = path13.resolve(this.cwd, edit.path);
     let stat4;
     try {
-      stat4 = await fs12.stat(abs);
+      stat4 = await fs13.stat(abs);
     } catch (e) {
       if (e.code === "ENOENT" && edit.oldContent === null) return;
       throw e;
@@ -13598,9 +13927,9 @@ var PendingEditStore = class {
     if (edit.status !== "pending") return edit;
     await this.checkExternalModification(edit);
     if (this.onBeforeWrite) await this.onBeforeWrite([edit]);
-    const abs = path12.resolve(this.cwd, edit.path);
-    await fs12.mkdir(path12.dirname(abs), { recursive: true });
-    await fs12.writeFile(abs, edit.newContent, "utf-8");
+    const abs = path13.resolve(this.cwd, edit.path);
+    await fs13.mkdir(path13.dirname(abs), { recursive: true });
+    await fs13.writeFile(abs, edit.newContent, "utf-8");
     edit.status = "accepted";
     this.byPath.delete(edit.path);
     return edit;
@@ -13620,35 +13949,35 @@ var PendingEditStore = class {
       await this.checkExternalModification(edit);
     }
     if (this.onBeforeWrite) await this.onBeforeWrite(all);
-    const stagingRoot = path12.resolve(this.cwd, ".minicodeide", "staging");
-    await fs12.mkdir(stagingRoot, { recursive: true });
+    const stagingRoot = path13.resolve(this.cwd, ".minicodeide", "staging");
+    await fs13.mkdir(stagingRoot, { recursive: true });
     const prepared = [];
     try {
       for (const edit of all) {
-        const target = path12.resolve(this.cwd, edit.path);
-        const stagingFile = path12.join(
+        const target = path13.resolve(this.cwd, edit.path);
+        const stagingFile = path13.join(
           stagingRoot,
           `${edit.id}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.tmp`
         );
-        await fs12.writeFile(stagingFile, edit.newContent, "utf-8");
+        await fs13.writeFile(stagingFile, edit.newContent, "utf-8");
         prepared.push({ edit, target, stagingFile });
       }
     } catch (err) {
       await Promise.allSettled(
-        prepared.map((p) => fs12.unlink(p.stagingFile).catch(() => void 0))
+        prepared.map((p) => fs13.unlink(p.stagingFile).catch(() => void 0))
       );
       throw new Error(`acceptAll prepare failed: ${err?.message ?? err}`);
     }
     const committed = [];
     try {
       for (const p of prepared) {
-        await fs12.mkdir(path12.dirname(p.target), { recursive: true });
+        await fs13.mkdir(path13.dirname(p.target), { recursive: true });
         try {
-          await fs12.rename(p.stagingFile, p.target);
+          await fs13.rename(p.stagingFile, p.target);
         } catch (renameErr) {
           if (renameErr?.code === "EXDEV") {
-            await fs12.copyFile(p.stagingFile, p.target);
-            await fs12.unlink(p.stagingFile).catch(() => void 0);
+            await fs13.copyFile(p.stagingFile, p.target);
+            await fs13.unlink(p.stagingFile).catch(() => void 0);
           } else {
             throw renameErr;
           }
@@ -13659,16 +13988,16 @@ var PendingEditStore = class {
       for (const c of committed) {
         try {
           if (c.oldContent === null) {
-            await fs12.unlink(c.target).catch(() => void 0);
+            await fs13.unlink(c.target).catch(() => void 0);
           } else {
-            await fs12.writeFile(c.target, c.oldContent, "utf-8");
+            await fs13.writeFile(c.target, c.oldContent, "utf-8");
           }
         } catch {
         }
       }
       const committedIds = new Set(committed.map((c) => c.edit.id));
       await Promise.allSettled(
-        prepared.filter((p) => !committedIds.has(p.edit.id)).map((p) => fs12.unlink(p.stagingFile).catch(() => void 0))
+        prepared.filter((p) => !committedIds.has(p.edit.id)).map((p) => fs13.unlink(p.stagingFile).catch(() => void 0))
       );
       throw new Error(
         `acceptAll commit failed (rolled back ${committed.length} files): ${err?.message ?? err}`
@@ -13684,26 +14013,26 @@ var PendingEditStore = class {
   }
 };
 
-// ../server/src/checkpoint.ts
-import { promises as fs13 } from "node:fs";
-import path13 from "node:path";
+// ../../packages/server-core/src/store/checkpoint.ts
+import { promises as fs14 } from "node:fs";
+import path14 from "node:path";
 var DIR_NAME = ".minicodeide/checkpoints";
 var CheckpointStore = class {
   constructor(cwd) {
     this.cwd = cwd;
-    this.dir = path13.join(cwd, DIR_NAME);
+    this.dir = path14.join(cwd, DIR_NAME);
   }
   cwd;
   list_ = [];
   dir;
   async init() {
-    await fs13.mkdir(this.dir, { recursive: true });
+    await fs14.mkdir(this.dir, { recursive: true });
     try {
-      const files = await fs13.readdir(this.dir);
+      const files = await fs14.readdir(this.dir);
       const jsonFiles = files.filter((f) => f.endsWith(".json")).sort();
       for (const f of jsonFiles.slice(-100)) {
         try {
-          const raw = await fs13.readFile(path13.join(this.dir, f), "utf-8");
+          const raw = await fs14.readFile(path14.join(this.dir, f), "utf-8");
           this.list_.push(JSON.parse(raw));
         } catch {
         }
@@ -13725,10 +14054,10 @@ var CheckpointStore = class {
   async create(opts) {
     const captured = [];
     for (const f of opts.files) {
-      const abs = path13.resolve(this.cwd, f.path);
+      const abs = path14.resolve(this.cwd, f.path);
       let oldContent = null;
       try {
-        oldContent = await fs13.readFile(abs, "utf-8");
+        oldContent = await fs14.readFile(abs, "utf-8");
       } catch {
         oldContent = null;
       }
@@ -13743,7 +14072,7 @@ var CheckpointStore = class {
       reverted: false
     };
     this.list_.unshift(cp);
-    await fs13.writeFile(path13.join(this.dir, `${cp.id}.json`), JSON.stringify(cp, null, 2)).catch(() => {
+    await fs14.writeFile(path14.join(this.dir, `${cp.id}.json`), JSON.stringify(cp, null, 2)).catch(() => {
     });
     return cp;
   }
@@ -13758,18 +14087,18 @@ var CheckpointStore = class {
     const affected = [];
     const missing = [];
     for (const f of cp.files) {
-      const abs = path13.resolve(this.cwd, f.path);
+      const abs = path14.resolve(this.cwd, f.path);
       if (f.oldContent === null) {
         try {
-          await fs13.unlink(abs);
+          await fs14.unlink(abs);
           affected.push(f.path);
         } catch {
           missing.push(f.path);
         }
       } else {
         try {
-          await fs13.mkdir(path13.dirname(abs), { recursive: true });
-          await fs13.writeFile(abs, f.oldContent, "utf-8");
+          await fs14.mkdir(path14.dirname(abs), { recursive: true });
+          await fs14.writeFile(abs, f.oldContent, "utf-8");
           affected.push(f.path);
         } catch {
           missing.push(f.path);
@@ -13777,7 +14106,7 @@ var CheckpointStore = class {
       }
     }
     cp.reverted = true;
-    await fs13.writeFile(path13.join(this.dir, `${cp.id}.json`), JSON.stringify(cp, null, 2)).catch(() => {
+    await fs14.writeFile(path14.join(this.dir, `${cp.id}.json`), JSON.stringify(cp, null, 2)).catch(() => {
     });
     return { ok: true, affected, missing };
   }
@@ -13787,20 +14116,20 @@ var CheckpointStore = class {
     const removed = this.list_.slice(max);
     this.list_ = this.list_.slice(0, max);
     for (const cp of removed) {
-      await fs13.unlink(path13.join(this.dir, `${cp.id}.json`)).catch(() => {
+      await fs14.unlink(path14.join(this.dir, `${cp.id}.json`)).catch(() => {
       });
     }
   }
 };
 
-// ../server/src/rules.ts
-import { promises as fs14 } from "node:fs";
-import path14 from "node:path";
+// ../../packages/server-core/src/store/rules.ts
+import { promises as fs15 } from "node:fs";
+import path15 from "node:path";
 var DIR = ".minicodeide/rules";
 var RulesStore = class {
   constructor(cwd) {
     this.cwd = cwd;
-    this.dir = path14.join(cwd, DIR);
+    this.dir = path15.join(cwd, DIR);
   }
   cwd;
   rules = [];
@@ -13808,12 +14137,12 @@ var RulesStore = class {
   async load() {
     this.rules = [];
     try {
-      await fs14.mkdir(this.dir, { recursive: true });
-      const files = await fs14.readdir(this.dir);
+      await fs15.mkdir(this.dir, { recursive: true });
+      const files = await fs15.readdir(this.dir);
       for (const f of files) {
         if (!f.endsWith(".md")) continue;
         try {
-          const raw = await fs14.readFile(path14.join(this.dir, f), "utf-8");
+          const raw = await fs15.readFile(path15.join(this.dir, f), "utf-8");
           this.rules.push(parseRule(f, raw));
         } catch (e) {
           console.warn(`[rules] failed to load ${f}:`, e.message);
@@ -13905,9 +14234,9 @@ function extractPathLike(msg) {
   return [...out];
 }
 
-// ../server/src/project-memory.ts
-import { promises as fs15 } from "node:fs";
-import path15 from "node:path";
+// ../../packages/server-core/src/store/project-memory.ts
+import { promises as fs16 } from "node:fs";
+import path16 from "node:path";
 import os2 from "node:os";
 var FILENAMES = ["AGENTS.md", "CLAUDE.md", "MEMORY.md"];
 var USER_DIRS = [".minicodeide", ".codex", ".claude"];
@@ -13924,7 +14253,7 @@ var ProjectMemoryStore = class {
     const homeDir = os2.homedir();
     for (const dir of USER_DIRS) {
       for (const fn of FILENAMES) {
-        const p = path15.join(homeDir, dir, fn);
+        const p = path16.join(homeDir, dir, fn);
         const body = await tryRead(p);
         if (body) {
           out.push({ path: p, scope: "user", depth: -1, body });
@@ -13932,20 +14261,20 @@ var ProjectMemoryStore = class {
         }
       }
     }
-    let cur = path15.resolve(this.cwd);
+    let cur = path16.resolve(this.cwd);
     let depth = 0;
-    const stop = path15.resolve(homeDir);
+    const stop = path16.resolve(homeDir);
     while (true) {
       for (const fn of FILENAMES) {
-        const p = path15.join(cur, fn);
+        const p = path16.join(cur, fn);
         const body = await tryRead(p);
         if (body) {
           out.push({ path: p, scope: "project", depth, body });
           break;
         }
       }
-      if (cur === stop || cur === path15.dirname(cur)) break;
-      cur = path15.dirname(cur);
+      if (cur === stop || cur === path16.dirname(cur)) break;
+      cur = path16.dirname(cur);
       depth++;
       if (depth > 8) break;
     }
@@ -14000,9 +14329,9 @@ ${body}`;
 };
 async function tryRead(p) {
   try {
-    const stat4 = await fs15.stat(p);
+    const stat4 = await fs16.stat(p);
     if (!stat4.isFile()) return null;
-    const body = await fs15.readFile(p, "utf-8");
+    const body = await fs16.readFile(p, "utf-8");
     if (!body.trim()) return null;
     return body;
   } catch {
@@ -14014,189 +14343,7 @@ function shortPath(p) {
   return p.startsWith(home) ? "~" + p.slice(home.length) : p;
 }
 
-// ../server/src/slash-commands.ts
-import { promises as fs16 } from "node:fs";
-import path16 from "node:path";
-var DIR2 = ".minicodeide/commands";
-var BUILTIN = [
-  {
-    name: "explain",
-    description: "Explain the given code, file, or concept in plain language.",
-    source: "builtin",
-    expand: (arg) => arg.trim() ? `Please explain the following in clear, structured terms, with examples and important caveats:
-
-${arg}` : "Please explain the current open file and what it does, step by step."
-  },
-  {
-    name: "test",
-    description: "Generate unit tests for the given target.",
-    source: "builtin",
-    expand: (arg) => `Generate thorough unit tests for: ${arg || "the current open file"}.
-
-Requirements:
-- Cover happy path + edge cases + error cases.
-- Use the testing framework already in use in this project (detect via package.json or existing tests).
-- Create new test file(s) via write_file, do NOT inline.
-`
-  },
-  {
-    name: "refactor",
-    description: "Refactor target code per stated goal, preserving behavior.",
-    source: "builtin",
-    expand: (arg) => `Refactor as instructed below. Preserve external behavior; add or update tests if any exist.
-
-Goal / target: ${arg || "(none specified \u2014 analyze the open file and propose a refactor first)"}
-Use edit_file or write_file for the changes.`
-  },
-  {
-    name: "docs",
-    description: "Add or improve documentation comments for the target.",
-    source: "builtin",
-    expand: (arg) => `Add or improve doc comments (TSDoc / JSDoc / docstrings) for: ${arg || "the current open file"}.
-- Don't change behavior.
-- Don't add trivial comments to obvious code.
-- Apply changes via edit_file.`
-  },
-  {
-    name: "fix",
-    description: "Diagnose and fix the given error.",
-    source: "builtin",
-    expand: (arg) => `Diagnose root cause and propose a fix for the following error:
-
-${arg || "(please paste the error message)"}
-
-Steps:
-1) Identify the file(s) involved.
-2) Read relevant code.
-3) Propose a fix via edit_file.
-4) Briefly explain why.`
-  },
-  {
-    name: "plan",
-    description: "Switch to Plan Mode and produce a structured 5-phase plan.",
-    source: "builtin",
-    expand: (arg) => `[Plan Mode requested]
-
-Goal: ${arg || "(no goal supplied \u2014 analyze the open file / current task and propose one)"}
-
-Follow Plan Mode protocol strictly:
-1. Initial Understanding \u2014 restate the goal, list assumptions, flag ambiguity.
-2. Design \u2014 at least 2 candidate approaches with trade-offs.
-3. Review \u2014 find the gaps and risks in your own design.
-4. Final Plan \u2014 concrete ordered steps with file paths.
-5. Approval \u2014 STOP and wait for the user. Do NOT execute.`
-  },
-  {
-    name: "mcp",
-    description: "List connected MCP servers and tools.",
-    source: "builtin",
-    expand: () => `List all connected MCP (Model Context Protocol) servers in this workspace.
-For each: name, command, status, and the tools it exposes (mcp__<server>__<tool>).
-If none: explain that the user can configure them in .minicodeide/mcp.json (see mcp.example.json).`
-  },
-  {
-    name: "cost",
-    description: "Report cumulative LLM cost / token usage for this session.",
-    source: "builtin",
-    expand: () => `Summarize this session's LLM usage:
-- input tokens / output tokens / cached tokens
-- estimated cost (use Anthropic / OpenAI public pricing as appropriate)
-- cache hit ratio and approximate savings
-Be concrete, no hedging.`
-  },
-  {
-    name: "compact",
-    description: "Manually trigger a soft-compact of the conversation history.",
-    source: "builtin",
-    expand: () => `[Manual compact requested]
-
-Produce a tight handoff summary of the conversation so far covering:
-- The user's overall goal
-- Decisions made
-- Files / functions touched
-- Outstanding TODOs (if any)
-Then continue from the current step.`
-  },
-  {
-    name: "remember",
-    description: "Explicitly save important information to long-term memory.",
-    source: "builtin",
-    expand: (arg) => arg.trim() ? `[REMEMBER REQUEST] The user explicitly asks you to remember the following information for future conversations:
-
-"${arg.trim()}"
-
-Call the \`upsert_memory\` tool (or equivalent) to save this to persistent memory. Classify it as: preference / project_knowledge / experience as appropriate. Confirm to the user once saved.` : `[REMEMBER REQUEST] The user wants to save the most important information from this conversation to memory.
-
-Review the conversation and identify 1\u20133 key facts worth remembering (preferences, decisions, project-specific knowledge). Save each one via \`upsert_memory\` and list what you saved.`
-  }
-];
-var SlashCommandRegistry = class {
-  constructor(cwd) {
-    this.cwd = cwd;
-    for (const c of BUILTIN) this.cmds.set(c.name, c);
-  }
-  cwd;
-  cmds = /* @__PURE__ */ new Map();
-  list() {
-    return [...this.cmds.values()];
-  }
-  get(name) {
-    return this.cmds.get(name);
-  }
-  async loadUser() {
-    const dir = path16.join(this.cwd, DIR2);
-    try {
-      await fs16.mkdir(dir, { recursive: true });
-      const files = await fs16.readdir(dir);
-      for (const f of files) {
-        if (!f.endsWith(".md")) continue;
-        try {
-          const raw = await fs16.readFile(path16.join(dir, f), "utf-8");
-          const cmd = parseUserCommand(f, raw);
-          this.cmds.set(cmd.name, cmd);
-        } catch (e) {
-          console.warn(`[slash] failed to load ${f}:`, e.message);
-        }
-      }
-    } catch {
-    }
-  }
-  /** 检查消息是否以 / 开头，是的话展开。返回 null 表示无需处理。 */
-  maybeExpand(message) {
-    if (!message.startsWith("/")) return null;
-    const m = /^\/(\w[\w-]*)\s*([\s\S]*)$/.exec(message);
-    if (!m) return null;
-    const [, name, arg] = m;
-    const cmd = this.cmds.get(name);
-    if (!cmd) return null;
-    return { command: name, expanded: cmd.expand(arg) };
-  }
-};
-function parseUserCommand(file, raw) {
-  let name = file.replace(/\.md$/, "");
-  let description = "";
-  let body = raw;
-  const fm = /^---\n([\s\S]*?)\n---\n?/m.exec(raw);
-  if (fm) {
-    body = raw.slice(fm[0].length);
-    for (const line of fm[1].split("\n")) {
-      const m = /^(\w+):\s*(.+)$/.exec(line.trim());
-      if (!m) continue;
-      const [, k, v] = m;
-      if (k === "name") name = v.trim();
-      else if (k === "description") description = v.trim();
-    }
-  }
-  const template = body.trim();
-  return {
-    name,
-    description: description || "(user command)",
-    source: "user",
-    expand: (arg) => template.replace(/\$ARG/g, arg.trim())
-  };
-}
-
-// ../server/src/providers.ts
+// ../../packages/server-core/src/store/providers.ts
 import { promises as fs17 } from "node:fs";
 import path17 from "node:path";
 var FILE = ".minicodeide/providers.json";
@@ -14362,257 +14509,9 @@ var ProviderStore = class {
   }
 };
 
-// ../server/src/session-store.ts
+// ../../packages/server-core/src/store/skill-store.ts
 import { promises as fs18 } from "node:fs";
 import path18 from "node:path";
-var SessionLock = class {
-  chains = /* @__PURE__ */ new Map();
-  async acquire(sessionId) {
-    const prev = this.chains.get(sessionId) ?? Promise.resolve();
-    let release;
-    const next = new Promise((resolve3) => {
-      release = resolve3;
-    });
-    this.chains.set(sessionId, next);
-    await prev;
-    return () => {
-      release();
-      if (this.chains.get(sessionId) === next) {
-        this.chains.delete(sessionId);
-      }
-    };
-  }
-  /** 检查某个 session 是否正在被锁定（用于快速判断，不阻塞） */
-  isLocked(sessionId) {
-    return this.chains.has(sessionId);
-  }
-};
-var SessionStore = class {
-  dir;
-  /** session id → 内存缓存（避免每次 list 都扫盘） */
-  cache = /* @__PURE__ */ new Map();
-  loaded = false;
-  /** 并发锁：确保同一 session 的 turn 生命周期不会交叉 */
-  lock = new SessionLock();
-  constructor(workspace) {
-    this.dir = path18.join(workspace, ".minicodeide", "sessions");
-  }
-  /** 启动时加载所有 session（jsonl 文件），并对老数据自动补全 mode 字段 */
-  async load() {
-    if (this.loaded) return;
-    await fs18.mkdir(this.dir, { recursive: true });
-    const files = await fs18.readdir(this.dir);
-    for (const f of files) {
-      if (!f.endsWith(".jsonl")) continue;
-      const id = f.replace(/\.jsonl$/, "");
-      try {
-        const sess = await this.readJsonl(id);
-        if (sess) {
-          if (!sess.meta.mode) {
-            sess.meta.mode = "code";
-          }
-          this.cache.set(id, sess);
-        }
-      } catch {
-      }
-    }
-    this.loaded = true;
-  }
-  list() {
-    return [...this.cache.values()].map((s) => s.meta).sort((a, b) => b.updatedAt - a.updatedAt);
-  }
-  get(id) {
-    return this.cache.get(id);
-  }
-  async create(titleOrOpts) {
-    const opts = typeof titleOrOpts === "string" ? { title: titleOrOpts } : titleOrOpts ?? {};
-    const id = `sess_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const now = Date.now();
-    const meta = {
-      id,
-      title: opts.title?.trim() || "New chat",
-      createdAt: now,
-      updatedAt: now,
-      messageCount: 0,
-      mode: opts.mode ?? "code",
-      workspaceRoot: opts.workspaceRoot,
-      remoteUser: opts.remoteUser
-    };
-    const sess = { meta, messages: [] };
-    this.cache.set(id, sess);
-    await this.appendLine(id, { t: "meta", ...meta });
-    return meta;
-  }
-  /** Remote 通道：按 wxUserId 找/建 session（一个 wxUser 默认一个 active session） */
-  async findOrCreateForRemote(wxUserId, opts = {}) {
-    const found = [...this.cache.values()].filter((s) => s.meta.remoteUser === wxUserId).sort((a, b) => b.meta.updatedAt - a.meta.updatedAt)[0];
-    if (found) return found.meta;
-    return this.create({
-      title: opts.title ?? `WeChat: ${wxUserId.slice(0, 8)}`,
-      mode: "code",
-      workspaceRoot: opts.workspace,
-      remoteUser: wxUserId
-    });
-  }
-  /** 追加一条消息；自动设置 title（首条 user 消息的前 40 字符） */
-  async append(id, msg) {
-    const sess = this.cache.get(id);
-    if (!sess) throw new Error(`Session not found: ${id}`);
-    const fullMsg = { ...msg, ts: msg.ts ?? Date.now() };
-    sess.messages.push(fullMsg);
-    sess.meta.updatedAt = fullMsg.ts;
-    sess.meta.messageCount = sess.messages.length;
-    if (sess.meta.title === "New chat" && msg.role === "user" && msg.content.trim()) {
-      sess.meta.title = msg.content.trim().slice(0, 40).replace(/\s+/g, " ");
-      await this.appendLine(id, { t: "meta", ...sess.meta });
-    }
-    await this.appendLine(id, { t: "msg", ...fullMsg });
-  }
-  async rename(id, title) {
-    const sess = this.cache.get(id);
-    if (!sess) throw new Error(`Session not found: ${id}`);
-    sess.meta.title = title.slice(0, 80) || sess.meta.title;
-    sess.meta.updatedAt = Date.now();
-    await this.appendLine(id, { t: "meta", ...sess.meta });
-    return sess.meta;
-  }
-  async delete(id) {
-    if (!this.cache.has(id)) return;
-    this.cache.delete(id);
-    const file = path18.join(this.dir, `${id}.jsonl`);
-    await fs18.unlink(file).catch(() => void 0);
-  }
-  // ===== Turn lifecycle (Resume 能力) =====
-  /** 开始一个新 turn，写 turn_start 落盘；返回 turnId */
-  async startTurn(id, userMessage) {
-    const sess = this.cache.get(id);
-    if (!sess) throw new Error(`Session not found: ${id}`);
-    const turnId = `t_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    const startedAt = Date.now();
-    sess.pendingTurn = { turnId, userMessage, partialAssistant: "", startedAt };
-    sess.meta.interruptedTurn = { turnId, userMessage, partialAssistant: "", startedAt };
-    await this.appendLine(id, { t: "turn_start", turnId, userMessage, ts: startedAt });
-    return turnId;
-  }
-  /** 流式 delta 落盘（每条都 append；fsync 由 SESSION_FSYNC env 控制） */
-  async appendChunk(id, turnId, delta) {
-    if (!delta) return;
-    const sess = this.cache.get(id);
-    if (!sess) return;
-    if (sess.pendingTurn?.turnId !== turnId) return;
-    sess.pendingTurn.partialAssistant += delta;
-    if (sess.meta.interruptedTurn) sess.meta.interruptedTurn.partialAssistant = sess.pendingTurn.partialAssistant;
-    await this.appendLine(id, { t: "chunk", turnId, delta, ts: Date.now() });
-  }
-  /** 记一次 tool 调用（便于审计 / 续接时知道做过什么） */
-  async appendTool(id, turnId, payload) {
-    await this.appendLine(id, { t: "tool", turnId, ts: Date.now(), ...payload });
-  }
-  /** 正常结束 turn：把 partial 升级为正式 assistant 消息，清空 pending */
-  async endTurn(id, turnId, finalText) {
-    const sess = this.cache.get(id);
-    if (!sess || sess.pendingTurn?.turnId !== turnId) return;
-    const text = (finalText ?? sess.pendingTurn.partialAssistant).trim();
-    sess.pendingTurn = void 0;
-    sess.meta.interruptedTurn = void 0;
-    await this.appendLine(id, { t: "turn_end", turnId, finalText: text, ts: Date.now() });
-    if (text) {
-      await this.append(id, { role: "assistant", content: text });
-    }
-  }
-  /** 主动标记为 interrupted（用户点了 stop / 服务端 catch 到 error） */
-  async interruptTurn(id, turnId, reason) {
-    const sess = this.cache.get(id);
-    if (!sess || sess.pendingTurn?.turnId !== turnId) return;
-    await this.appendLine(id, { t: "turn_interrupted", turnId, reason, ts: Date.now() });
-  }
-  /** Fork：复制现有 session 并截断到指定消息索引（含），创建新 session */
-  async fork(srcId, untilIndex, title) {
-    const src = this.cache.get(srcId);
-    if (!src) throw new Error(`Source session not found: ${srcId}`);
-    const cut = src.messages.slice(0, Math.min(untilIndex + 1, src.messages.length));
-    const meta = await this.create(title || `Fork: ${src.meta.title}`);
-    for (const m of cut) {
-      await this.append(meta.id, m);
-    }
-    return this.cache.get(meta.id).meta;
-  }
-  /** 读取一个 jsonl 文件并 reduce 成 session 状态 */
-  async readJsonl(id) {
-    const file = path18.join(this.dir, `${id}.jsonl`);
-    let raw;
-    try {
-      raw = await fs18.readFile(file, "utf-8");
-    } catch {
-      return null;
-    }
-    const lines = raw.split("\n").filter((l) => l.trim());
-    let meta = null;
-    const messages = [];
-    let curTurn = null;
-    for (const ln of lines) {
-      try {
-        const obj = JSON.parse(ln);
-        if (obj.t === "meta") {
-          meta = {
-            id: obj.id ?? id,
-            title: obj.title ?? "Untitled",
-            createdAt: obj.createdAt ?? Date.now(),
-            updatedAt: obj.updatedAt ?? Date.now(),
-            messageCount: obj.messageCount ?? 0,
-            mode: obj.mode,
-            workspaceRoot: obj.workspaceRoot,
-            remoteUser: obj.remoteUser
-          };
-        } else if (obj.t === "msg") {
-          const { t, ...rest } = obj;
-          messages.push(rest);
-        } else if (obj.t === "turn_start") {
-          curTurn = {
-            turnId: obj.turnId,
-            userMessage: obj.userMessage ?? "",
-            partial: "",
-            startedAt: obj.ts ?? Date.now()
-          };
-        } else if (obj.t === "chunk") {
-          if (curTurn && obj.turnId === curTurn.turnId && typeof obj.delta === "string") {
-            curTurn.partial += obj.delta;
-          }
-        } else if (obj.t === "turn_end" || obj.t === "turn_interrupted") {
-          if (obj.t === "turn_end") curTurn = null;
-        }
-      } catch {
-      }
-    }
-    if (!meta) {
-      meta = {
-        id,
-        title: "Untitled",
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        messageCount: messages.length
-      };
-    }
-    meta.messageCount = messages.length;
-    if (curTurn) {
-      meta.interruptedTurn = {
-        turnId: curTurn.turnId,
-        userMessage: curTurn.userMessage,
-        partialAssistant: curTurn.partial,
-        startedAt: curTurn.startedAt
-      };
-    }
-    return { meta, messages };
-  }
-  async appendLine(id, obj) {
-    const file = path18.join(this.dir, `${id}.jsonl`);
-    await fs18.appendFile(file, JSON.stringify(obj) + "\n", "utf-8");
-  }
-};
-
-// ../server/src/skill-store.ts
-import { promises as fs19 } from "node:fs";
-import path19 from "node:path";
 import os3 from "node:os";
 
 // ../../node_modules/.pnpm/chokidar@5.0.0/node_modules/chokidar/index.js
@@ -14705,7 +14604,7 @@ var ReaddirpStream = class extends Readable {
     this._directoryFilter = normalizeFilter(opts.directoryFilter);
     const statMethod = opts.lstat ? lstat : stat;
     if (wantBigintFsStats) {
-      this._stat = (path27) => statMethod(path27, { bigint: true });
+      this._stat = (path32) => statMethod(path32, { bigint: true });
     } else {
       this._stat = statMethod;
     }
@@ -14730,8 +14629,8 @@ var ReaddirpStream = class extends Readable {
         const par = this.parent;
         const fil = par && par.files;
         if (fil && fil.length > 0) {
-          const { path: path27, depth } = par;
-          const slice = fil.splice(0, batch).map((dirent) => this._formatEntry(dirent, path27));
+          const { path: path32, depth } = par;
+          const slice = fil.splice(0, batch).map((dirent) => this._formatEntry(dirent, path32));
           const awaited = await Promise.all(slice);
           for (const entry of awaited) {
             if (!entry)
@@ -14771,20 +14670,20 @@ var ReaddirpStream = class extends Readable {
       this.reading = false;
     }
   }
-  async _exploreDir(path27, depth) {
+  async _exploreDir(path32, depth) {
     let files;
     try {
-      files = await readdir(path27, this._rdOptions);
+      files = await readdir(path32, this._rdOptions);
     } catch (error) {
       this._onError(error);
     }
-    return { files, depth, path: path27 };
+    return { files, depth, path: path32 };
   }
-  async _formatEntry(dirent, path27) {
+  async _formatEntry(dirent, path32) {
     let entry;
     const basename4 = this._isDirent ? dirent.name : dirent;
     try {
-      const fullPath = presolve(pjoin(path27, basename4));
+      const fullPath = presolve(pjoin(path32, basename4));
       entry = { path: prelative(this._root, fullPath), fullPath, basename: basename4 };
       entry[this._statsProp] = this._isDirent ? dirent : await this._stat(fullPath);
     } catch (err) {
@@ -15184,16 +15083,16 @@ var delFromSet = (main2, prop, item) => {
 };
 var isEmptySet = (val) => val instanceof Set ? val.size === 0 : !val;
 var FsWatchInstances = /* @__PURE__ */ new Map();
-function createFsWatchInstance(path27, options, listener, errHandler, emitRaw) {
+function createFsWatchInstance(path32, options, listener, errHandler, emitRaw) {
   const handleEvent = (rawEvent, evPath) => {
-    listener(path27);
-    emitRaw(rawEvent, evPath, { watchedPath: path27 });
-    if (evPath && path27 !== evPath) {
-      fsWatchBroadcast(sp.resolve(path27, evPath), KEY_LISTENERS, sp.join(path27, evPath));
+    listener(path32);
+    emitRaw(rawEvent, evPath, { watchedPath: path32 });
+    if (evPath && path32 !== evPath) {
+      fsWatchBroadcast(sp.resolve(path32, evPath), KEY_LISTENERS, sp.join(path32, evPath));
     }
   };
   try {
-    return fs_watch(path27, {
+    return fs_watch(path32, {
       persistent: options.persistent
     }, handleEvent);
   } catch (error) {
@@ -15209,12 +15108,12 @@ var fsWatchBroadcast = (fullPath, listenerType, val1, val2, val3) => {
     listener(val1, val2, val3);
   });
 };
-var setFsWatchListener = (path27, fullPath, options, handlers) => {
+var setFsWatchListener = (path32, fullPath, options, handlers) => {
   const { listener, errHandler, rawEmitter } = handlers;
   let cont = FsWatchInstances.get(fullPath);
   let watcher;
   if (!options.persistent) {
-    watcher = createFsWatchInstance(path27, options, listener, errHandler, rawEmitter);
+    watcher = createFsWatchInstance(path32, options, listener, errHandler, rawEmitter);
     if (!watcher)
       return;
     return watcher.close.bind(watcher);
@@ -15225,7 +15124,7 @@ var setFsWatchListener = (path27, fullPath, options, handlers) => {
     addAndConvert(cont, KEY_RAW, rawEmitter);
   } else {
     watcher = createFsWatchInstance(
-      path27,
+      path32,
       options,
       fsWatchBroadcast.bind(null, fullPath, KEY_LISTENERS),
       errHandler,
@@ -15240,7 +15139,7 @@ var setFsWatchListener = (path27, fullPath, options, handlers) => {
         cont.watcherUnusable = true;
       if (isWindows && error.code === "EPERM") {
         try {
-          const fd = await open(path27, "r");
+          const fd = await open(path32, "r");
           await fd.close();
           broadcastErr(error);
         } catch (err) {
@@ -15271,7 +15170,7 @@ var setFsWatchListener = (path27, fullPath, options, handlers) => {
   };
 };
 var FsWatchFileInstances = /* @__PURE__ */ new Map();
-var setFsWatchFileListener = (path27, fullPath, options, handlers) => {
+var setFsWatchFileListener = (path32, fullPath, options, handlers) => {
   const { listener, rawEmitter } = handlers;
   let cont = FsWatchFileInstances.get(fullPath);
   const copts = cont && cont.options;
@@ -15293,7 +15192,7 @@ var setFsWatchFileListener = (path27, fullPath, options, handlers) => {
         });
         const currmtime = curr.mtimeMs;
         if (curr.size !== prev.size || currmtime > prev.mtimeMs || currmtime === 0) {
-          foreach(cont.listeners, (listener2) => listener2(path27, curr));
+          foreach(cont.listeners, (listener2) => listener2(path32, curr));
         }
       })
     };
@@ -15323,13 +15222,13 @@ var NodeFsHandler = class {
    * @param listener on fs change
    * @returns closer for the watcher instance
    */
-  _watchWithNodeFs(path27, listener) {
+  _watchWithNodeFs(path32, listener) {
     const opts = this.fsw.options;
-    const directory = sp.dirname(path27);
-    const basename4 = sp.basename(path27);
+    const directory = sp.dirname(path32);
+    const basename4 = sp.basename(path32);
     const parent = this.fsw._getWatchedDir(directory);
     parent.add(basename4);
-    const absolutePath = sp.resolve(path27);
+    const absolutePath = sp.resolve(path32);
     const options = {
       persistent: opts.persistent
     };
@@ -15339,12 +15238,12 @@ var NodeFsHandler = class {
     if (opts.usePolling) {
       const enableBin = opts.interval !== opts.binaryInterval;
       options.interval = enableBin && isBinaryPath(basename4) ? opts.binaryInterval : opts.interval;
-      closer = setFsWatchFileListener(path27, absolutePath, options, {
+      closer = setFsWatchFileListener(path32, absolutePath, options, {
         listener,
         rawEmitter: this.fsw._emitRaw
       });
     } else {
-      closer = setFsWatchListener(path27, absolutePath, options, {
+      closer = setFsWatchListener(path32, absolutePath, options, {
         listener,
         errHandler: this._boundHandleError,
         rawEmitter: this.fsw._emitRaw
@@ -15366,7 +15265,7 @@ var NodeFsHandler = class {
     let prevStats = stats;
     if (parent.has(basename4))
       return;
-    const listener = async (path27, newStats) => {
+    const listener = async (path32, newStats) => {
       if (!this.fsw._throttle(THROTTLE_MODE_WATCH, file, 5))
         return;
       if (!newStats || newStats.mtimeMs === 0) {
@@ -15380,11 +15279,11 @@ var NodeFsHandler = class {
             this.fsw._emit(EV.CHANGE, file, newStats2);
           }
           if ((isMacos || isLinux || isFreeBSD) && prevStats.ino !== newStats2.ino) {
-            this.fsw._closeFile(path27);
+            this.fsw._closeFile(path32);
             prevStats = newStats2;
             const closer2 = this._watchWithNodeFs(file, listener);
             if (closer2)
-              this.fsw._addPathCloser(path27, closer2);
+              this.fsw._addPathCloser(path32, closer2);
           } else {
             prevStats = newStats2;
           }
@@ -15416,7 +15315,7 @@ var NodeFsHandler = class {
    * @param item basename of this item
    * @returns true if no more processing is needed for this entry.
    */
-  async _handleSymlink(entry, directory, path27, item) {
+  async _handleSymlink(entry, directory, path32, item) {
     if (this.fsw.closed) {
       return;
     }
@@ -15426,7 +15325,7 @@ var NodeFsHandler = class {
       this.fsw._incrReadyCount();
       let linkPath;
       try {
-        linkPath = await fsrealpath(path27);
+        linkPath = await fsrealpath(path32);
       } catch (e) {
         this.fsw._emitReady();
         return true;
@@ -15436,12 +15335,12 @@ var NodeFsHandler = class {
       if (dir.has(item)) {
         if (this.fsw._symlinkPaths.get(full) !== linkPath) {
           this.fsw._symlinkPaths.set(full, linkPath);
-          this.fsw._emit(EV.CHANGE, path27, entry.stats);
+          this.fsw._emit(EV.CHANGE, path32, entry.stats);
         }
       } else {
         dir.add(item);
         this.fsw._symlinkPaths.set(full, linkPath);
-        this.fsw._emit(EV.ADD, path27, entry.stats);
+        this.fsw._emit(EV.ADD, path32, entry.stats);
       }
       this.fsw._emitReady();
       return true;
@@ -15471,9 +15370,9 @@ var NodeFsHandler = class {
         return;
       }
       const item = entry.path;
-      let path27 = sp.join(directory, item);
+      let path32 = sp.join(directory, item);
       current.add(item);
-      if (entry.stats.isSymbolicLink() && await this._handleSymlink(entry, directory, path27, item)) {
+      if (entry.stats.isSymbolicLink() && await this._handleSymlink(entry, directory, path32, item)) {
         return;
       }
       if (this.fsw.closed) {
@@ -15482,8 +15381,8 @@ var NodeFsHandler = class {
       }
       if (item === target || !target && !previous.has(item)) {
         this.fsw._incrReadyCount();
-        path27 = sp.join(dir, sp.relative(dir, path27));
-        this._addToNodeFs(path27, initialAdd, wh, depth + 1);
+        path32 = sp.join(dir, sp.relative(dir, path32));
+        this._addToNodeFs(path32, initialAdd, wh, depth + 1);
       }
     }).on(EV.ERROR, this._boundHandleError);
     return new Promise((resolve3, reject) => {
@@ -15552,13 +15451,13 @@ var NodeFsHandler = class {
    * @param depth Child path actually targeted for watch
    * @param target Child path actually targeted for watch
    */
-  async _addToNodeFs(path27, initialAdd, priorWh, depth, target) {
+  async _addToNodeFs(path32, initialAdd, priorWh, depth, target) {
     const ready = this.fsw._emitReady;
-    if (this.fsw._isIgnored(path27) || this.fsw.closed) {
+    if (this.fsw._isIgnored(path32) || this.fsw.closed) {
       ready();
       return false;
     }
-    const wh = this.fsw._getWatchHelpers(path27);
+    const wh = this.fsw._getWatchHelpers(path32);
     if (priorWh) {
       wh.filterPath = (entry) => priorWh.filterPath(entry);
       wh.filterDir = (entry) => priorWh.filterDir(entry);
@@ -15574,8 +15473,8 @@ var NodeFsHandler = class {
       const follow = this.fsw.options.followSymlinks;
       let closer;
       if (stats.isDirectory()) {
-        const absPath = sp.resolve(path27);
-        const targetPath = follow ? await fsrealpath(path27) : path27;
+        const absPath = sp.resolve(path32);
+        const targetPath = follow ? await fsrealpath(path32) : path32;
         if (this.fsw.closed)
           return;
         closer = await this._handleDir(wh.watchPath, stats, initialAdd, depth, target, wh, targetPath);
@@ -15585,29 +15484,29 @@ var NodeFsHandler = class {
           this.fsw._symlinkPaths.set(absPath, targetPath);
         }
       } else if (stats.isSymbolicLink()) {
-        const targetPath = follow ? await fsrealpath(path27) : path27;
+        const targetPath = follow ? await fsrealpath(path32) : path32;
         if (this.fsw.closed)
           return;
         const parent = sp.dirname(wh.watchPath);
         this.fsw._getWatchedDir(parent).add(wh.watchPath);
         this.fsw._emit(EV.ADD, wh.watchPath, stats);
-        closer = await this._handleDir(parent, stats, initialAdd, depth, path27, wh, targetPath);
+        closer = await this._handleDir(parent, stats, initialAdd, depth, path32, wh, targetPath);
         if (this.fsw.closed)
           return;
         if (targetPath !== void 0) {
-          this.fsw._symlinkPaths.set(sp.resolve(path27), targetPath);
+          this.fsw._symlinkPaths.set(sp.resolve(path32), targetPath);
         }
       } else {
         closer = this._handleFile(wh.watchPath, stats, initialAdd);
       }
       ready();
       if (closer)
-        this.fsw._addPathCloser(path27, closer);
+        this.fsw._addPathCloser(path32, closer);
       return false;
     } catch (error) {
       if (this.fsw._handleError(error)) {
         ready();
-        return path27;
+        return path32;
       }
     }
   }
@@ -15650,24 +15549,24 @@ function createPattern(matcher) {
   }
   return () => false;
 }
-function normalizePath(path27) {
-  if (typeof path27 !== "string")
+function normalizePath(path32) {
+  if (typeof path32 !== "string")
     throw new Error("string expected");
-  path27 = sp2.normalize(path27);
-  path27 = path27.replace(/\\/g, "/");
+  path32 = sp2.normalize(path32);
+  path32 = path32.replace(/\\/g, "/");
   let prepend = false;
-  if (path27.startsWith("//"))
+  if (path32.startsWith("//"))
     prepend = true;
-  path27 = path27.replace(DOUBLE_SLASH_RE, "/");
+  path32 = path32.replace(DOUBLE_SLASH_RE, "/");
   if (prepend)
-    path27 = "/" + path27;
-  return path27;
+    path32 = "/" + path32;
+  return path32;
 }
 function matchPatterns(patterns, testString, stats) {
-  const path27 = normalizePath(testString);
+  const path32 = normalizePath(testString);
   for (let index = 0; index < patterns.length; index++) {
     const pattern = patterns[index];
-    if (pattern(path27, stats)) {
+    if (pattern(path32, stats)) {
       return true;
     }
   }
@@ -15705,19 +15604,19 @@ var toUnix = (string) => {
   }
   return str;
 };
-var normalizePathToUnix = (path27) => toUnix(sp2.normalize(toUnix(path27)));
-var normalizeIgnored = (cwd = "") => (path27) => {
-  if (typeof path27 === "string") {
-    return normalizePathToUnix(sp2.isAbsolute(path27) ? path27 : sp2.join(cwd, path27));
+var normalizePathToUnix = (path32) => toUnix(sp2.normalize(toUnix(path32)));
+var normalizeIgnored = (cwd = "") => (path32) => {
+  if (typeof path32 === "string") {
+    return normalizePathToUnix(sp2.isAbsolute(path32) ? path32 : sp2.join(cwd, path32));
   } else {
-    return path27;
+    return path32;
   }
 };
-var getAbsolutePath = (path27, cwd) => {
-  if (sp2.isAbsolute(path27)) {
-    return path27;
+var getAbsolutePath = (path32, cwd) => {
+  if (sp2.isAbsolute(path32)) {
+    return path32;
   }
-  return sp2.join(cwd, path27);
+  return sp2.join(cwd, path32);
 };
 var EMPTY_SET = Object.freeze(/* @__PURE__ */ new Set());
 var DirEntry = class {
@@ -15782,10 +15681,10 @@ var WatchHelper = class {
   dirParts;
   followSymlinks;
   statMethod;
-  constructor(path27, follow, fsw) {
+  constructor(path32, follow, fsw) {
     this.fsw = fsw;
-    const watchPath = path27;
-    this.path = path27 = path27.replace(REPLACER_RE, "");
+    const watchPath = path32;
+    this.path = path32 = path32.replace(REPLACER_RE, "");
     this.watchPath = watchPath;
     this.fullWatchPath = sp2.resolve(watchPath);
     this.dirParts = [];
@@ -15925,20 +15824,20 @@ var FSWatcher = class extends EventEmitter {
     this._closePromise = void 0;
     let paths = unifyPaths(paths_);
     if (cwd) {
-      paths = paths.map((path27) => {
-        const absPath = getAbsolutePath(path27, cwd);
+      paths = paths.map((path32) => {
+        const absPath = getAbsolutePath(path32, cwd);
         return absPath;
       });
     }
-    paths.forEach((path27) => {
-      this._removeIgnoredPath(path27);
+    paths.forEach((path32) => {
+      this._removeIgnoredPath(path32);
     });
     this._userIgnored = void 0;
     if (!this._readyCount)
       this._readyCount = 0;
     this._readyCount += paths.length;
-    Promise.all(paths.map(async (path27) => {
-      const res = await this._nodeFsHandler._addToNodeFs(path27, !_internal, void 0, 0, _origAdd);
+    Promise.all(paths.map(async (path32) => {
+      const res = await this._nodeFsHandler._addToNodeFs(path32, !_internal, void 0, 0, _origAdd);
       if (res)
         this._emitReady();
       return res;
@@ -15960,17 +15859,17 @@ var FSWatcher = class extends EventEmitter {
       return this;
     const paths = unifyPaths(paths_);
     const { cwd } = this.options;
-    paths.forEach((path27) => {
-      if (!sp2.isAbsolute(path27) && !this._closers.has(path27)) {
+    paths.forEach((path32) => {
+      if (!sp2.isAbsolute(path32) && !this._closers.has(path32)) {
         if (cwd)
-          path27 = sp2.join(cwd, path27);
-        path27 = sp2.resolve(path27);
+          path32 = sp2.join(cwd, path32);
+        path32 = sp2.resolve(path32);
       }
-      this._closePath(path27);
-      this._addIgnoredPath(path27);
-      if (this._watched.has(path27)) {
+      this._closePath(path32);
+      this._addIgnoredPath(path32);
+      if (this._watched.has(path32)) {
         this._addIgnoredPath({
-          path: path27,
+          path: path32,
           recursive: true
         });
       }
@@ -16034,38 +15933,38 @@ var FSWatcher = class extends EventEmitter {
    * @param stats arguments to be passed with event
    * @returns the error if defined, otherwise the value of the FSWatcher instance's `closed` flag
    */
-  async _emit(event, path27, stats) {
+  async _emit(event, path32, stats) {
     if (this.closed)
       return;
     const opts = this.options;
     if (isWindows)
-      path27 = sp2.normalize(path27);
+      path32 = sp2.normalize(path32);
     if (opts.cwd)
-      path27 = sp2.relative(opts.cwd, path27);
-    const args = [path27];
+      path32 = sp2.relative(opts.cwd, path32);
+    const args = [path32];
     if (stats != null)
       args.push(stats);
     const awf = opts.awaitWriteFinish;
     let pw;
-    if (awf && (pw = this._pendingWrites.get(path27))) {
+    if (awf && (pw = this._pendingWrites.get(path32))) {
       pw.lastChange = /* @__PURE__ */ new Date();
       return this;
     }
     if (opts.atomic) {
       if (event === EVENTS.UNLINK) {
-        this._pendingUnlinks.set(path27, [event, ...args]);
+        this._pendingUnlinks.set(path32, [event, ...args]);
         setTimeout(() => {
-          this._pendingUnlinks.forEach((entry, path28) => {
+          this._pendingUnlinks.forEach((entry, path33) => {
             this.emit(...entry);
             this.emit(EVENTS.ALL, ...entry);
-            this._pendingUnlinks.delete(path28);
+            this._pendingUnlinks.delete(path33);
           });
         }, typeof opts.atomic === "number" ? opts.atomic : 100);
         return this;
       }
-      if (event === EVENTS.ADD && this._pendingUnlinks.has(path27)) {
+      if (event === EVENTS.ADD && this._pendingUnlinks.has(path32)) {
         event = EVENTS.CHANGE;
-        this._pendingUnlinks.delete(path27);
+        this._pendingUnlinks.delete(path32);
       }
     }
     if (awf && (event === EVENTS.ADD || event === EVENTS.CHANGE) && this._readyEmitted) {
@@ -16083,16 +15982,16 @@ var FSWatcher = class extends EventEmitter {
           this.emitWithAll(event, args);
         }
       };
-      this._awaitWriteFinish(path27, awf.stabilityThreshold, event, awfEmit);
+      this._awaitWriteFinish(path32, awf.stabilityThreshold, event, awfEmit);
       return this;
     }
     if (event === EVENTS.CHANGE) {
-      const isThrottled = !this._throttle(EVENTS.CHANGE, path27, 50);
+      const isThrottled = !this._throttle(EVENTS.CHANGE, path32, 50);
       if (isThrottled)
         return this;
     }
     if (opts.alwaysStat && stats === void 0 && (event === EVENTS.ADD || event === EVENTS.ADD_DIR || event === EVENTS.CHANGE)) {
-      const fullPath = opts.cwd ? sp2.join(opts.cwd, path27) : path27;
+      const fullPath = opts.cwd ? sp2.join(opts.cwd, path32) : path32;
       let stats2;
       try {
         stats2 = await stat3(fullPath);
@@ -16123,23 +16022,23 @@ var FSWatcher = class extends EventEmitter {
    * @param timeout duration of time to suppress duplicate actions
    * @returns tracking object or false if action should be suppressed
    */
-  _throttle(actionType, path27, timeout) {
+  _throttle(actionType, path32, timeout) {
     if (!this._throttled.has(actionType)) {
       this._throttled.set(actionType, /* @__PURE__ */ new Map());
     }
     const action = this._throttled.get(actionType);
     if (!action)
       throw new Error("invalid throttle");
-    const actionPath = action.get(path27);
+    const actionPath = action.get(path32);
     if (actionPath) {
       actionPath.count++;
       return false;
     }
     let timeoutObject;
     const clear = () => {
-      const item = action.get(path27);
+      const item = action.get(path32);
       const count = item ? item.count : 0;
-      action.delete(path27);
+      action.delete(path32);
       clearTimeout(timeoutObject);
       if (item)
         clearTimeout(item.timeoutObject);
@@ -16147,7 +16046,7 @@ var FSWatcher = class extends EventEmitter {
     };
     timeoutObject = setTimeout(clear, timeout);
     const thr = { timeoutObject, clear, count: 0 };
-    action.set(path27, thr);
+    action.set(path32, thr);
     return thr;
   }
   _incrReadyCount() {
@@ -16161,44 +16060,44 @@ var FSWatcher = class extends EventEmitter {
    * @param event
    * @param awfEmit Callback to be called when ready for event to be emitted.
    */
-  _awaitWriteFinish(path27, threshold, event, awfEmit) {
+  _awaitWriteFinish(path32, threshold, event, awfEmit) {
     const awf = this.options.awaitWriteFinish;
     if (typeof awf !== "object")
       return;
     const pollInterval = awf.pollInterval;
     let timeoutHandler;
-    let fullPath = path27;
-    if (this.options.cwd && !sp2.isAbsolute(path27)) {
-      fullPath = sp2.join(this.options.cwd, path27);
+    let fullPath = path32;
+    if (this.options.cwd && !sp2.isAbsolute(path32)) {
+      fullPath = sp2.join(this.options.cwd, path32);
     }
     const now = /* @__PURE__ */ new Date();
     const writes = this._pendingWrites;
     function awaitWriteFinishFn(prevStat) {
       statcb(fullPath, (err, curStat) => {
-        if (err || !writes.has(path27)) {
+        if (err || !writes.has(path32)) {
           if (err && err.code !== "ENOENT")
             awfEmit(err);
           return;
         }
         const now2 = Number(/* @__PURE__ */ new Date());
         if (prevStat && curStat.size !== prevStat.size) {
-          writes.get(path27).lastChange = now2;
+          writes.get(path32).lastChange = now2;
         }
-        const pw = writes.get(path27);
+        const pw = writes.get(path32);
         const df = now2 - pw.lastChange;
         if (df >= threshold) {
-          writes.delete(path27);
+          writes.delete(path32);
           awfEmit(void 0, curStat);
         } else {
           timeoutHandler = setTimeout(awaitWriteFinishFn, pollInterval, curStat);
         }
       });
     }
-    if (!writes.has(path27)) {
-      writes.set(path27, {
+    if (!writes.has(path32)) {
+      writes.set(path32, {
         lastChange: now,
         cancelWait: () => {
-          writes.delete(path27);
+          writes.delete(path32);
           clearTimeout(timeoutHandler);
           return event;
         }
@@ -16209,8 +16108,8 @@ var FSWatcher = class extends EventEmitter {
   /**
    * Determines whether user has asked to ignore this path.
    */
-  _isIgnored(path27, stats) {
-    if (this.options.atomic && DOT_RE.test(path27))
+  _isIgnored(path32, stats) {
+    if (this.options.atomic && DOT_RE.test(path32))
       return true;
     if (!this._userIgnored) {
       const { cwd } = this.options;
@@ -16220,17 +16119,17 @@ var FSWatcher = class extends EventEmitter {
       const list = [...ignoredPaths.map(normalizeIgnored(cwd)), ...ignored];
       this._userIgnored = anymatch(list, void 0);
     }
-    return this._userIgnored(path27, stats);
+    return this._userIgnored(path32, stats);
   }
-  _isntIgnored(path27, stat4) {
-    return !this._isIgnored(path27, stat4);
+  _isntIgnored(path32, stat4) {
+    return !this._isIgnored(path32, stat4);
   }
   /**
    * Provides a set of common helpers and properties relating to symlink handling.
    * @param path file or directory pattern being watched
    */
-  _getWatchHelpers(path27) {
-    return new WatchHelper(path27, this.options.followSymlinks, this);
+  _getWatchHelpers(path32) {
+    return new WatchHelper(path32, this.options.followSymlinks, this);
   }
   // Directory helpers
   // -----------------
@@ -16262,63 +16161,63 @@ var FSWatcher = class extends EventEmitter {
    * @param item      base path of item/directory
    */
   _remove(directory, item, isDirectory) {
-    const path27 = sp2.join(directory, item);
-    const fullPath = sp2.resolve(path27);
-    isDirectory = isDirectory != null ? isDirectory : this._watched.has(path27) || this._watched.has(fullPath);
-    if (!this._throttle("remove", path27, 100))
+    const path32 = sp2.join(directory, item);
+    const fullPath = sp2.resolve(path32);
+    isDirectory = isDirectory != null ? isDirectory : this._watched.has(path32) || this._watched.has(fullPath);
+    if (!this._throttle("remove", path32, 100))
       return;
     if (!isDirectory && this._watched.size === 1) {
       this.add(directory, item, true);
     }
-    const wp = this._getWatchedDir(path27);
+    const wp = this._getWatchedDir(path32);
     const nestedDirectoryChildren = wp.getChildren();
-    nestedDirectoryChildren.forEach((nested) => this._remove(path27, nested));
+    nestedDirectoryChildren.forEach((nested) => this._remove(path32, nested));
     const parent = this._getWatchedDir(directory);
     const wasTracked = parent.has(item);
     parent.remove(item);
     if (this._symlinkPaths.has(fullPath)) {
       this._symlinkPaths.delete(fullPath);
     }
-    let relPath = path27;
+    let relPath = path32;
     if (this.options.cwd)
-      relPath = sp2.relative(this.options.cwd, path27);
+      relPath = sp2.relative(this.options.cwd, path32);
     if (this.options.awaitWriteFinish && this._pendingWrites.has(relPath)) {
       const event = this._pendingWrites.get(relPath).cancelWait();
       if (event === EVENTS.ADD)
         return;
     }
-    this._watched.delete(path27);
+    this._watched.delete(path32);
     this._watched.delete(fullPath);
     const eventName = isDirectory ? EVENTS.UNLINK_DIR : EVENTS.UNLINK;
-    if (wasTracked && !this._isIgnored(path27))
-      this._emit(eventName, path27);
-    this._closePath(path27);
+    if (wasTracked && !this._isIgnored(path32))
+      this._emit(eventName, path32);
+    this._closePath(path32);
   }
   /**
    * Closes all watchers for a path
    */
-  _closePath(path27) {
-    this._closeFile(path27);
-    const dir = sp2.dirname(path27);
-    this._getWatchedDir(dir).remove(sp2.basename(path27));
+  _closePath(path32) {
+    this._closeFile(path32);
+    const dir = sp2.dirname(path32);
+    this._getWatchedDir(dir).remove(sp2.basename(path32));
   }
   /**
    * Closes only file-specific watchers
    */
-  _closeFile(path27) {
-    const closers = this._closers.get(path27);
+  _closeFile(path32) {
+    const closers = this._closers.get(path32);
     if (!closers)
       return;
     closers.forEach((closer) => closer());
-    this._closers.delete(path27);
+    this._closers.delete(path32);
   }
-  _addPathCloser(path27, closer) {
+  _addPathCloser(path32, closer) {
     if (!closer)
       return;
-    let list = this._closers.get(path27);
+    let list = this._closers.get(path32);
     if (!list) {
       list = [];
-      this._closers.set(path27, list);
+      this._closers.set(path32, list);
     }
     list.push(closer);
   }
@@ -16347,7 +16246,7 @@ function watch(paths, options = {}) {
 }
 var chokidar_default = { watch, FSWatcher };
 
-// ../server/src/skill-store.ts
+// ../../packages/server-core/src/store/skill-store.ts
 var SkillStore = class {
   workspace;
   cache = /* @__PURE__ */ new Map();
@@ -16396,9 +16295,9 @@ var SkillStore = class {
       ignoreInitial: true,
       depth: 3,
       ignored: (p) => {
-        const base = path19.basename(p);
+        const base = path18.basename(p);
         if (base === "SKILL.md") return false;
-        if (!path19.extname(base)) return false;
+        if (!path18.extname(base)) return false;
         return true;
       }
     });
@@ -16420,7 +16319,7 @@ var SkillStore = class {
     if (cached) return cached;
     const meta = this.cache.get(name);
     if (!meta) return null;
-    const raw = await fs19.readFile(meta.filePath, "utf-8").catch(() => "");
+    const raw = await fs18.readFile(meta.filePath, "utf-8").catch(() => "");
     const { body } = parseFrontmatter(raw);
     const supportFiles = await listSupportFiles(meta.directory).catch(() => []);
     const full = { ...meta, body, supportFiles };
@@ -16507,23 +16406,23 @@ var SkillStore = class {
   async scanDir(dir, source) {
     let entries = [];
     try {
-      entries = await fs19.readdir(dir);
+      entries = await fs18.readdir(dir);
     } catch {
       return;
     }
     for (const name of entries) {
-      const skillDir = path19.join(dir, name);
+      const skillDir = path18.join(dir, name);
       let stat4;
       try {
-        stat4 = await fs19.stat(skillDir);
+        stat4 = await fs18.stat(skillDir);
       } catch {
         continue;
       }
       if (!stat4.isDirectory()) continue;
-      const skillMd = path19.join(skillDir, "SKILL.md");
+      const skillMd = path18.join(skillDir, "SKILL.md");
       let raw;
       try {
-        raw = await fs19.readFile(skillMd, "utf-8");
+        raw = await fs18.readFile(skillMd, "utf-8");
       } catch {
         continue;
       }
@@ -16588,9 +16487,9 @@ function tokenizeInput(s) {
 async function listSupportFiles(dir) {
   const out = [];
   const walk2 = async (cur, rel) => {
-    const entries = await fs19.readdir(cur, { withFileTypes: true }).catch(() => []);
+    const entries = await fs18.readdir(cur, { withFileTypes: true }).catch(() => []);
     for (const e of entries) {
-      const child = path19.join(cur, e.name);
+      const child = path18.join(cur, e.name);
       const childRel = rel ? `${rel}/${e.name}` : e.name;
       if (e.isDirectory()) {
         if (e.name.startsWith(".") || e.name === "node_modules") continue;
@@ -16604,21 +16503,21 @@ async function listSupportFiles(dir) {
   return out.slice(0, 100);
 }
 async function findExistingDir(parent, dirName, subDir) {
-  const exact = path19.join(parent, dirName, subDir);
+  const exact = path18.join(parent, dirName, subDir);
   try {
-    const stat4 = await fs19.stat(exact);
+    const stat4 = await fs18.stat(exact);
     if (stat4.isDirectory()) return exact;
   } catch {
   }
   try {
-    const entries = await fs19.readdir(parent, { withFileTypes: true });
+    const entries = await fs18.readdir(parent, { withFileTypes: true });
     const matched = entries.find(
       (e) => e.isDirectory() && e.name.toLowerCase() === dirName.toLowerCase() && e.name !== dirName
     );
     if (matched) {
-      const alt = path19.join(parent, matched.name, subDir);
+      const alt = path18.join(parent, matched.name, subDir);
       try {
-        const stat4 = await fs19.stat(alt);
+        const stat4 = await fs18.stat(alt);
         if (stat4.isDirectory()) return alt;
       } catch {
       }
@@ -16628,713 +16527,28 @@ async function findExistingDir(parent, dirName, subDir) {
   return exact;
 }
 async function ensureSkillsDir(parent, dirName, subDir) {
-  const parentDir = path19.join(parent, dirName);
+  const parentDir = path18.join(parent, dirName);
   try {
-    const stat4 = await fs19.stat(parentDir);
+    const stat4 = await fs18.stat(parentDir);
     if (!stat4.isDirectory()) return "";
   } catch {
     return "";
   }
-  const target = path19.join(parentDir, subDir);
+  const target = path18.join(parentDir, subDir);
   try {
-    const stat4 = await fs19.stat(target);
+    const stat4 = await fs18.stat(target);
     if (stat4.isDirectory()) return target;
   } catch {
   }
   try {
-    await fs19.mkdir(target, { recursive: false });
+    await fs18.mkdir(target, { recursive: false });
     return target;
   } catch {
     return "";
   }
 }
 
-// ../server/src/subagent-manager.ts
-import { EventEmitter as EventEmitter2 } from "node:events";
-import * as fsSync from "node:fs";
-import path20 from "node:path";
-var TypedEmitter = class {
-  ee = new EventEmitter2();
-  on(ev, fn) {
-    this.ee.on(ev, fn);
-    return this;
-  }
-  off(ev, fn) {
-    this.ee.off(ev, fn);
-    return this;
-  }
-  emit(ev, payload) {
-    this.ee.emit(ev, payload);
-  }
-};
-var SubagentManager = class extends TypedEmitter {
-  opts;
-  runs = /* @__PURE__ */ new Map();
-  /** parentSessionId → active runIds（用于并发限制 + announce 路由） */
-  byParent = /* @__PURE__ */ new Map();
-  /** runId 幂等：已经 announce 过的不再二次推送 */
-  announced = /* @__PURE__ */ new Set();
-  /** 已推送但还没被父 turn 消费的 announce message（父端 follow-up turn 拉取） */
-  pendingAnnounceByParent = /* @__PURE__ */ new Map();
-  /** 角色 profile 缓存（启动时加载一次，文件变更时可手动 refresh） */
-  profiles = /* @__PURE__ */ new Map();
-  /** fs.watch watcher instance（hot-reload 用） */
-  profileWatcher = null;
-  /** debounce timer for hot-reload */
-  profileReloadTimer = null;
-  /** 等待某个 parent 当前所有 active subagent 完成（或 timeout）。父 turn 末尾用 */
-  async awaitAllForParent(parentSessionId, timeoutMs = 6e4) {
-    const active = this.byParent.get(parentSessionId);
-    if (!active || active.size === 0) return;
-    const deadline = Date.now() + timeoutMs;
-    await new Promise((resolve3) => {
-      const tick = () => {
-        const cur = this.byParent.get(parentSessionId);
-        if (!cur || cur.size === 0) return resolve3();
-        if (Date.now() >= deadline) return resolve3();
-        setTimeout(tick, 100);
-      };
-      tick();
-    });
-  }
-  constructor(opts) {
-    super();
-    this.opts = {
-      maxDepth: 2,
-      maxConcurrentPerParent: 3,
-      runTimeoutMs: 12e4,
-      ...opts
-    };
-    loadAgentProfiles(opts.workspaceRoot).then((map) => {
-      this.profiles = map;
-      if (map.size > 0) {
-        console.log(`[subagents] Loaded ${map.size} agent profiles: ${[...map.keys()].join(", ")}`);
-      }
-    }).catch(() => void 0);
-    this._startProfileWatcher(opts.workspaceRoot);
-  }
-  /** 手动刷新 profile（用户编辑 .minicodeide/agents/ 后调用） */
-  async refreshProfiles() {
-    this.profiles = await loadAgentProfiles(this.opts.workspaceRoot);
-    return this.profiles.size;
-  }
-  /** 返回当前所有 profile 名（用于 tool description 动态填充） */
-  getProfileNames() {
-    return [...this.profiles.values()].map((p) => ({ name: p.name, description: p.description }));
-  }
-  /**
-   * 父 Agent 调 dispatch_subagent 时进入这里。
-   * 立刻返回 runId（不阻塞父 turn），后台跑 runAgent。
-   */
-  async spawn(spec) {
-    const childDepth = spec.parentDepth + 1;
-    if (childDepth > this.opts.maxDepth) {
-      throw new Error(`Subagent depth limit (${this.opts.maxDepth}) reached`);
-    }
-    const activeForParent = this.byParent.get(spec.parentSessionId)?.size ?? 0;
-    if (activeForParent >= this.opts.maxConcurrentPerParent) {
-      throw new Error(
-        `Max concurrent subagents per parent (${this.opts.maxConcurrentPerParent}) reached`
-      );
-    }
-    const child = await this.opts.sessions.create(
-      `[subagent] ${spec.label ?? spec.task.slice(0, 40)}`
-    );
-    const runId = `srun_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const run2 = {
-      runId,
-      childSessionId: child.id,
-      parentSessionId: spec.parentSessionId,
-      label: spec.label ?? "(no-label)",
-      task: spec.task,
-      role: spec.role,
-      status: "running",
-      startedAt: Date.now(),
-      depth: childDepth
-    };
-    this.runs.set(runId, run2);
-    if (!this.byParent.has(spec.parentSessionId)) this.byParent.set(spec.parentSessionId, /* @__PURE__ */ new Set());
-    this.byParent.get(spec.parentSessionId).add(runId);
-    void this.runChild(run2);
-    return { runId, childSessionId: child.id };
-  }
-  /** 父端在新 turn 启动前拉取累积的 announce，作为合成 user 消息合入 */
-  pickPendingAnnouncements(parentSessionId) {
-    const buf = this.pendingAnnounceByParent.get(parentSessionId);
-    if (!buf || buf.length === 0) return [];
-    this.pendingAnnounceByParent.delete(parentSessionId);
-    return buf;
-  }
-  hasPending(parentSessionId) {
-    return (this.pendingAnnounceByParent.get(parentSessionId)?.length ?? 0) > 0;
-  }
-  list(parentSessionId) {
-    const all = [...this.runs.values()];
-    if (parentSessionId) return all.filter((r) => r.parentSessionId === parentSessionId);
-    return all;
-  }
-  async runChild(run2) {
-    const profile = run2.role ? getProfile(this.profiles, run2.role) : void 0;
-    const systemLines = [];
-    if (profile) {
-      systemLines.push(
-        `[Subagent Role: ${profile.name}]`,
-        profile.systemPrompt,
-        "",
-        `[Subagent Context]`,
-        `You are running as a subagent (depth ${run2.depth}/${this.opts.maxDepth}) with role "${profile.name}".`,
-        `Role description: ${profile.description}`,
-        'Your output will be auto-delivered to the requester as a single "[Subagent Completed]" message.'
-      );
-      if (profile.sandbox === "read_only") {
-        systemLines.push("", "[Sandbox: read_only]", "You CANNOT write files. Your job is to read, analyze, and report findings.");
-      }
-    } else {
-      systemLines.push(
-        "[Subagent Context]",
-        `You are running as a subagent (depth ${run2.depth}/${this.opts.maxDepth}).`,
-        'Your output will be auto-delivered to the requester as a single "[Subagent Completed]" message.'
-      );
-    }
-    systemLines.push(
-      "",
-      "[Rules]",
-      "- You CANNOT spawn further subagents (dispatch_subagent is disabled here).",
-      "- You CANNOT modify the parent plan (update_plan is disabled here).",
-      "- Be concise. Produce a final answer in 1 turn if possible; max 8 steps.",
-      "- Do not poll status of other agents. You have no visibility into siblings.",
-      "",
-      `[Subagent Task]: ${run2.task}`
-    );
-    const SUBAGENT_SYSTEM = systemLines.join("\n");
-    const childRegistry = this.buildChildRegistry(profile);
-    const messages = [
-      { role: "system", content: SUBAGENT_SYSTEM },
-      { role: "user", content: run2.task }
-    ];
-    const abort = new AbortController();
-    const timeoutHandle = setTimeout(() => abort.abort(), this.opts.runTimeoutMs);
-    let childTurnId;
-    try {
-      childTurnId = await this.opts.sessions.startTurn(run2.childSessionId, run2.task).catch(() => void 0);
-      await this.opts.sessions.append(run2.childSessionId, { role: "user", content: run2.task });
-      const childCtx = {
-        ...this.opts.childToolCtxFactory(),
-        subagentDepth: run2.depth
-        // 即使子 registry 没有 dispatch tool，也带上 depth 信息
-      };
-      let isolatedPath;
-      if (this.opts.worktrees) {
-        try {
-          const wt = await this.opts.worktrees.createForSubagent(run2.runId);
-          if (wt.isolated) {
-            isolatedPath = wt.path;
-            childCtx.cwd = wt.path;
-          }
-        } catch {
-        }
-      }
-      let assistantBuf = "";
-      const resolvedLlm = typeof this.opts.llm === "function" ? this.opts.llm() : this.opts.llm;
-      const resolvedModel = typeof this.opts.defaultModel === "function" ? this.opts.defaultModel() : this.opts.defaultModel;
-      for await (const ev of runAgent({
-        llm: resolvedLlm,
-        registry: childRegistry,
-        messages,
-        toolCtx: childCtx,
-        signal: abort.signal,
-        maxSteps: 8,
-        model: resolvedModel
-      })) {
-        if (ev.type === "text" && ev.text) {
-          assistantBuf += ev.text;
-          if (childTurnId) {
-            this.opts.sessions.appendChunk(run2.childSessionId, childTurnId, ev.text).catch(() => void 0);
-          }
-          this.emit("child_text", { runId: run2.runId, text: ev.text });
-        }
-        if (ev.type === "tool_call" && ev.toolCall) {
-          this.emit("child_tool", { runId: run2.runId, tool: ev.toolCall.name });
-          if (childTurnId) {
-            this.opts.sessions.appendTool(run2.childSessionId, childTurnId, {
-              name: ev.toolCall.name,
-              args: ev.toolCall.arguments
-            }).catch(() => void 0);
-          }
-        }
-        if (ev.type === "tool_result") {
-          const preview = typeof ev.toolResult === "string" ? ev.toolResult.slice(0, 80).replace(/\n/g, " ") : "";
-          this.emit("child_tool_result", {
-            runId: run2.runId,
-            tool: ev.toolCall?.name ?? "unknown",
-            resultPreview: preview
-          });
-        }
-        if (ev.type === "error") {
-          throw new Error(ev.error ?? "subagent error");
-        }
-      }
-      const finalText = assistantBuf.trim();
-      run2.result = finalText;
-      run2.status = "completed";
-      if (childTurnId) {
-        await this.opts.sessions.endTurn(run2.childSessionId, childTurnId, finalText).catch(() => void 0);
-      }
-    } catch (e) {
-      const isTimeout = abort.signal.aborted;
-      run2.status = isTimeout ? "timeout" : "error";
-      run2.error = e?.message ?? String(e);
-      if (childTurnId) {
-        await this.opts.sessions.interruptTurn(run2.childSessionId, childTurnId, run2.error).catch(() => void 0);
-      }
-    } finally {
-      clearTimeout(timeoutHandle);
-      run2.finishedAt = Date.now();
-      this.byParent.get(run2.parentSessionId)?.delete(run2.runId);
-      this.deliverAnnounce(run2);
-      if (this.opts.worktrees) {
-        this.opts.worktrees.remove(run2.runId, { keepBranch: true }).catch(() => void 0);
-      }
-    }
-  }
-  /** 把 run 结果构建 announce message 并放入父的 pending 队列（zero-token，user 角色注入） */
-  deliverAnnounce(run2) {
-    if (this.announced.has(run2.runId)) return;
-    this.announced.add(run2.runId);
-    const lines = [];
-    lines.push(`[Subagent Completed] runId=${run2.runId} label=${run2.label} outcome=${run2.status}`);
-    if (run2.status === "completed") {
-      lines.push("---");
-      lines.push(run2.result ?? "(empty)");
-    } else {
-      lines.push(`error: ${run2.error ?? "(unknown)"}`);
-    }
-    const msg = lines.join("\n");
-    if (!this.pendingAnnounceByParent.has(run2.parentSessionId)) {
-      this.pendingAnnounceByParent.set(run2.parentSessionId, []);
-    }
-    this.pendingAnnounceByParent.get(run2.parentSessionId).push(msg);
-    this.emit("announce", { run: run2 });
-  }
-  /** 子 Agent 的 registry：拿全 builtin，然后剔除危险/不该有的；profile 可进一步裁剪 */
-  buildChildRegistry(profile) {
-    const r = new ToolRegistry();
-    registerBuiltinTools(r);
-    r.unregister("dispatch_subagent");
-    r.unregister("update_plan");
-    if (profile) {
-      if (profile.allowedTools && profile.allowedTools.length > 0) {
-        const allNames = r.list().map((t) => t.name);
-        for (const name of allNames) {
-          if (!profile.allowedTools.includes(name)) {
-            r.unregister(name);
-          }
-        }
-      } else if (profile.deniedTools && profile.deniedTools.length > 0) {
-        for (const name of profile.deniedTools) {
-          r.unregister(name);
-        }
-      }
-      if (profile.sandbox === "read_only") {
-        r.unregister("write_file");
-        r.unregister("edit_file");
-        r.unregister("run_command");
-      }
-    } else {
-      r.unregister("write_file");
-      r.unregister("edit_file");
-      r.unregister("run_command");
-    }
-    return r;
-  }
-  // --- P3-D5: Agent Profile hot-reload ---
-  /**
-   * 启动 fs.watch 监听 .minicodeide/agents/ 目录变更。
-   * 文件增/删/改 → debounce 500ms → 自动 refreshProfiles。
-   * 无 agents 目录或 fs.watch 不可用 → 静默跳过。
-   */
-  _startProfileWatcher(workspaceRoot) {
-    const agentsDir = path20.join(workspaceRoot, ".minicodeide", "agents");
-    try {
-      const stat4 = fsSync.statSync(agentsDir);
-      if (!stat4.isDirectory()) return;
-    } catch {
-      return;
-    }
-    try {
-      this.profileWatcher = fsSync.watch(agentsDir, (eventType, filename) => {
-        if (!filename || !filename.endsWith(".md")) return;
-        if (this.profileReloadTimer) clearTimeout(this.profileReloadTimer);
-        this.profileReloadTimer = setTimeout(async () => {
-          try {
-            const count = await this.refreshProfiles();
-            console.log(`[subagents] Hot-reloaded ${count} agent profiles (trigger: ${eventType} ${filename})`);
-          } catch (e) {
-            console.error(`[subagents] Hot-reload failed: ${e?.message ?? e}`);
-          }
-        }, 500);
-      });
-      console.log(`[subagents] Watching ${agentsDir} for profile hot-reload`);
-    } catch (e) {
-      console.warn(`[subagents] fs.watch on ${agentsDir} failed: ${e?.message ?? e}. Profiles will NOT auto-reload.`);
-    }
-  }
-  /** 停止 profile watcher（server shutdown 时调用） */
-  stopProfileWatcher() {
-    if (this.profileWatcher) {
-      this.profileWatcher.close();
-      this.profileWatcher = null;
-    }
-    if (this.profileReloadTimer) {
-      clearTimeout(this.profileReloadTimer);
-      this.profileReloadTimer = null;
-    }
-  }
-};
-
-// ../server/src/mcp-client.ts
-import { spawn } from "node:child_process";
-import * as fs20 from "node:fs";
-import * as path21 from "node:path";
-var DEFAULT_ALLOWLIST = {
-  allowedCommands: ["npx", "uvx", "node", "python3", "python", "bunx", "pnpm", "docker"],
-  denyArgs: ["--allow-shell", "--unsafe", "--rm-rf"]
-};
-function loadAllowlist(workspace) {
-  const f = path21.join(workspace, ".minicodeide", "mcp-allowlist.json");
-  if (!fs20.existsSync(f)) return DEFAULT_ALLOWLIST;
-  try {
-    const raw = JSON.parse(fs20.readFileSync(f, "utf8"));
-    return {
-      allowedCommands: raw.allowedCommands ?? DEFAULT_ALLOWLIST.allowedCommands,
-      denyArgs: raw.denyArgs ?? DEFAULT_ALLOWLIST.denyArgs
-    };
-  } catch {
-    return DEFAULT_ALLOWLIST;
-  }
-}
-function validateServerAgainstAllowlist(cfg, allow) {
-  const base = path21.basename(cfg.command).toLowerCase();
-  if (!allow.allowedCommands.map((c) => c.toLowerCase()).includes(base)) {
-    return `command "${cfg.command}" not in allowedCommands. Add it to .minicodeide/mcp-allowlist.json`;
-  }
-  const argsLower = (cfg.args ?? []).map((a) => String(a).toLowerCase());
-  for (const deny of allow.denyArgs ?? []) {
-    const dl = deny.toLowerCase();
-    if (argsLower.some((a) => a.includes(dl))) {
-      return `args contain forbidden token "${deny}"`;
-    }
-  }
-  return null;
-}
-var McpClient = class {
-  constructor(name, config) {
-    this.name = name;
-    this.config = config;
-  }
-  name;
-  config;
-  proc = null;
-  nextId = 1;
-  pending = /* @__PURE__ */ new Map();
-  buf = "";
-  readyPromise = null;
-  tools = [];
-  connected = false;
-  /** P2 修复：自动重连状态 */
-  reconnectAttempts = 0;
-  MAX_RECONNECT = 3;
-  reconnectTimer = null;
-  /** 重连成功/失败回调（McpManager 用于更新工具注册和通知前端） */
-  onReconnect;
-  async connect() {
-    if (this.readyPromise) return this.readyPromise;
-    this.readyPromise = (async () => {
-      const proc = spawn(this.config.command, this.config.args ?? [], {
-        env: { ...process.env, ...this.config.env ?? {} },
-        stdio: ["pipe", "pipe", "pipe"]
-      });
-      this.proc = proc;
-      proc.stdout.setEncoding("utf8");
-      proc.stdout.on("data", (chunk) => this.onStdout(chunk));
-      proc.stderr.on("data", (c) => {
-      });
-      proc.on("exit", (code) => {
-        this.connected = false;
-        for (const [, p] of this.pending) {
-          p.reject(new Error(`MCP server "${this.name}" exited (code=${code})`));
-        }
-        this.pending.clear();
-        if (code !== 0 && this.reconnectAttempts < this.MAX_RECONNECT) {
-          this.scheduleReconnect();
-        }
-      });
-      proc.on("error", (e) => {
-        for (const [, p] of this.pending) p.reject(e);
-        this.pending.clear();
-      });
-      await this.request("initialize", {
-        protocolVersion: "2024-11-05",
-        capabilities: {},
-        clientInfo: { name: "minicodeide", version: "0.1" }
-      });
-      this.notify("notifications/initialized", {});
-      const r = await this.request("tools/list", {});
-      this.tools = r?.tools ?? [];
-      if (this.config.disabledTools?.length) {
-        const disabled = new Set(this.config.disabledTools);
-        this.tools = this.tools.filter((t) => !disabled.has(t.name));
-      }
-      this.connected = true;
-      this.reconnectAttempts = 0;
-    })();
-    return this.readyPromise;
-  }
-  async callTool(name, args) {
-    if (!this.connected) await this.connect();
-    const r = await this.request("tools/call", { name, arguments: args ?? {} });
-    return r;
-  }
-  async close() {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    this.reconnectAttempts = this.MAX_RECONNECT;
-    if (this.proc) {
-      try {
-        this.proc.kill("SIGTERM");
-      } catch {
-      }
-      this.proc = null;
-    }
-    this.connected = false;
-  }
-  /**
-   * P2 修复：指数退避自动重连。
-   * 延迟 = 1s * 2^attempt（1s → 2s → 4s），最多 MAX_RECONNECT 次。
-   */
-  scheduleReconnect() {
-    const attempt = this.reconnectAttempts + 1;
-    const delay = 1e3 * Math.pow(2, attempt - 1);
-    console.log(`[mcp:${this.name}] Scheduling reconnect attempt ${attempt}/${this.MAX_RECONNECT} in ${delay}ms`);
-    this.reconnectTimer = setTimeout(async () => {
-      this.reconnectAttempts = attempt;
-      this.readyPromise = null;
-      try {
-        await this.connect();
-        console.log(`[mcp:${this.name}] Reconnected successfully (attempt ${attempt})`);
-        this.onReconnect?.(true, attempt);
-      } catch (e) {
-        console.warn(`[mcp:${this.name}] Reconnect failed (attempt ${attempt}): ${e?.message ?? e}`);
-        this.onReconnect?.(false, attempt, e?.message ?? String(e));
-      }
-    }, delay);
-  }
-  request(method, params) {
-    const id = this.nextId++;
-    const req = { jsonrpc: "2.0", id, method, params };
-    return new Promise((resolve3, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`MCP request "${method}" timeout (30s)`));
-      }, 3e4);
-      this.pending.set(id, {
-        resolve: (v) => {
-          clearTimeout(timer);
-          resolve3(v);
-        },
-        reject: (e) => {
-          clearTimeout(timer);
-          reject(e);
-        }
-      });
-      this.proc.stdin.write(JSON.stringify(req) + "\n");
-    });
-  }
-  notify(method, params) {
-    const req = { jsonrpc: "2.0", method, params };
-    try {
-      this.proc.stdin.write(JSON.stringify(req) + "\n");
-    } catch {
-    }
-  }
-  onStdout(chunk) {
-    this.buf += chunk;
-    let nl;
-    while ((nl = this.buf.indexOf("\n")) >= 0) {
-      const line = this.buf.slice(0, nl).trim();
-      this.buf = this.buf.slice(nl + 1);
-      if (!line) continue;
-      try {
-        const msg = JSON.parse(line);
-        if (typeof msg.id === "number" && this.pending.has(msg.id)) {
-          const p = this.pending.get(msg.id);
-          this.pending.delete(msg.id);
-          if (msg.error) p.reject(new Error(`${msg.error.code}: ${msg.error.message}`));
-          else p.resolve(msg.result);
-        }
-      } catch {
-      }
-    }
-  }
-};
-var McpManager = class {
-  constructor(workspace) {
-    this.workspace = workspace;
-  }
-  workspace;
-  clients = /* @__PURE__ */ new Map();
-  async loadAndConnect() {
-    const cfgPath = path21.join(this.workspace, ".minicodeide", "mcp.json");
-    if (!fs20.existsSync(cfgPath)) return [];
-    let cfg;
-    try {
-      cfg = JSON.parse(fs20.readFileSync(cfgPath, "utf8"));
-    } catch (e) {
-      return [{ name: "<config>", ok: false, error: `mcp.json parse error: ${e?.message ?? e}` }];
-    }
-    const allow = loadAllowlist(this.workspace);
-    const out = [];
-    for (const [name, sc] of Object.entries(cfg.servers ?? {})) {
-      const reject = validateServerAgainstAllowlist(sc, allow);
-      if (reject) {
-        out.push({ name, ok: false, error: `denied by allowlist: ${reject}` });
-        continue;
-      }
-      const client = new McpClient(name, sc);
-      try {
-        await client.connect();
-        this.clients.set(name, client);
-        out.push({ name, ok: true, toolCount: client.tools.length });
-      } catch (e) {
-        out.push({ name, ok: false, error: e?.message ?? String(e) });
-      }
-    }
-    return out;
-  }
-  list() {
-    return [...this.clients.values()];
-  }
-  get(name) {
-    return this.clients.get(name);
-  }
-  async closeAll() {
-    for (const c of this.clients.values()) await c.close();
-    this.clients.clear();
-  }
-  /**
-   * 把所有已连接的 MCP tools 注册到 ToolRegistry。
-   * 命名：mcp__<server>__<tool>
-   *
-   * 修复（P1）：将 MCP inputSchema（JSON Schema）转换为 zod schema，
-   * 使 LLM 能通过 tool parameters 字段获得结构化的参数信息，
-   * 而非之前的 z.record(z.string(), z.any()) 万能占位。
-   */
-  registerToolsTo(registry) {
-    for (const client of this.clients.values()) {
-      for (const tool of client.tools) {
-        const fqName = `mcp__${client.name}__${tool.name}`;
-        const desc = (tool.description ?? "").slice(0, 1e3) || `MCP tool ${tool.name} from "${client.name}".`;
-        let zodSchema;
-        try {
-          zodSchema = tool.inputSchema ? jsonSchemaToZod(tool.inputSchema) : external_exports.record(external_exports.string(), external_exports.any());
-        } catch {
-          zodSchema = external_exports.record(external_exports.string(), external_exports.any());
-        }
-        const t = {
-          name: fqName,
-          description: `[MCP:${client.name}] ${desc}`.slice(0, 4e3),
-          schema: zodSchema,
-          parallelSafe: false,
-          // 保守：未知副作用 → 串行
-          async execute(input) {
-            const r = await client.callTool(tool.name, input);
-            if (r?.content && Array.isArray(r.content)) {
-              const text = r.content.map((c) => {
-                if (c?.type === "text") return c.text;
-                if (c?.type === "image") return `[image ${c.mimeType}]`;
-                if (c?.type === "resource") return `[resource ${c.resource?.uri}]`;
-                return JSON.stringify(c);
-              }).join("\n");
-              return { ok: !r.isError, content: text, raw: r };
-            }
-            return r;
-          }
-        };
-        registry.register(t);
-      }
-    }
-  }
-};
-function jsonSchemaToZod(schema) {
-  if (!schema || typeof schema !== "object") return external_exports.any();
-  const type = schema.type;
-  if (schema.anyOf || schema.oneOf) {
-    const variants = schema.anyOf || schema.oneOf;
-    if (variants.length === 1) return jsonSchemaToZod(variants[0]);
-    if (variants.length === 2 && variants.some((v) => v.type === "null")) {
-      const nonNull = variants.find((v) => v.type !== "null");
-      if (nonNull) return jsonSchemaToZod(nonNull).nullable();
-    }
-    return external_exports.any();
-  }
-  if (schema.enum) {
-    const values = schema.enum.filter((v) => v !== null);
-    if (values.length > 0 && values.every((v) => typeof v === "string")) {
-      const [first, ...rest] = values;
-      let zodEnum = external_exports.enum([first, ...rest]);
-      if (schema.enum.includes(null)) zodEnum = zodEnum.nullable();
-      return zodEnum;
-    }
-    return external_exports.any();
-  }
-  switch (type) {
-    case "object": {
-      const properties = schema.properties ?? {};
-      const required = new Set(schema.required ?? []);
-      const shape = {};
-      for (const [key, propSchema] of Object.entries(properties)) {
-        let fieldSchema = jsonSchemaToZod(propSchema);
-        if (propSchema?.description) {
-          fieldSchema = fieldSchema.describe(propSchema.description);
-        }
-        if (!required.has(key)) {
-          shape[key] = fieldSchema.optional();
-        } else {
-          shape[key] = fieldSchema;
-        }
-      }
-      let obj = external_exports.object(shape);
-      if (schema.additionalProperties === false) {
-        obj = obj.strict();
-      }
-      if (Object.keys(properties).length === 0 && schema.additionalProperties && typeof schema.additionalProperties === "object") {
-        return external_exports.record(external_exports.string(), jsonSchemaToZod(schema.additionalProperties));
-      }
-      return obj;
-    }
-    case "array": {
-      if (schema.items) {
-        return external_exports.array(jsonSchemaToZod(schema.items));
-      }
-      return external_exports.array(external_exports.any());
-    }
-    case "string":
-      return external_exports.string();
-    case "number":
-    case "integer":
-      return external_exports.number();
-    case "boolean":
-      return external_exports.boolean();
-    case "null":
-      return external_exports.null();
-    default:
-      return external_exports.any();
-  }
-}
-
-// ../server/src/key-rotator.ts
+// ../../packages/server-core/src/llm/key-rotator.ts
 var AllKeysCooldownError = class extends Error {
   constructor(profileId, nextAvailableInMs) {
     super(
@@ -17421,17 +16635,18 @@ var KeyRotator = class {
   }
 };
 var rotators = /* @__PURE__ */ new Map();
+var sigMap = /* @__PURE__ */ new WeakMap();
 function getOrCreateRotator(profileId, keys) {
   const sig = profileId + ":" + keys.length + ":" + keys.map((k) => k.slice(-4)).join(",");
   const cached = rotators.get(profileId);
-  if (cached && cached.__sig === sig) return cached;
+  if (cached && sigMap.get(cached) === sig) return cached;
   const r = new KeyRotator(profileId, keys);
-  r.__sig = sig;
+  sigMap.set(r, sig);
   rotators.set(profileId, r);
   return r;
 }
 
-// ../server/src/llm-router.ts
+// ../../packages/server-core/src/llm/llm-router.ts
 var MAX_FAILURES = 3;
 var COOLDOWN_MS = 3e4;
 var CircuitBreaker = class {
@@ -17534,7 +16749,7 @@ var LLMRouter = class {
         } catch (e) {
           lastErr = e;
           const kind = classifyError2(e);
-          rotator.markFailure(keyChosen, kind === "unknown" ? "unknown" : kind);
+          rotator.markFailure(keyChosen, kind);
           if (started) {
             throw e;
           }
@@ -17624,11 +16839,159 @@ function classifyError2(e) {
 function stringifyError(e) {
   if (!e) return "";
   if (typeof e === "string") return e;
-  const any = e;
-  return any?.message ?? String(e);
+  if (e instanceof Error) return e.message;
+  return String(e);
 }
 
-// ../server/src/reranker.ts
+// ../../packages/server-core/src/git/git-helpers.ts
+import { exec as _exec } from "node:child_process";
+import { promisify as promisify3 } from "node:util";
+import os4 from "node:os";
+import path19 from "node:path";
+var exec = promisify3(_exec);
+var MAX_BUFFER2 = 32 * 1024 * 1024;
+async function run(cmd, cwd) {
+  const { stdout } = await exec(cmd, { cwd, maxBuffer: MAX_BUFFER2 });
+  return stdout;
+}
+async function isGitRepo(cwd) {
+  try {
+    await run("git rev-parse --is-inside-work-tree", cwd);
+    return true;
+  } catch {
+    return false;
+  }
+}
+async function gitStatus(cwd) {
+  const out = await run("git status --porcelain", cwd);
+  const result = [];
+  for (const ln of out.split("\n")) {
+    if (!ln) continue;
+    const x = ln[0];
+    const y = ln[1];
+    const p = ln.slice(3).trim();
+    if (x !== " " && x !== "?") {
+      result.push({ status: x, path: p, staged: true });
+    }
+    if (y !== " " && (y !== " " || x === "?")) {
+      result.push({ status: y === " " ? x : y, path: p, staged: false });
+    }
+  }
+  return result;
+}
+async function gitDiff(cwd, opts = {}) {
+  const args = ["diff"];
+  if (opts.staged) args.push("--cached");
+  if (opts.path) args.push("--", opts.path.replace(/'/g, "'\\''"));
+  return run("git " + args.join(" "), cwd);
+}
+async function gitBranch(cwd) {
+  return (await run("git rev-parse --abbrev-ref HEAD", cwd)).trim();
+}
+async function gitLog(cwd, n = 20) {
+  const fmt = "%H%x1f%h%x1f%aI%x1f%an%x1f%s";
+  const out = await run(`git log --pretty=format:${fmt} -n ${n}`, cwd);
+  return out.split("\n").filter(Boolean).map((ln) => {
+    const [hash, shortHash, date, author, subject] = ln.split("");
+    return { hash, shortHash, date, author, subject };
+  });
+}
+async function gitCommit(cwd, message, paths = []) {
+  if (paths.length === 0) {
+    await run("git add -A", cwd);
+  } else {
+    const safe = paths.map((p) => `'${p.replace(/'/g, "'\\''")}'`).join(" ");
+    await run(`git add ${safe}`, cwd);
+  }
+  const file = path19.join(os4.tmpdir(), `.minicodeide-commit-${Date.now()}.txt`);
+  const fs28 = await import("node:fs/promises");
+  await fs28.writeFile(file, message, "utf-8");
+  try {
+    await run(`git commit -F '${file}'`, cwd);
+  } finally {
+    await fs28.unlink(file).catch(() => void 0);
+  }
+  const log = await gitLog(cwd, 1);
+  return { hash: log[0]?.hash ?? "", subject: log[0]?.subject ?? "" };
+}
+async function gitShow(cwd, hash) {
+  if (!/^[0-9a-f]{6,40}$/.test(hash)) throw new Error("invalid hash");
+  return run(`git show ${hash}`, cwd);
+}
+async function gitRevert(cwd, filePath) {
+  const safe = filePath.replace(/'/g, "'\\''");
+  await run(`git checkout -- '${safe}'`, cwd);
+}
+async function gitAccept(cwd, filePaths, message) {
+  return gitCommit(cwd, message, filePaths);
+}
+
+// ../../packages/server-core/src/indexer/retrieval.ts
+async function hybridRetrieve(index, embedder, query, topK = 8, reranker) {
+  const RRF_K = 60;
+  const overFetch = reranker && reranker.name !== "identity" ? topK * 3 : topK * 2;
+  const bmHits = index.bm25.search(query, overFetch);
+  let vecHits = [];
+  if (index.vectors.size() > 0) {
+    try {
+      const [v] = await embedder.embed([query]);
+      vecHits = index.vectors.search(v, overFetch);
+    } catch (e) {
+      console.warn("[retrieval] vector search failed, falling back to BM25 only:", e.message);
+    }
+  }
+  const scores = /* @__PURE__ */ new Map();
+  bmHits.forEach((h, rank) => {
+    const id = h.chunk.id;
+    scores.set(id, {
+      id,
+      path: h.chunk.file,
+      startLine: h.chunk.startLine,
+      endLine: h.chunk.endLine,
+      text: h.chunk.text,
+      score: 1 / (RRF_K + rank + 1),
+      sources: ["bm25"]
+    });
+  });
+  vecHits.forEach((h, rank) => {
+    const id = h.item.id;
+    const existing = scores.get(id);
+    if (existing) {
+      existing.score += 1 / (RRF_K + rank + 1);
+      if (!existing.sources.includes("vector")) existing.sources.push("vector");
+    } else {
+      scores.set(id, {
+        id,
+        path: h.item.path,
+        startLine: h.item.startLine,
+        endLine: h.item.endLine,
+        text: h.item.text,
+        score: 1 / (RRF_K + rank + 1),
+        sources: ["vector"]
+      });
+    }
+  });
+  const fused = Array.from(scores.values()).sort((a, b) => b.score - a.score);
+  if (reranker && reranker.name !== "identity" && fused.length > 1) {
+    const candidates = fused.slice(0, overFetch).map((h) => ({
+      id: h.id,
+      text: h.text,
+      meta: h
+    }));
+    try {
+      const reranked = await reranker.rerank(query, candidates, topK);
+      return reranked.map((r) => ({
+        ...r.candidate.meta,
+        rerankScore: r.score
+      }));
+    } catch (e) {
+      console.warn("[retrieval] rerank failed, using RRF order:", e.message);
+    }
+  }
+  return fused.slice(0, topK);
+}
+
+// ../../packages/server-core/src/indexer/reranker.ts
 var IdentityReranker = class {
   name = "identity";
   async rerank(_q, cs, topN) {
@@ -17709,72 +17072,149 @@ function buildReranker(env2 = process.env) {
   return new TransformersReranker(v);
 }
 
-// ../server/src/retrieval.ts
-async function hybridRetrieve(index, embedder, query, topK = 8, reranker) {
-  const RRF_K = 60;
-  const overFetch = reranker && reranker.name !== "identity" ? topK * 3 : topK * 2;
-  const bmHits = index.bm25.search(query, overFetch);
-  let vecHits = [];
-  if (index.vectors.size() > 0) {
-    try {
-      const [v] = await embedder.embed([query]);
-      vecHits = index.vectors.search(v, overFetch);
-    } catch (e) {
-      console.warn("[retrieval] vector search failed, falling back to BM25 only:", e.message);
-    }
+// ../../packages/server-core/src/indexer/watcher.ts
+import { promises as fs19 } from "node:fs";
+import path20 from "node:path";
+var DEFAULT_IGNORED = [
+  /node_modules/,
+  /\.git\//,
+  /\.minicodeide/,
+  /dist\//,
+  /\.next\//,
+  /\.cache\//,
+  /\.DS_Store/
+];
+var IndexWatcher = class {
+  constructor(opts) {
+    this.opts = opts;
   }
-  const scores = /* @__PURE__ */ new Map();
-  bmHits.forEach((h, rank) => {
-    const id = h.chunk.id;
-    scores.set(id, {
-      id,
-      path: h.chunk.file,
-      startLine: h.chunk.startLine,
-      endLine: h.chunk.endLine,
-      text: h.chunk.text,
-      score: 1 / (RRF_K + rank + 1),
-      sources: ["bm25"]
+  opts;
+  watcher;
+  /** 等待处理的文件队列：add/change/unlink */
+  pending = /* @__PURE__ */ new Map();
+  timer;
+  flushing = false;
+  start() {
+    const ignored = [...DEFAULT_IGNORED, ...this.opts.ignored ?? []];
+    this.watcher = chokidar_default.watch(this.opts.root, {
+      ignored: (p) => ignored.some(
+        (rule) => rule instanceof RegExp ? rule.test(p) : p.includes(rule)
+      ),
+      ignoreInitial: true,
+      // 初始扫描由 builder 做
+      persistent: true,
+      awaitWriteFinish: { stabilityThreshold: 150, pollInterval: 50 }
     });
-  });
-  vecHits.forEach((h, rank) => {
-    const id = h.item.id;
-    const existing = scores.get(id);
-    if (existing) {
-      existing.score += 1 / (RRF_K + rank + 1);
-      if (!existing.sources.includes("vector")) existing.sources.push("vector");
-    } else {
-      scores.set(id, {
-        id,
-        path: h.item.path,
-        startLine: h.item.startLine,
-        endLine: h.item.endLine,
-        text: h.item.text,
-        score: 1 / (RRF_K + rank + 1),
-        sources: ["vector"]
-      });
+    this.watcher.on("add", (p) => this.enqueue(p, "add")).on("change", (p) => this.enqueue(p, "change")).on("unlink", (p) => this.enqueue(p, "unlink"));
+    this.opts.onProgress?.(`[watcher] watching ${this.opts.root}`);
+  }
+  async stop() {
+    await this.watcher?.close();
+    if (this.timer) clearTimeout(this.timer);
+  }
+  enqueue(abs, kind) {
+    const rel = path20.relative(this.opts.root, abs);
+    if (!rel || rel.startsWith("..")) return;
+    const existing = this.pending.get(rel);
+    if (existing === "unlink" && kind !== "unlink") return;
+    this.pending.set(rel, kind);
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = setTimeout(() => void this.flush(), this.opts.debounceMs ?? 300);
+  }
+  async flush() {
+    if (this.flushing) {
+      this.timer = setTimeout(() => void this.flush(), 200);
+      return;
     }
-  });
-  const fused = Array.from(scores.values()).sort((a, b) => b.score - a.score);
-  if (reranker && reranker.name !== "identity" && fused.length > 1) {
-    const candidates = fused.slice(0, overFetch).map((h) => ({
-      id: h.id,
-      text: h.text,
-      meta: h
-    }));
+    this.flushing = true;
     try {
-      const reranked = await reranker.rerank(query, candidates, topK);
-      return reranked.map((r) => ({
-        ...r.candidate.meta,
-        rerankScore: r.score
-      }));
-    } catch (e) {
-      console.warn("[retrieval] rerank failed, using RRF order:", e.message);
+      const idx = this.opts.index();
+      if (!idx) {
+        this.opts.onProgress?.("[watcher] index not ready, skip");
+        return;
+      }
+      const batch = [...this.pending.entries()];
+      this.pending.clear();
+      const burst = this.opts.burstLimit ?? 200;
+      if (batch.length > burst) {
+        this.opts.onProgress?.(
+          `[watcher] burst ${batch.length} > ${burst}; skip embedding this round (BM25 still updated)`
+        );
+      }
+      const embedder = this.opts.embedder();
+      const max = this.opts.maxFileSize ?? 5e5;
+      const allNewItems = [];
+      for (const [relPath, kind] of batch) {
+        if (kind === "unlink") {
+          idx.bm25.removeByPath(relPath);
+          idx.symbols.remove(relPath);
+          idx.vectors.upsertFile(relPath, []);
+          continue;
+        }
+        const abs = path20.join(this.opts.root, relPath);
+        let text = "";
+        try {
+          const stat4 = await fs19.stat(abs);
+          if (!stat4.isFile()) continue;
+          if (stat4.size > max) {
+            this.opts.onProgress?.(`[watcher] skip ${relPath} (${stat4.size}b > ${max})`);
+            continue;
+          }
+          text = await fs19.readFile(abs, "utf-8");
+        } catch {
+          idx.bm25.removeByPath(relPath);
+          idx.symbols.remove(relPath);
+          idx.vectors.upsertFile(relPath, []);
+          continue;
+        }
+        const facts = extractFacts(relPath, text);
+        const chunks = facts && facts.symbols.length > 0 ? chunkTextWithSymbols(
+          relPath,
+          text,
+          facts.symbols.map((s) => ({ name: s.name, startLine: s.startLine, endLine: s.endLine }))
+        ) : chunkText(relPath, text);
+        idx.bm25.upsertFile(relPath, chunks);
+        if (facts) idx.symbols.upsert(facts);
+        if (batch.length <= burst && chunks.length) {
+          try {
+            const vecs = await embedder.embed(chunks.map((c) => `// ${c.path}
+${c.text}`));
+            const items = chunks.map((c, i) => ({
+              id: c.id,
+              path: c.path,
+              startLine: c.startLine,
+              endLine: c.endLine,
+              text: c.text,
+              vec: vecs[i],
+              model: embedder.name
+            }));
+            idx.vectors.upsertFile(relPath, items);
+            allNewItems.push(...items);
+          } catch (e) {
+            this.opts.onProgress?.(`[watcher] embed failed ${relPath}: ${e.message}`);
+          }
+        } else {
+          idx.vectors.upsertFile(relPath, []);
+        }
+      }
+      this.opts.onProgress?.(
+        `[watcher] flushed ${batch.length} change(s); +${allNewItems.length} vectors`
+      );
+      if (this.opts.onFileChange && batch.length > 0) {
+        this.opts.onFileChange(batch.map(([path32, kind]) => ({ path: path32, kind })));
+      }
+      if (allNewItems.length) {
+        idx.vectors.save(this.opts.vectorPath()).catch((e) => {
+          console.warn("[watcher] vectors.save failed:", e.message);
+        });
+      }
+    } finally {
+      this.flushing = false;
     }
   }
-  return fused.slice(0, topK);
-}
+};
 
-// ../server/src/exec-policy.ts
+// ../../packages/server-core/src/exec/exec-policy.ts
 var AUTO_PROGRAMS = /* @__PURE__ */ new Set([
   // 读类
   "ls",
@@ -17990,147 +17430,1852 @@ function decideCommand(command) {
   return worst;
 }
 
-// ../server/src/watcher.ts
-import { promises as fs21 } from "node:fs";
-import path22 from "node:path";
-var DEFAULT_IGNORED = [
-  /node_modules/,
-  /\.git\//,
-  /\.minicodeide/,
-  /dist\//,
-  /\.next\//,
-  /\.cache\//,
-  /\.DS_Store/
-];
-var IndexWatcher = class {
-  constructor(opts) {
-    this.opts = opts;
+// ../../packages/server-core/src/exec/permission-aware-policy.ts
+var WRITE_CLASS_PROGRAMS = /* @__PURE__ */ new Set([
+  // 包管理（会写 node_modules / 全局目录）
+  "npm",
+  "pnpm",
+  "yarn",
+  "pip",
+  "pip3",
+  "brew",
+  "apt",
+  "apt-get"
+  // git 写操作（由 exec-policy 的 isGitReadOnly 判断）
+  // 这里只标记 git 写类子命令 → 在 isGitWrite 里判断
+  // 注：tsc/eslint/prettier/vitest/jest/mocha 是读/验证类工具，不在此列
+  // 它们在 read_only sandbox 下仍然可用（类型检查、lint、测试不修改文件）
+]);
+var GIT_READONLY_SUBS = /* @__PURE__ */ new Set([
+  "status",
+  "diff",
+  "log",
+  "show",
+  "blame",
+  "branch",
+  "remote",
+  "config",
+  "rev-parse",
+  "rev-list",
+  "ls-files",
+  "ls-tree",
+  "describe",
+  "tag",
+  "stash"
+]);
+function isGitWrite(cmd) {
+  const tokens = cmd.trim().split(/\s+/);
+  if (tokens[0] !== "git") return false;
+  const sub = tokens[1];
+  if (!sub) return true;
+  return !GIT_READONLY_SUBS.has(sub);
+}
+function isWriteCommand(cmd) {
+  const tokens = cmd.trim().split(/\s+/);
+  let prog = tokens[0] || "";
+  while (/^[A-Z_][A-Z0-9_]*=/.test(prog) && tokens.length > 1) {
+    tokens.shift();
+    prog = tokens[0];
   }
-  opts;
-  watcher;
-  /** 等待处理的文件队列：add/change/unlink */
-  pending = /* @__PURE__ */ new Map();
-  timer;
-  flushing = false;
-  start() {
-    const ignored = [...DEFAULT_IGNORED, ...this.opts.ignored ?? []];
-    this.watcher = chokidar_default.watch(this.opts.root, {
-      ignored: (p) => ignored.some(
-        (rule) => rule instanceof RegExp ? rule.test(p) : p.includes(rule)
-      ),
-      ignoreInitial: true,
-      // 初始扫描由 builder 做
-      persistent: true,
-      awaitWriteFinish: { stabilityThreshold: 150, pollInterval: 50 }
-    });
-    this.watcher.on("add", (p) => this.enqueue(p, "add")).on("change", (p) => this.enqueue(p, "change")).on("unlink", (p) => this.enqueue(p, "unlink"));
-    this.opts.onProgress?.(`[watcher] watching ${this.opts.root}`);
+  const slash = prog.lastIndexOf("/");
+  if (slash >= 0) prog = prog.slice(slash + 1);
+  if (prog === "git") return isGitWrite(cmd);
+  return WRITE_CLASS_PROGRAMS.has(prog);
+}
+function permissionAwareDecide(command, profile) {
+  const base = decideCommand(command);
+  if (base.verdict === "deny") return base;
+  if (profile.sandbox === "read_only") {
+    if (isWriteCommand(command)) {
+      return {
+        verdict: "deny",
+        reason: `read_only sandbox: write-class command "${command.slice(0, 60)}" denied`,
+        matchedRule: "sandbox-read_only"
+      };
+    }
+    if (base.verdict === "ask") {
+      return {
+        verdict: "deny",
+        reason: `read_only sandbox: non-auto command needs approval, but read_only blocks it: ${base.reason}`,
+        matchedRule: "sandbox-read_only-ask-upgrade"
+      };
+    }
   }
-  async stop() {
-    await this.watcher?.close();
-    if (this.timer) clearTimeout(this.timer);
+  if (profile.approval === "never" && base.verdict === "ask") {
+    return {
+      verdict: "deny",
+      reason: `approval=never: would-ask command denied without prompting: ${base.reason}`,
+      matchedRule: "approval-never"
+    };
   }
-  enqueue(abs, kind) {
-    const rel = path22.relative(this.opts.root, abs);
-    if (!rel || rel.startsWith("..")) return;
-    const existing = this.pending.get(rel);
-    if (existing === "unlink" && kind !== "unlink") return;
-    this.pending.set(rel, kind);
-    if (this.timer) clearTimeout(this.timer);
-    this.timer = setTimeout(() => void this.flush(), this.opts.debounceMs ?? 300);
+  if (profile.approval === "granular" && base.verdict === "auto") {
+    return {
+      verdict: "ask",
+      reason: `approval=granular: auto command requires explicit approval: ${base.reason}`,
+      matchedRule: "approval-granular"
+    };
   }
-  async flush() {
-    if (this.flushing) {
-      this.timer = setTimeout(() => void this.flush(), 200);
+  return base;
+}
+
+// ../../packages/server-core/src/agent/subagent-types.ts
+import { EventEmitter as EventEmitter2 } from "node:events";
+var TypedEmitter = class {
+  ee = new EventEmitter2();
+  on(ev, fn) {
+    this.ee.on(ev, fn);
+    return this;
+  }
+  off(ev, fn) {
+    this.ee.off(ev, fn);
+    return this;
+  }
+  emit(ev, payload) {
+    this.ee.emit(ev, payload);
+  }
+};
+
+// ../../packages/server-core/src/agent/profile-watcher.ts
+import * as fsSync from "node:fs";
+import path21 from "node:path";
+var ProfileWatcher = class {
+  watcher = null;
+  reloadTimer = null;
+  profiles = /* @__PURE__ */ new Map();
+  workspaceRoot;
+  constructor(workspaceRoot) {
+    this.workspaceRoot = workspaceRoot;
+  }
+  /** 启动时加载 profile + 启动 fs.watch */
+  async init() {
+    this.profiles = await loadAgentProfiles(this.workspaceRoot).catch(() => /* @__PURE__ */ new Map());
+    if (this.profiles.size > 0) {
+      console.log(`[subagents] Loaded ${this.profiles.size} agent profiles: ${[...this.profiles.keys()].join(", ")}`);
+    }
+    this._startWatch();
+    return this.profiles;
+  }
+  /** 手动刷新 profile */
+  async refresh() {
+    this.profiles = await loadAgentProfiles(this.workspaceRoot);
+    return this.profiles;
+  }
+  /** 获取当前 profile 缓存 */
+  getProfiles() {
+    return this.profiles;
+  }
+  /** 返回所有 profile 名（用于 tool description 动态填充） */
+  getProfileNames() {
+    return [...this.profiles.values()].map((p) => ({ name: p.name, description: p.description }));
+  }
+  /** 停止 watcher（server shutdown 时调用） */
+  stop() {
+    if (this.watcher) {
+      this.watcher.close();
+      this.watcher = null;
+    }
+    if (this.reloadTimer) {
+      clearTimeout(this.reloadTimer);
+      this.reloadTimer = null;
+    }
+  }
+  // ─── 内部 ─────────────────────────────────────────────
+  _startWatch() {
+    const agentsDir = path21.join(this.workspaceRoot, ".minicodeide", "agents");
+    try {
+      const stat4 = fsSync.statSync(agentsDir);
+      if (!stat4.isDirectory()) return;
+    } catch {
       return;
     }
-    this.flushing = true;
     try {
-      const idx = this.opts.index();
-      if (!idx) {
-        this.opts.onProgress?.("[watcher] index not ready, skip");
-        return;
-      }
-      const batch = [...this.pending.entries()];
-      this.pending.clear();
-      const burst = this.opts.burstLimit ?? 200;
-      if (batch.length > burst) {
-        this.opts.onProgress?.(
-          `[watcher] burst ${batch.length} > ${burst}; skip embedding this round (BM25 still updated)`
-        );
-      }
-      const embedder = this.opts.embedder();
-      const max = this.opts.maxFileSize ?? 5e5;
-      const allNewItems = [];
-      for (const [relPath, kind] of batch) {
-        if (kind === "unlink") {
-          idx.bm25.removeByPath(relPath);
-          idx.symbols.remove(relPath);
-          idx.vectors.upsertFile(relPath, []);
-          continue;
-        }
-        const abs = path22.join(this.opts.root, relPath);
-        let text = "";
-        try {
-          const stat4 = await fs21.stat(abs);
-          if (!stat4.isFile()) continue;
-          if (stat4.size > max) {
-            this.opts.onProgress?.(`[watcher] skip ${relPath} (${stat4.size}b > ${max})`);
-            continue;
-          }
-          text = await fs21.readFile(abs, "utf-8");
-        } catch {
-          idx.bm25.removeByPath(relPath);
-          idx.symbols.remove(relPath);
-          idx.vectors.upsertFile(relPath, []);
-          continue;
-        }
-        const facts = extractFacts(relPath, text);
-        const chunks = facts && facts.symbols.length > 0 ? chunkTextWithSymbols(
-          relPath,
-          text,
-          facts.symbols.map((s) => ({ name: s.name, startLine: s.startLine, endLine: s.endLine }))
-        ) : chunkText(relPath, text);
-        idx.bm25.upsertFile(relPath, chunks);
-        if (facts) idx.symbols.upsert(facts);
-        if (batch.length <= burst && chunks.length) {
+      this.watcher = fsSync.watch(agentsDir, (eventType, filename) => {
+        if (!filename || !filename.endsWith(".md")) return;
+        if (this.reloadTimer) clearTimeout(this.reloadTimer);
+        this.reloadTimer = setTimeout(async () => {
           try {
-            const vecs = await embedder.embed(chunks.map((c) => `// ${c.path}
-${c.text}`));
-            const items = chunks.map((c, i) => ({
-              id: c.id,
-              path: c.path,
-              startLine: c.startLine,
-              endLine: c.endLine,
-              text: c.text,
-              vec: vecs[i],
-              model: embedder.name
-            }));
-            idx.vectors.upsertFile(relPath, items);
-            allNewItems.push(...items);
+            this.profiles = await this.refresh();
+            console.log(`[subagents] Hot-reloaded ${this.profiles.size} agent profiles (trigger: ${eventType} ${filename})`);
           } catch (e) {
-            this.opts.onProgress?.(`[watcher] embed failed ${relPath}: ${e.message}`);
+            console.error(`[subagents] Hot-reload failed: ${e?.message ?? e}`);
           }
-        } else {
-          idx.vectors.upsertFile(relPath, []);
-        }
-      }
-      this.opts.onProgress?.(
-        `[watcher] flushed ${batch.length} change(s); +${allNewItems.length} vectors`
-      );
-      if (this.opts.onFileChange && batch.length > 0) {
-        this.opts.onFileChange(batch.map(([path27, kind]) => ({ path: path27, kind })));
-      }
-      if (allNewItems.length) {
-        idx.vectors.save(this.opts.vectorPath()).catch((e) => {
-          console.warn("[watcher] vectors.save failed:", e.message);
-        });
-      }
-    } finally {
-      this.flushing = false;
+        }, 500);
+      });
+      console.log(`[subagents] Watching ${agentsDir} for profile hot-reload`);
+    } catch (e) {
+      console.warn(`[subagents] fs.watch on ${agentsDir} failed: ${e?.message ?? e}. Profiles will NOT auto-reload.`);
     }
   }
 };
+
+// ../../packages/server-core/src/agent/subagent-manager.ts
+var SubagentManager = class extends TypedEmitter {
+  opts;
+  runs = /* @__PURE__ */ new Map();
+  /** parentSessionId → active runIds（用于并发限制 + announce 路由） */
+  byParent = /* @__PURE__ */ new Map();
+  /** runId 幂等：已经 announce 过的不再二次推送 */
+  announced = /* @__PURE__ */ new Set();
+  /** 已推送但还没被父 turn 消费的 announce message（父端 follow-up turn 拉取） */
+  pendingAnnounceByParent = /* @__PURE__ */ new Map();
+  /** Profile hot-reload watcher */
+  profileWatcher;
+  constructor(opts) {
+    super();
+    this.opts = {
+      maxDepth: 2,
+      maxConcurrentPerParent: 3,
+      runTimeoutMs: 12e4,
+      ...opts
+    };
+    this.profileWatcher = new ProfileWatcher(opts.workspaceRoot);
+    this.profileWatcher.init().catch(() => void 0);
+  }
+  /** 手动刷新 profile（用户编辑 .minicodeide/agents/ 后调用） */
+  async refreshProfiles() {
+    const map = await this.profileWatcher.refresh();
+    return map.size;
+  }
+  /** 返回当前所有 profile 名（用于 tool description 动态填充） */
+  getProfileNames() {
+    return this.profileWatcher.getProfileNames();
+  }
+  /** 等待某个 parent 当前所有 active subagent 完成（或 timeout）。父 turn 末尾用 */
+  async awaitAllForParent(parentSessionId, timeoutMs = 6e4) {
+    const active = this.byParent.get(parentSessionId);
+    if (!active || active.size === 0) return;
+    const deadline = Date.now() + timeoutMs;
+    await new Promise((resolve3) => {
+      const tick = () => {
+        const cur = this.byParent.get(parentSessionId);
+        if (!cur || cur.size === 0) return resolve3();
+        if (Date.now() >= deadline) return resolve3();
+        setTimeout(tick, 100);
+      };
+      tick();
+    });
+  }
+  /**
+   * 父 Agent 调 dispatch_subagent 时进入这里。
+   * 立刻返回 runId（不阻塞父 turn），后台跑 runAgent。
+   */
+  async spawn(spec) {
+    const childDepth = spec.parentDepth + 1;
+    if (childDepth > this.opts.maxDepth) {
+      throw new Error(`Subagent depth limit (${this.opts.maxDepth}) reached`);
+    }
+    const activeForParent = this.byParent.get(spec.parentSessionId)?.size ?? 0;
+    if (activeForParent >= this.opts.maxConcurrentPerParent) {
+      throw new Error(
+        `Max concurrent subagents per parent (${this.opts.maxConcurrentPerParent}) reached`
+      );
+    }
+    const child = await this.opts.sessions.create(
+      `[subagent] ${spec.label ?? spec.task.slice(0, 40)}`
+    );
+    const runId = `srun_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const run2 = {
+      runId,
+      childSessionId: child.id,
+      parentSessionId: spec.parentSessionId,
+      label: spec.label ?? "(no-label)",
+      task: spec.task,
+      role: spec.role,
+      status: "running",
+      startedAt: Date.now(),
+      depth: childDepth
+    };
+    this.runs.set(runId, run2);
+    if (!this.byParent.has(spec.parentSessionId)) this.byParent.set(spec.parentSessionId, /* @__PURE__ */ new Set());
+    this.byParent.get(spec.parentSessionId).add(runId);
+    void this.runChild(run2);
+    return { runId, childSessionId: child.id };
+  }
+  /** 父端在新 turn 启动前拉取累积的 announce，作为合成 user 消息合入 */
+  pickPendingAnnouncements(parentSessionId) {
+    const buf = this.pendingAnnounceByParent.get(parentSessionId);
+    if (!buf || buf.length === 0) return [];
+    this.pendingAnnounceByParent.delete(parentSessionId);
+    return buf;
+  }
+  hasPending(parentSessionId) {
+    return (this.pendingAnnounceByParent.get(parentSessionId)?.length ?? 0) > 0;
+  }
+  list(parentSessionId) {
+    const all = [...this.runs.values()];
+    if (parentSessionId) return all.filter((r) => r.parentSessionId === parentSessionId);
+    return all;
+  }
+  /** 停止 profile watcher（server shutdown 时调用） */
+  stopProfileWatcher() {
+    this.profileWatcher.stop();
+  }
+  // ─── 私有方法 ─────────────────────────────────────────
+  async runChild(run2) {
+    const profiles = this.profileWatcher.getProfiles();
+    const profile = run2.role ? getProfile(profiles, run2.role) : void 0;
+    const systemPrompt = this.buildSystemPrompt(run2, profile);
+    const childRegistry = this.buildChildRegistry(profile);
+    const messages = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: run2.task }
+    ];
+    const abort = new AbortController();
+    const timeoutHandle = setTimeout(() => abort.abort(), this.opts.runTimeoutMs);
+    let childTurnId;
+    try {
+      childTurnId = await this.opts.sessions.startTurn(run2.childSessionId, run2.task).catch(() => void 0);
+      await this.opts.sessions.append(run2.childSessionId, { role: "user", content: run2.task });
+      const childCtx = {
+        ...this.opts.childToolCtxFactory(),
+        subagentDepth: run2.depth
+      };
+      if (this.opts.worktrees) {
+        try {
+          const wt = await this.opts.worktrees.createForSubagent(run2.runId);
+          if (wt.isolated) {
+            childCtx.cwd = wt.path;
+          }
+        } catch {
+        }
+      }
+      await this.executeAgentLoop(run2, childRegistry, messages, childCtx, abort, childTurnId);
+    } catch (e) {
+      const isTimeout = abort.signal.aborted;
+      run2.status = isTimeout ? "timeout" : "error";
+      run2.error = e?.message ?? String(e);
+      if (childTurnId) {
+        await this.opts.sessions.interruptTurn(run2.childSessionId, childTurnId, run2.error).catch(() => void 0);
+      }
+    } finally {
+      clearTimeout(timeoutHandle);
+      run2.finishedAt = Date.now();
+      this.byParent.get(run2.parentSessionId)?.delete(run2.runId);
+      this.deliverAnnounce(run2);
+      if (this.opts.worktrees) {
+        this.opts.worktrees.remove(run2.runId, { keepBranch: true }).catch(() => void 0);
+      }
+    }
+  }
+  /** 执行子 Agent 的 runAgent 循环，收集事件 */
+  async executeAgentLoop(run2, registry, messages, childCtx, abort, childTurnId) {
+    let assistantBuf = "";
+    const resolvedLlm = typeof this.opts.llm === "function" ? this.opts.llm() : this.opts.llm;
+    const resolvedModel = typeof this.opts.defaultModel === "function" ? this.opts.defaultModel() : this.opts.defaultModel;
+    for await (const ev of runAgent({
+      llm: resolvedLlm,
+      registry,
+      messages,
+      toolCtx: childCtx,
+      signal: abort.signal,
+      maxSteps: 8,
+      model: resolvedModel
+    })) {
+      if (ev.type === "text" && ev.text) {
+        assistantBuf += ev.text;
+        if (childTurnId) {
+          this.opts.sessions.appendChunk(run2.childSessionId, childTurnId, ev.text).catch(() => void 0);
+        }
+        this.emit("child_text", { runId: run2.runId, text: ev.text });
+      }
+      if (ev.type === "tool_call" && ev.toolCall) {
+        this.emit("child_tool", { runId: run2.runId, tool: ev.toolCall.name });
+        if (childTurnId) {
+          this.opts.sessions.appendTool(run2.childSessionId, childTurnId, {
+            name: ev.toolCall.name,
+            args: ev.toolCall.arguments
+          }).catch(() => void 0);
+        }
+      }
+      if (ev.type === "tool_result") {
+        const preview = typeof ev.toolResult === "string" ? ev.toolResult.slice(0, 80).replace(/\n/g, " ") : "";
+        this.emit("child_tool_result", {
+          runId: run2.runId,
+          tool: ev.toolCall?.name ?? "unknown",
+          resultPreview: preview
+        });
+      }
+      if (ev.type === "error") {
+        throw new Error(ev.error ?? "subagent error");
+      }
+    }
+    const finalText = assistantBuf.trim();
+    run2.result = finalText;
+    run2.status = "completed";
+    if (childTurnId) {
+      await this.opts.sessions.endTurn(run2.childSessionId, childTurnId, finalText).catch(() => void 0);
+    }
+  }
+  /** 构建 system prompt */
+  buildSystemPrompt(run2, profile) {
+    const lines = [];
+    if (profile) {
+      lines.push(
+        `[Subagent Role: ${profile.name}]`,
+        profile.systemPrompt,
+        "",
+        `[Subagent Context]`,
+        `You are running as a subagent (depth ${run2.depth}/${this.opts.maxDepth}) with role "${profile.name}".`,
+        `Role description: ${profile.description}`,
+        'Your output will be auto-delivered to the requester as a single "[Subagent Completed]" message.'
+      );
+      if (profile.sandbox === "read_only") {
+        lines.push("", "[Sandbox: read_only]", "You CANNOT write files. Your job is to read, analyze, and report findings.");
+      }
+    } else {
+      lines.push(
+        "[Subagent Context]",
+        `You are running as a subagent (depth ${run2.depth}/${this.opts.maxDepth}).`,
+        'Your output will be auto-delivered to the requester as a single "[Subagent Completed]" message.'
+      );
+    }
+    lines.push(
+      "",
+      "[Rules]",
+      "- You CANNOT spawn further subagents (dispatch_subagent is disabled here).",
+      "- You CANNOT modify the parent plan (update_plan is disabled here).",
+      "- Be concise. Produce a final answer in 1 turn if possible; max 8 steps.",
+      "- Do not poll status of other agents. You have no visibility into siblings.",
+      "",
+      `[Subagent Task]: ${run2.task}`
+    );
+    return lines.join("\n");
+  }
+  /** 子 Agent 的 registry：拿全 builtin，然后剔除危险/不该有的；profile 可进一步裁剪 */
+  buildChildRegistry(profile) {
+    const r = new ToolRegistry();
+    registerBuiltinTools(r);
+    r.unregister("dispatch_subagent");
+    r.unregister("update_plan");
+    if (profile) {
+      if (profile.allowedTools && profile.allowedTools.length > 0) {
+        const allNames = r.list().map((t) => t.name);
+        for (const name of allNames) {
+          if (!profile.allowedTools.includes(name)) r.unregister(name);
+        }
+      } else if (profile.deniedTools && profile.deniedTools.length > 0) {
+        for (const name of profile.deniedTools) r.unregister(name);
+      }
+      if (profile.sandbox === "read_only") {
+        r.unregister("write_file");
+        r.unregister("edit_file");
+        r.unregister("run_command");
+      }
+    } else {
+      r.unregister("write_file");
+      r.unregister("edit_file");
+      r.unregister("run_command");
+    }
+    return r;
+  }
+  /** 把 run 结果构建 announce message 并放入父的 pending 队列 */
+  deliverAnnounce(run2) {
+    if (this.announced.has(run2.runId)) return;
+    this.announced.add(run2.runId);
+    const lines = [];
+    lines.push(`[Subagent Completed] runId=${run2.runId} label=${run2.label} outcome=${run2.status}`);
+    if (run2.status === "completed") {
+      lines.push("---");
+      lines.push(run2.result ?? "(empty)");
+    } else {
+      lines.push(`error: ${run2.error ?? "(unknown)"}`);
+    }
+    const msg = lines.join("\n");
+    if (!this.pendingAnnounceByParent.has(run2.parentSessionId)) {
+      this.pendingAnnounceByParent.set(run2.parentSessionId, []);
+    }
+    this.pendingAnnounceByParent.get(run2.parentSessionId).push(msg);
+    this.emit("announce", { run: run2 });
+  }
+};
+
+// ../../packages/server-core/src/agent/slash-commands.ts
+import { promises as fs20 } from "node:fs";
+import path22 from "node:path";
+var DIR2 = ".minicodeide/commands";
+var BUILTIN = [
+  {
+    name: "explain",
+    description: "Explain the given code, file, or concept in plain language.",
+    source: "builtin",
+    expand: (arg) => arg.trim() ? `Please explain the following in clear, structured terms, with examples and important caveats:
+
+${arg}` : "Please explain the current open file and what it does, step by step."
+  },
+  {
+    name: "test",
+    description: "Generate unit tests for the given target.",
+    source: "builtin",
+    expand: (arg) => `Generate thorough unit tests for: ${arg || "the current open file"}.
+
+Requirements:
+- Cover happy path + edge cases + error cases.
+- Use the testing framework already in use in this project (detect via package.json or existing tests).
+- Create new test file(s) via write_file, do NOT inline.
+`
+  },
+  {
+    name: "refactor",
+    description: "Refactor target code per stated goal, preserving behavior.",
+    source: "builtin",
+    expand: (arg) => `Refactor as instructed below. Preserve external behavior; add or update tests if any exist.
+
+Goal / target: ${arg || "(none specified \u2014 analyze the open file and propose a refactor first)"}
+Use edit_file or write_file for the changes.`
+  },
+  {
+    name: "docs",
+    description: "Add or improve documentation comments for the target.",
+    source: "builtin",
+    expand: (arg) => `Add or improve doc comments (TSDoc / JSDoc / docstrings) for: ${arg || "the current open file"}.
+- Don't change behavior.
+- Don't add trivial comments to obvious code.
+- Apply changes via edit_file.`
+  },
+  {
+    name: "fix",
+    description: "Diagnose and fix the given error.",
+    source: "builtin",
+    expand: (arg) => `Diagnose root cause and propose a fix for the following error:
+
+${arg || "(please paste the error message)"}
+
+Steps:
+1) Identify the file(s) involved.
+2) Read relevant code.
+3) Propose a fix via edit_file.
+4) Briefly explain why.`
+  },
+  {
+    name: "plan",
+    description: "Switch to Plan Mode and produce a structured 5-phase plan.",
+    source: "builtin",
+    expand: (arg) => `[Plan Mode requested]
+
+Goal: ${arg || "(no goal supplied \u2014 analyze the open file / current task and propose one)"}
+
+Follow Plan Mode protocol strictly:
+1. Initial Understanding \u2014 restate the goal, list assumptions, flag ambiguity.
+2. Design \u2014 at least 2 candidate approaches with trade-offs.
+3. Review \u2014 find the gaps and risks in your own design.
+4. Final Plan \u2014 concrete ordered steps with file paths.
+5. Approval \u2014 STOP and wait for the user. Do NOT execute.`
+  },
+  {
+    name: "mcp",
+    description: "List connected MCP servers and tools.",
+    source: "builtin",
+    expand: () => `List all connected MCP (Model Context Protocol) servers in this workspace.
+For each: name, command, status, and the tools it exposes (mcp__<server>__<tool>).
+If none: explain that the user can configure them in .minicodeide/mcp.json (see mcp.example.json).`
+  },
+  {
+    name: "cost",
+    description: "Report cumulative LLM cost / token usage for this session.",
+    source: "builtin",
+    expand: () => `Summarize this session's LLM usage:
+- input tokens / output tokens / cached tokens
+- estimated cost (use Anthropic / OpenAI public pricing as appropriate)
+- cache hit ratio and approximate savings
+Be concrete, no hedging.`
+  },
+  {
+    name: "compact",
+    description: "Manually trigger a soft-compact of the conversation history.",
+    source: "builtin",
+    expand: () => `[Manual compact requested]
+
+Produce a tight handoff summary of the conversation so far covering:
+- The user's overall goal
+- Decisions made
+- Files / functions touched
+- Outstanding TODOs (if any)
+Then continue from the current step.`
+  },
+  {
+    name: "remember",
+    description: "Explicitly save important information to long-term memory.",
+    source: "builtin",
+    expand: (arg) => arg.trim() ? `[REMEMBER REQUEST] The user explicitly asks you to remember the following information for future conversations:
+
+"${arg.trim()}"
+
+Call the \`upsert_memory\` tool (or equivalent) to save this to persistent memory. Classify it as: preference / project_knowledge / experience as appropriate. Confirm to the user once saved.` : `[REMEMBER REQUEST] The user wants to save the most important information from this conversation to memory.
+
+Review the conversation and identify 1\u20133 key facts worth remembering (preferences, decisions, project-specific knowledge). Save each one via \`upsert_memory\` and list what you saved.`
+  }
+];
+var SlashCommandRegistry = class {
+  constructor(cwd) {
+    this.cwd = cwd;
+    for (const c of BUILTIN) this.cmds.set(c.name, c);
+  }
+  cwd;
+  cmds = /* @__PURE__ */ new Map();
+  list() {
+    return [...this.cmds.values()];
+  }
+  get(name) {
+    return this.cmds.get(name);
+  }
+  async loadUser() {
+    const dir = path22.join(this.cwd, DIR2);
+    try {
+      await fs20.mkdir(dir, { recursive: true });
+      const files = await fs20.readdir(dir);
+      for (const f of files) {
+        if (!f.endsWith(".md")) continue;
+        try {
+          const raw = await fs20.readFile(path22.join(dir, f), "utf-8");
+          const cmd = parseUserCommand(f, raw);
+          this.cmds.set(cmd.name, cmd);
+        } catch (e) {
+          console.warn(`[slash] failed to load ${f}:`, e.message);
+        }
+      }
+    } catch {
+    }
+  }
+  /** 检查消息是否以 / 开头，是的话展开。返回 null 表示无需处理。 */
+  maybeExpand(message) {
+    if (!message.startsWith("/")) return null;
+    const m = /^\/(\w[\w-]*)\s*([\s\S]*)$/.exec(message);
+    if (!m) return null;
+    const [, name, arg] = m;
+    const cmd = this.cmds.get(name);
+    if (!cmd) return null;
+    return { command: name, expanded: cmd.expand(arg) };
+  }
+};
+function parseUserCommand(file, raw) {
+  let name = file.replace(/\.md$/, "");
+  let description = "";
+  let body = raw;
+  const fm = /^---\n([\s\S]*?)\n---\n?/m.exec(raw);
+  if (fm) {
+    body = raw.slice(fm[0].length);
+    for (const line of fm[1].split("\n")) {
+      const m = /^(\w+):\s*(.+)$/.exec(line.trim());
+      if (!m) continue;
+      const [, k, v] = m;
+      if (k === "name") name = v.trim();
+      else if (k === "description") description = v.trim();
+    }
+  }
+  const template = body.trim();
+  return {
+    name,
+    description: description || "(user command)",
+    source: "user",
+    expand: (arg) => template.replace(/\$ARG/g, arg.trim())
+  };
+}
+
+// ../../packages/server-core/src/utils/detect-hint.ts
+function detectMultiStepHint(userMessage) {
+  const patterns = [
+    /\b(all|every|each)\b.*\b(file|function|class|method)\b/i,
+    /(\d+[.)]\s+.+){2,}/,
+    // "1. xxx  2. xxx"
+    /\b(then|and then|after that|next)\b/i,
+    /先.{2,20}再.{2,20}/,
+    // 先…再…
+    /分别|并行|同时|批量|全部|所有/,
+    /parallel|simultaneously/i
+  ];
+  const isMultiStep = patterns.some((p) => p.test(userMessage));
+  const pathMatches = userMessage.match(/\b[\w\/.-]+\.\w{1,6}\b/g) ?? [];
+  const uniquePaths = new Set(pathMatches);
+  const hasMultiFile = uniquePaths.size >= 3;
+  if (!isMultiStep && !hasMultiFile) return null;
+  return "\n[context] This user message appears to involve multiple steps or files. IMPORTANT: Before executing, call `update_plan` to list all steps with status=pending, set the first step to in_progress, then execute. Update after each step. This improves transparency and prevents drift.";
+}
+
+// ../../packages/server-core/src/utils/glob-regex.ts
+function globToRegex2(glob) {
+  let out = "^";
+  let i = 0;
+  while (i < glob.length) {
+    const c = glob[i];
+    if (c === "*") {
+      if (glob[i + 1] === "*") {
+        out += ".*";
+        i += 2;
+      } else {
+        out += "[^/]*";
+        i++;
+      }
+    } else if (c === "?") {
+      out += ".";
+      i++;
+    } else if (c === "{") {
+      const end = glob.indexOf("}", i);
+      if (end < 0) {
+        out += "\\{";
+        i++;
+      } else {
+        const opts = glob.slice(i + 1, end).split(",").map((x) => x.replace(/[.+^$()|[\]\\]/g, "\\$&"));
+        out += "(?:" + opts.join("|") + ")";
+        i = end + 1;
+      }
+    } else if (/[.+^$()|[\]\\]/.test(c)) {
+      out += "\\" + c;
+      i++;
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  out += "$";
+  return new RegExp(out);
+}
+
+// ../../packages/server-core/src/utils/diagnostics.ts
+import { exec as exec2 } from "node:child_process";
+import path23 from "node:path";
+import { promises as fs21 } from "node:fs";
+var DIAG_TTL_MS = 3e4;
+function createDiagCache() {
+  return { ts: 0, running: false, result: [] };
+}
+async function runDiagnostics(workspace, cache) {
+  if (cache.running) return cache.result;
+  cache.running = true;
+  const t0 = Date.now();
+  try {
+    const hasPnpm = await fs21.access(path23.join(workspace, "pnpm-workspace.yaml")).then(() => true).catch(() => false);
+    const pkgJson = await fs21.readFile(path23.join(workspace, "package.json"), "utf-8").catch(() => "{}");
+    const scripts = JSON.parse(pkgJson).scripts ?? {};
+    let cmd;
+    if (hasPnpm && scripts.typecheck) cmd = "pnpm -r typecheck";
+    else if (scripts.typecheck) cmd = "npm run typecheck";
+    else cmd = "npx tsc --noEmit";
+    const result = await new Promise((resolve3) => {
+      const p = exec2(
+        cmd,
+        { cwd: workspace, maxBuffer: 8 * 1024 * 1024, timeout: 12e4 },
+        (_e, so, se) => resolve3({ out: (so ?? "") + "\n" + (se ?? "") })
+      );
+      p.on?.("error", () => void 0);
+    });
+    const diagnostics = [];
+    const tscRe = /(.+?)\((\d+),(\d+)\):\s*(error|warning)\s+(TS\d+):\s*(.+)/g;
+    for (const m of result.out.matchAll(tscRe)) {
+      let file = m[1];
+      if (path23.isAbsolute(file)) file = path23.relative(workspace, file);
+      diagnostics.push({
+        file,
+        line: Number(m[2]),
+        col: Number(m[3]),
+        severity: m[4],
+        message: m[6].slice(0, 300),
+        code: m[5]
+      });
+      if (diagnostics.length >= 200) break;
+    }
+    cache.ts = Date.now();
+    cache.running = false;
+    cache.result = diagnostics;
+    cache.durationMs = Date.now() - t0;
+    cache.lastError = void 0;
+  } catch (e) {
+    cache.ts = Date.now();
+    cache.running = false;
+    cache.result = [];
+    cache.lastError = e instanceof Error ? e.message : String(e);
+    cache.durationMs = Date.now() - t0;
+  }
+  return cache.result;
+}
+
+// ../../packages/server-core/src/utils/mentions.ts
+import { promises as fs22 } from "node:fs";
+import path24 from "node:path";
+var MENTION_REGEX = /@(file|symbol|selection|docs|web):([^\s]+)/g;
+var MAX_FILE_LINES = 400;
+async function parseMentions(text, ctx) {
+  const items = [];
+  const unresolved = [];
+  const matches = [];
+  for (const m of text.matchAll(MENTION_REGEX)) {
+    matches.push({ kind: m[1], arg: m[2], raw: m[0] });
+  }
+  for (const { kind, arg, raw } of matches) {
+    try {
+      switch (kind) {
+        case "file":
+        case "selection": {
+          const m = arg.match(/^(.+?)(?::(\d+)-(\d+))?$/);
+          if (!m) {
+            unresolved.push({ kind, arg, reason: "invalid syntax" });
+            break;
+          }
+          const rel = m[1];
+          const startLine = m[2] ? Number(m[2]) : void 0;
+          const endLine = m[3] ? Number(m[3]) : void 0;
+          const item = await resolveFile(ctx.workspace, rel, startLine, endLine);
+          if (item) items.push(item);
+          else unresolved.push({ kind, arg, reason: "file not found" });
+          break;
+        }
+        case "symbol": {
+          if (!ctx.index) {
+            unresolved.push({ kind, arg, reason: "index not ready" });
+            break;
+          }
+          const found = ctx.index.symbols.fuzzyFind(arg, 1);
+          if (!found.length) {
+            unresolved.push({ kind, arg, reason: "symbol not found" });
+            break;
+          }
+          const sym = found[0];
+          const item = await resolveFile(
+            ctx.workspace,
+            sym.path,
+            Math.max(1, sym.startLine - 2),
+            sym.endLine + 30
+          );
+          if (item) {
+            item.type = "symbol";
+            item.label = `${sym.name} (${sym.kind})`;
+            items.push(item);
+          } else {
+            unresolved.push({ kind, arg, reason: "cannot read symbol file" });
+          }
+          break;
+        }
+        case "docs": {
+          const candidates = [`docs/${arg}.md`, `${arg}.md`];
+          let found = null;
+          for (const rel of candidates) {
+            const item = await resolveFile(ctx.workspace, rel);
+            if (item) {
+              found = item;
+              break;
+            }
+          }
+          if (found) items.push(found);
+          else unresolved.push({ kind, arg, reason: "doc not found" });
+          break;
+        }
+        case "web": {
+          unresolved.push({ kind, arg, reason: "web search not enabled" });
+          break;
+        }
+        default:
+          unresolved.push({ kind, arg, reason: `unknown mention kind: ${kind}` });
+      }
+    } catch (e) {
+      unresolved.push({ kind, arg, reason: e?.message ?? String(e) });
+    }
+  }
+  const cleanText = text.replace(MENTION_REGEX, " ").replace(/\s+/g, " ").trim();
+  return { cleanText, items, unresolved };
+}
+async function resolveFile(workspace, rel, startLine, endLine) {
+  const safeRel = rel.replace(/^\/+/, "").replace(/\.\.\//g, "");
+  const abs = path24.join(workspace, safeRel);
+  let raw;
+  try {
+    raw = await fs22.readFile(abs, "utf-8");
+  } catch {
+    return null;
+  }
+  const lines = raw.split("\n");
+  const total = lines.length;
+  let start = startLine ?? 1;
+  let end = endLine ?? Math.min(total, MAX_FILE_LINES);
+  if (!startLine && total > MAX_FILE_LINES) {
+    end = MAX_FILE_LINES;
+  }
+  start = Math.max(1, start);
+  end = Math.min(total, end);
+  const slice = lines.slice(start - 1, end).join("\n");
+  const label = startLine && endLine ? `${safeRel}:${startLine}-${endLine}` : safeRel;
+  return {
+    type: "file",
+    label,
+    content: slice + (end < total && !endLine ? `
+... (truncated, total ${total} lines)` : "")
+  };
+}
+
+// ../../packages/server-core/src/utils/logger.ts
+var LEVEL_ORDER = { debug: 10, info: 20, warn: 30, error: 40 };
+var cfgLevel = process.env.MINI_LOG_LEVEL in LEVEL_ORDER ? process.env.MINI_LOG_LEVEL : "info";
+var useJson = process.env.MINI_LOG_FORMAT === "json";
+function emit(level, msg, fields) {
+  if (LEVEL_ORDER[level] < LEVEL_ORDER[cfgLevel]) return;
+  const ts = (/* @__PURE__ */ new Date()).toISOString();
+  if (useJson) {
+    const record = { ts, level, msg, ...fields };
+    (level === "error" ? console.error : console.log)(JSON.stringify(record));
+  } else {
+    const fieldStr = fields && Object.keys(fields).length ? " " + Object.entries(fields).map(([k, v]) => `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`).join(" ") : "";
+    (level === "error" ? console.error : console.log)(
+      `${ts} [${level.toUpperCase()}] ${msg}${fieldStr}`
+    );
+  }
+}
+var logger = {
+  debug: (msg, fields) => emit("debug", msg, fields),
+  info: (msg, fields) => emit("info", msg, fields),
+  warn: (msg, fields) => emit("warn", msg, fields),
+  error: (msg, fields) => emit("error", msg, fields)
+};
+
+// ../../packages/server-core/src/agent/system-hooks.ts
+var HookMetrics = class {
+  metrics = /* @__PURE__ */ new Map();
+  record(toolName, ok, durationMs, errorMsg) {
+    const m = this.metrics.get(toolName) ?? { count: 0, errors: 0, totalMs: 0 };
+    m.count++;
+    m.totalMs += durationMs;
+    if (!ok) {
+      m.errors++;
+      m.lastErrorAt = Date.now();
+      m.lastErrorMsg = errorMsg?.slice(0, 200);
+    }
+    this.metrics.set(toolName, m);
+  }
+  snapshot() {
+    const out = {};
+    for (const [k, v] of this.metrics) {
+      out[k] = {
+        ...v,
+        avgMs: v.count ? Math.round(v.totalMs / v.count) : 0,
+        errorRate: v.count ? +(v.errors / v.count).toFixed(3) : 0
+      };
+    }
+    return out;
+  }
+  reset() {
+    this.metrics.clear();
+  }
+};
+function createSystemHookBus(deps = {}) {
+  const bus = new HookBus();
+  const metrics2 = new HookMetrics();
+  const logTools = deps.logTools !== false;
+  bus.on("PostToolUse", "system:metrics", (p) => {
+    metrics2.record(p.call.name, p.ok, p.durationMs, p.error);
+    if (logTools) {
+      const tag = p.ok ? "ok" : "err";
+      logger.info(`[tool] ${p.call.name} ${tag} ${p.durationMs}ms`);
+    }
+  });
+  if (deps.checkpoints) {
+    bus.on("PostToolUse", "system:auto-checkpoint-mark", (p) => {
+      if (!p.ok) return;
+      if (p.call.name === "write_file" || p.call.name === "edit_file") {
+        const target = p.call.arguments?.path;
+        if (target) {
+          logger.info(`[hook] post-write ${target} (tool=${p.call.name})`);
+        }
+      }
+    });
+  }
+  bus.on("UserPromptSubmit", "system:safety-hint", (p) => {
+    const t = (p.userText ?? "").toLowerCase();
+    if (/\brm\s+-rf\s+\//.test(t) || /\bsudo\b/.test(t)) {
+      return {
+        injectSystem: "[safety-hint] User mentioned a destructive shell command. Never run it via run_command without explicit user approval, and prefer dry-run or git-based alternatives."
+      };
+    }
+  });
+  return { bus, metrics: metrics2 };
+}
+
+// ../../packages/server-core/src/tasks/bg-tasks.ts
+import { spawn } from "node:child_process";
+import * as fs23 from "node:fs";
+import * as path25 from "node:path";
+import { EventEmitter as EventEmitter3 } from "node:events";
+var BackgroundTaskManager = class extends EventEmitter3 {
+  tasks = /* @__PURE__ */ new Map();
+  procs = /* @__PURE__ */ new Map();
+  cacheDir;
+  counter = 0;
+  maxConcurrent;
+  maxBuffer;
+  constructor(opts) {
+    super();
+    this.cacheDir = path25.join(opts.workspace, ".minicodeide", "bg-tasks");
+    this.maxConcurrent = opts.maxConcurrent ?? 5;
+    this.maxBuffer = opts.maxBufferBytes ?? 256 * 1024;
+    try {
+      fs23.mkdirSync(this.cacheDir, { recursive: true });
+    } catch {
+    }
+  }
+  list() {
+    return [...this.tasks.values()].sort((a, b) => b.startedAt - a.startedAt);
+  }
+  get(id) {
+    return this.tasks.get(id);
+  }
+  /** 启动一个后台命令；立即返回 task 元数据 */
+  start(command, cwd) {
+    const running = [...this.tasks.values()].filter((t) => t.status === "running").length;
+    if (running >= this.maxConcurrent) {
+      throw new Error(
+        `Too many concurrent background tasks (${running}/${this.maxConcurrent}). Wait for some to finish or call cancel_background.`
+      );
+    }
+    this.counter++;
+    const id = `bg_${Date.now().toString(36)}_${this.counter}`;
+    const task = {
+      id,
+      command,
+      cwd,
+      status: "running",
+      startedAt: Date.now(),
+      stdout: "",
+      stderr: "",
+      notified: false
+    };
+    this.tasks.set(id, task);
+    const proc = spawn("sh", ["-c", command], { cwd, detached: false });
+    this.procs.set(id, proc);
+    proc.stdout?.on("data", (chunk) => {
+      task.stdout = appendCapped(task.stdout, chunk.toString("utf8"), this.maxBuffer);
+    });
+    proc.stderr?.on("data", (chunk) => {
+      task.stderr = appendCapped(task.stderr, chunk.toString("utf8"), this.maxBuffer);
+    });
+    proc.on("error", (err) => {
+      task.status = "failed";
+      task.finishedAt = Date.now();
+      task.stderr = appendCapped(task.stderr, `
+[spawn-error] ${err.message}`, this.maxBuffer);
+      this.persist(task);
+      this.emit("task_complete", task);
+    });
+    proc.on("exit", (code, signal) => {
+      task.exitCode = code;
+      task.finishedAt = Date.now();
+      if (task.status === "cancelled") {
+      } else if (signal) {
+        task.status = "failed";
+        task.stderr = appendCapped(task.stderr, `
+[exit-signal] ${signal}`, this.maxBuffer);
+      } else {
+        task.status = code === 0 ? "completed" : "failed";
+      }
+      this.persist(task);
+      this.procs.delete(id);
+      this.emit("task_complete", task);
+    });
+    this.persist(task);
+    return task;
+  }
+  /** 取消一个运行中的后台任务 */
+  cancel(id) {
+    const task = this.tasks.get(id);
+    if (!task || task.status !== "running") return false;
+    const proc = this.procs.get(id);
+    if (proc) {
+      task.status = "cancelled";
+      try {
+        proc.kill("SIGTERM");
+        setTimeout(() => {
+          try {
+            proc.kill("SIGKILL");
+          } catch {
+          }
+        }, 3e3).unref?.();
+      } catch {
+      }
+    }
+    return true;
+  }
+  /** 取出所有 just-finished 且未通知过的任务（用于主 loop 注入） */
+  drainPendingNotifications() {
+    const out = [];
+    for (const t of this.tasks.values()) {
+      if (t.status !== "running" && !t.notified) {
+        t.notified = true;
+        out.push(t);
+      }
+    }
+    return out;
+  }
+  persist(task) {
+    try {
+      fs23.writeFileSync(
+        path25.join(this.cacheDir, `${task.id}.json`),
+        JSON.stringify(task, null, 2),
+        "utf8"
+      );
+    } catch {
+    }
+  }
+};
+function appendCapped(prev, add, cap) {
+  const next = prev + add;
+  if (next.length <= cap) return next;
+  return "[...truncated...]" + next.slice(next.length - cap + 20);
+}
+
+// ../../packages/server-core/src/tasks/verify-after-accept.ts
+import { exec as exec3 } from "node:child_process";
+import { promises as fs24 } from "node:fs";
+import path26 from "node:path";
+var VerifyAfterAcceptStore = class {
+  constructor(cwd) {
+    this.cwd = cwd;
+  }
+  cwd;
+  queue = [];
+  /** 防抖：同一个 package 上多次连续 accept，只跑最后一次 */
+  inflight = /* @__PURE__ */ new Map();
+  /** 用户 Accept 一批 edits 后调用。非阻塞：异步跑，结果进队列。 */
+  trigger(filePaths) {
+    const tsFiles = filePaths.filter((p) => /\.(ts|tsx|mts|cts)$/.test(p));
+    if (tsFiles.length === 0) return;
+    void this.runAsync(tsFiles).catch(() => {
+    });
+  }
+  async runAsync(tsFiles) {
+    const pkgDir = await this.findNearestTsconfigDir(tsFiles[0]);
+    const key = pkgDir ?? this.cwd;
+    if (this.inflight.has(key)) return;
+    const task = (async () => {
+      const cwd = pkgDir ? path26.resolve(this.cwd, pkgDir) : this.cwd;
+      const command = "npx tsc --noEmit";
+      const result = await execLimited(command, cwd, 6e4);
+      const output = result.stdout.slice(0, 2e3) + (result.stderr ? "\n[stderr]\n" + result.stderr.slice(0, 2e3) : "");
+      this.queue.push({
+        files: tsFiles,
+        ok: result.code === 0,
+        command: pkgDir ? `(cd ${pkgDir}) ${command}` : command,
+        output: output.trim(),
+        at: Date.now()
+      });
+    })().finally(() => this.inflight.delete(key));
+    this.inflight.set(key, task);
+  }
+  async findNearestTsconfigDir(relFile) {
+    let dir = path26.dirname(path26.resolve(this.cwd, relFile));
+    const root = path26.resolve(this.cwd);
+    while (true) {
+      try {
+        await fs24.access(path26.join(dir, "tsconfig.json"));
+        const rel = path26.relative(root, dir);
+        return rel || ".";
+      } catch {
+      }
+      const parent = path26.dirname(dir);
+      if (parent === dir || !dir.startsWith(root)) return null;
+      dir = parent;
+    }
+  }
+  /**
+   * 让 buildMessages 在装配 systemExtras 时调用：
+   * 一次性消费已积累的 verify 结果，渲染成 system 段落塞进去。
+   */
+  consumeForSystem() {
+    if (this.queue.length === 0) return "";
+    const records = this.queue.splice(0);
+    const lines = [];
+    lines.push("## Auto-Verification Results (post-accept)");
+    lines.push(
+      "The user just accepted edits to the files below. The system **automatically** ran a typecheck. Review:"
+    );
+    for (const r of records) {
+      lines.push("");
+      lines.push(`### ${r.ok ? "PASS" : "FAIL"} \u2014 ${r.command}`);
+      lines.push(`Files: ${r.files.map((f) => `\`${f}\``).join(", ")}`);
+      if (!r.ok) {
+        lines.push("```");
+        lines.push(r.output);
+        lines.push("```");
+        lines.push(
+          "IMPORTANT: The accepted edits introduced or surfaced typecheck errors. Fix them in your next response \u2014 read the affected files, identify the root cause, and propose corrected edits. Do NOT claim the task done."
+        );
+      } else {
+        lines.push("Typecheck passed. You may proceed.");
+      }
+    }
+    return lines.join("\n");
+  }
+  /** debug API */
+  peek() {
+    return [...this.queue];
+  }
+};
+function execLimited(cmd, cwd, timeoutMs) {
+  return new Promise((resolve3) => {
+    exec3(
+      cmd,
+      { cwd, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        const code = err && typeof err.code === "number" ? err.code : err ? 1 : 0;
+        resolve3({ stdout: stdout || "", stderr: stderr || (err ? String(err.message) : ""), code });
+      }
+    );
+  });
+}
+
+// ../../packages/server-core/src/tasks/worktree-manager.ts
+import * as path27 from "node:path";
+import * as fs25 from "node:fs";
+import { execFile as execFile3 } from "node:child_process";
+import { promisify as promisify4 } from "node:util";
+var pExec = promisify4(execFile3);
+var VALID_NAME = /^[A-Za-z0-9._-]{1,64}$/;
+var WorktreeManager = class {
+  constructor(workspace) {
+    this.workspace = workspace;
+    this.rootDir = path27.join(workspace, ".minicodeide", "worktrees");
+  }
+  workspace;
+  rootDir;
+  active = /* @__PURE__ */ new Map();
+  gitAvailable = null;
+  async isGitRepo() {
+    if (this.gitAvailable !== null) return this.gitAvailable;
+    try {
+      await pExec("git", ["rev-parse", "--is-inside-work-tree"], { cwd: this.workspace });
+      this.gitAvailable = true;
+    } catch {
+      this.gitAvailable = false;
+    }
+    return this.gitAvailable;
+  }
+  /**
+   * 给一个 subagent 任务创建一个独立 worktree。
+   * 返回 path：subagent 应该在这个目录下工作。
+   * 如果 git 不可用 → 返回主 workspace（不隔离，但不报错）。
+   */
+  async createForSubagent(taskId) {
+    if (!await this.isGitRepo()) {
+      return { path: this.workspace, isolated: false };
+    }
+    const name = sanitizeName(taskId);
+    const wtPath = path27.join(this.rootDir, name);
+    if (this.active.has(taskId)) {
+      const info = this.active.get(taskId);
+      return { path: info.path, isolated: true, info };
+    }
+    if (fs25.existsSync(wtPath)) {
+      const info = {
+        taskId,
+        worktreeName: name,
+        path: wtPath,
+        branch: `wt/${name}`,
+        createdAt: Date.now()
+      };
+      this.active.set(taskId, info);
+      return { path: wtPath, isolated: true, info };
+    }
+    try {
+      fs25.mkdirSync(this.rootDir, { recursive: true });
+      await pExec(
+        "git",
+        ["worktree", "add", wtPath, "-b", `wt/${name}`, "HEAD"],
+        { cwd: this.workspace }
+      );
+      const info = {
+        taskId,
+        worktreeName: name,
+        path: wtPath,
+        branch: `wt/${name}`,
+        createdAt: Date.now()
+      };
+      this.active.set(taskId, info);
+      return { path: wtPath, isolated: true, info };
+    } catch (e) {
+      return { path: this.workspace, isolated: false };
+    }
+  }
+  getPath(taskId) {
+    return this.active.get(taskId)?.path;
+  }
+  async remove(taskId, opts = {}) {
+    const info = this.active.get(taskId);
+    if (!info) return false;
+    try {
+      await pExec("git", ["worktree", "remove", info.path, "--force"], { cwd: this.workspace });
+      if (!opts.keepBranch) {
+        try {
+          await pExec("git", ["branch", "-D", info.branch], { cwd: this.workspace });
+        } catch {
+        }
+      }
+      this.active.delete(taskId);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  list() {
+    return [...this.active.values()];
+  }
+};
+function sanitizeName(raw) {
+  const cleaned = raw.replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 60);
+  if (!cleaned) return `task-${Date.now().toString(36)}`;
+  if (!VALID_NAME.test(cleaned)) return `task-${Date.now().toString(36)}`;
+  return cleaned;
+}
+
+// ../../packages/server-core/src/bridge/mcp-client.ts
+import { spawn as spawn2 } from "node:child_process";
+import * as fs26 from "node:fs";
+import * as path28 from "node:path";
+var DEFAULT_ALLOWLIST = {
+  allowedCommands: ["npx", "uvx", "node", "python3", "python", "bunx", "pnpm", "docker"],
+  denyArgs: ["--allow-shell", "--unsafe", "--rm-rf"]
+};
+function loadAllowlist(workspace) {
+  const f = path28.join(workspace, ".minicodeide", "mcp-allowlist.json");
+  if (!fs26.existsSync(f)) return DEFAULT_ALLOWLIST;
+  try {
+    const raw = JSON.parse(fs26.readFileSync(f, "utf8"));
+    return {
+      allowedCommands: raw.allowedCommands ?? DEFAULT_ALLOWLIST.allowedCommands,
+      denyArgs: raw.denyArgs ?? DEFAULT_ALLOWLIST.denyArgs
+    };
+  } catch {
+    return DEFAULT_ALLOWLIST;
+  }
+}
+function validateServerAgainstAllowlist(cfg, allow) {
+  const base = path28.basename(cfg.command).toLowerCase();
+  if (!allow.allowedCommands.map((c) => c.toLowerCase()).includes(base)) {
+    return `command "${cfg.command}" not in allowedCommands. Add it to .minicodeide/mcp-allowlist.json`;
+  }
+  const argsLower = (cfg.args ?? []).map((a) => String(a).toLowerCase());
+  for (const deny of allow.denyArgs ?? []) {
+    const dl = deny.toLowerCase();
+    if (argsLower.some((a) => a.includes(dl))) {
+      return `args contain forbidden token "${deny}"`;
+    }
+  }
+  return null;
+}
+var McpClient = class {
+  constructor(name, config) {
+    this.name = name;
+    this.config = config;
+  }
+  name;
+  config;
+  proc = null;
+  nextId = 1;
+  pending = /* @__PURE__ */ new Map();
+  buf = "";
+  readyPromise = null;
+  tools = [];
+  connected = false;
+  /** P2 修复：自动重连状态 */
+  reconnectAttempts = 0;
+  MAX_RECONNECT = 3;
+  reconnectTimer = null;
+  /** 重连成功/失败回调（McpManager 用于更新工具注册和通知前端） */
+  onReconnect;
+  async connect() {
+    if (this.readyPromise) return this.readyPromise;
+    this.readyPromise = (async () => {
+      const proc = spawn2(this.config.command, this.config.args ?? [], {
+        env: { ...process.env, ...this.config.env ?? {} },
+        stdio: ["pipe", "pipe", "pipe"]
+      });
+      this.proc = proc;
+      proc.stdout.setEncoding("utf8");
+      proc.stdout.on("data", (chunk) => this.onStdout(chunk));
+      proc.stderr.on("data", (c) => {
+      });
+      proc.on("exit", (code) => {
+        this.connected = false;
+        for (const [, p] of this.pending) {
+          p.reject(new Error(`MCP server "${this.name}" exited (code=${code})`));
+        }
+        this.pending.clear();
+        if (code !== 0 && this.reconnectAttempts < this.MAX_RECONNECT) {
+          this.scheduleReconnect();
+        }
+      });
+      proc.on("error", (e) => {
+        for (const [, p] of this.pending) p.reject(e);
+        this.pending.clear();
+      });
+      await this.request("initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "minicodeide", version: "0.1" }
+      });
+      this.notify("notifications/initialized", {});
+      const r = await this.request("tools/list", {});
+      this.tools = r?.tools ?? [];
+      if (this.config.disabledTools?.length) {
+        const disabled = new Set(this.config.disabledTools);
+        this.tools = this.tools.filter((t) => !disabled.has(t.name));
+      }
+      this.connected = true;
+      this.reconnectAttempts = 0;
+    })();
+    return this.readyPromise;
+  }
+  async callTool(name, args) {
+    if (!this.connected) await this.connect();
+    const r = await this.request("tools/call", { name, arguments: args ?? {} });
+    return r;
+  }
+  async close() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.reconnectAttempts = this.MAX_RECONNECT;
+    if (this.proc) {
+      try {
+        this.proc.kill("SIGTERM");
+      } catch {
+      }
+      this.proc = null;
+    }
+    this.connected = false;
+  }
+  /**
+   * P2 修复：指数退避自动重连。
+   * 延迟 = 1s * 2^attempt（1s → 2s → 4s），最多 MAX_RECONNECT 次。
+   */
+  scheduleReconnect() {
+    const attempt = this.reconnectAttempts + 1;
+    const delay = 1e3 * Math.pow(2, attempt - 1);
+    console.log(`[mcp:${this.name}] Scheduling reconnect attempt ${attempt}/${this.MAX_RECONNECT} in ${delay}ms`);
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectAttempts = attempt;
+      this.readyPromise = null;
+      try {
+        await this.connect();
+        console.log(`[mcp:${this.name}] Reconnected successfully (attempt ${attempt})`);
+        this.onReconnect?.(true, attempt);
+      } catch (e) {
+        console.warn(`[mcp:${this.name}] Reconnect failed (attempt ${attempt}): ${e?.message ?? e}`);
+        this.onReconnect?.(false, attempt, e?.message ?? String(e));
+      }
+    }, delay);
+  }
+  request(method, params) {
+    const id = this.nextId++;
+    const req = { jsonrpc: "2.0", id, method, params };
+    return new Promise((resolve3, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`MCP request "${method}" timeout (30s)`));
+      }, 3e4);
+      this.pending.set(id, {
+        resolve: (v) => {
+          clearTimeout(timer);
+          resolve3(v);
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        }
+      });
+      this.proc.stdin.write(JSON.stringify(req) + "\n");
+    });
+  }
+  notify(method, params) {
+    const req = { jsonrpc: "2.0", method, params };
+    try {
+      this.proc.stdin.write(JSON.stringify(req) + "\n");
+    } catch {
+    }
+  }
+  onStdout(chunk) {
+    this.buf += chunk;
+    let nl;
+    while ((nl = this.buf.indexOf("\n")) >= 0) {
+      const line = this.buf.slice(0, nl).trim();
+      this.buf = this.buf.slice(nl + 1);
+      if (!line) continue;
+      try {
+        const msg = JSON.parse(line);
+        if (typeof msg.id === "number" && this.pending.has(msg.id)) {
+          const p = this.pending.get(msg.id);
+          this.pending.delete(msg.id);
+          if (msg.error) p.reject(new Error(`${msg.error.code}: ${msg.error.message}`));
+          else p.resolve(msg.result);
+        }
+      } catch {
+      }
+    }
+  }
+};
+var McpManager = class {
+  constructor(workspace) {
+    this.workspace = workspace;
+  }
+  workspace;
+  clients = /* @__PURE__ */ new Map();
+  async loadAndConnect() {
+    const cfgPath = path28.join(this.workspace, ".minicodeide", "mcp.json");
+    if (!fs26.existsSync(cfgPath)) return [];
+    let cfg;
+    try {
+      cfg = JSON.parse(fs26.readFileSync(cfgPath, "utf8"));
+    } catch (e) {
+      return [{ name: "<config>", ok: false, error: `mcp.json parse error: ${e?.message ?? e}` }];
+    }
+    const allow = loadAllowlist(this.workspace);
+    const out = [];
+    for (const [name, sc] of Object.entries(cfg.servers ?? {})) {
+      const reject = validateServerAgainstAllowlist(sc, allow);
+      if (reject) {
+        out.push({ name, ok: false, error: `denied by allowlist: ${reject}` });
+        continue;
+      }
+      const client = new McpClient(name, sc);
+      try {
+        await client.connect();
+        this.clients.set(name, client);
+        out.push({ name, ok: true, toolCount: client.tools.length });
+      } catch (e) {
+        out.push({ name, ok: false, error: e?.message ?? String(e) });
+      }
+    }
+    return out;
+  }
+  list() {
+    return [...this.clients.values()];
+  }
+  get(name) {
+    return this.clients.get(name);
+  }
+  async closeAll() {
+    for (const c of this.clients.values()) await c.close();
+    this.clients.clear();
+  }
+  /**
+   * 把所有已连接的 MCP tools 注册到 ToolRegistry。
+   * 命名：mcp__<server>__<tool>
+   *
+   * 修复（P1）：将 MCP inputSchema（JSON Schema）转换为 zod schema，
+   * 使 LLM 能通过 tool parameters 字段获得结构化的参数信息，
+   * 而非之前的 z.record(z.string(), z.any()) 万能占位。
+   */
+  registerToolsTo(registry) {
+    for (const client of this.clients.values()) {
+      for (const tool of client.tools) {
+        const fqName = `mcp__${client.name}__${tool.name}`;
+        const desc = (tool.description ?? "").slice(0, 1e3) || `MCP tool ${tool.name} from "${client.name}".`;
+        let zodSchema;
+        try {
+          zodSchema = tool.inputSchema ? jsonSchemaToZod(tool.inputSchema) : external_exports.record(external_exports.string(), external_exports.any());
+        } catch {
+          zodSchema = external_exports.record(external_exports.string(), external_exports.any());
+        }
+        const t = {
+          name: fqName,
+          description: `[MCP:${client.name}] ${desc}`.slice(0, 4e3),
+          schema: zodSchema,
+          parallelSafe: false,
+          // 保守：未知副作用 → 串行
+          async execute(input) {
+            const r = await client.callTool(tool.name, input);
+            if (r?.content && Array.isArray(r.content)) {
+              const text = r.content.map((c) => {
+                if (c?.type === "text") return c.text;
+                if (c?.type === "image") return `[image ${c.mimeType}]`;
+                if (c?.type === "resource") return `[resource ${c.resource?.uri}]`;
+                return JSON.stringify(c);
+              }).join("\n");
+              return { ok: !r.isError, content: text, raw: r };
+            }
+            return r;
+          }
+        };
+        registry.register(t);
+      }
+    }
+  }
+};
+function jsonSchemaToZod(schema) {
+  if (!schema || typeof schema !== "object") return external_exports.any();
+  const type = schema.type;
+  if (schema.anyOf || schema.oneOf) {
+    const variants = schema.anyOf || schema.oneOf;
+    if (variants.length === 1) return jsonSchemaToZod(variants[0]);
+    if (variants.length === 2 && variants.some((v) => v.type === "null")) {
+      const nonNull = variants.find((v) => v.type !== "null");
+      if (nonNull) return jsonSchemaToZod(nonNull).nullable();
+    }
+    return external_exports.any();
+  }
+  if (schema.enum) {
+    const values = schema.enum.filter((v) => v !== null);
+    if (values.length > 0 && values.every((v) => typeof v === "string")) {
+      const [first, ...rest] = values;
+      let zodEnum = external_exports.enum([first, ...rest]);
+      if (schema.enum.includes(null)) zodEnum = zodEnum.nullable();
+      return zodEnum;
+    }
+    return external_exports.any();
+  }
+  switch (type) {
+    case "object": {
+      const properties = schema.properties ?? {};
+      const required = new Set(schema.required ?? []);
+      const shape = {};
+      for (const [key, propSchema] of Object.entries(properties)) {
+        let fieldSchema = jsonSchemaToZod(propSchema);
+        if (propSchema?.description) {
+          fieldSchema = fieldSchema.describe(propSchema.description);
+        }
+        if (!required.has(key)) {
+          shape[key] = fieldSchema.optional();
+        } else {
+          shape[key] = fieldSchema;
+        }
+      }
+      let obj = external_exports.object(shape);
+      if (schema.additionalProperties === false) {
+        obj = obj.strict();
+      }
+      if (Object.keys(properties).length === 0 && schema.additionalProperties && typeof schema.additionalProperties === "object") {
+        return external_exports.record(external_exports.string(), jsonSchemaToZod(schema.additionalProperties));
+      }
+      return obj;
+    }
+    case "array": {
+      if (schema.items) {
+        return external_exports.array(jsonSchemaToZod(schema.items));
+      }
+      return external_exports.array(external_exports.any());
+    }
+    case "string":
+      return external_exports.string();
+    case "number":
+    case "integer":
+      return external_exports.number();
+    case "boolean":
+      return external_exports.boolean();
+    case "null":
+      return external_exports.null();
+    default:
+      return external_exports.any();
+  }
+}
+
+// ../../packages/server-core/src/bridge/lsp-bridge.ts
+import { spawn as spawn3 } from "node:child_process";
+
+// ../../node_modules/.pnpm/ws@8.21.0/node_modules/ws/wrapper.mjs
+var import_stream = __toESM(require_stream(), 1);
+var import_extension = __toESM(require_extension(), 1);
+var import_permessage_deflate = __toESM(require_permessage_deflate(), 1);
+var import_receiver = __toESM(require_receiver(), 1);
+var import_sender = __toESM(require_sender(), 1);
+var import_subprotocol = __toESM(require_subprotocol(), 1);
+var import_websocket = __toESM(require_websocket(), 1);
+var import_websocket_server = __toESM(require_websocket_server(), 1);
+
+// ../../packages/server-core/src/bridge/lsp-bridge.ts
+function attachLspBridge(httpServer, opts) {
+  const path32 = opts.path ?? "/lsp";
+  const wss = new import_websocket_server.default({ noServer: true });
+  httpServer.on("upgrade", (req, socket, head) => {
+    const url = req.url ?? "";
+    if (!url.startsWith(path32)) return;
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      const lang = url.slice(path32.length).replace(/^\//, "") || "ts";
+      handleConnection(ws, lang, opts.cwd);
+    });
+  });
+  console.log(`[lsp] bridge ready on ws://host${path32}/<lang>`);
+}
+function handleConnection(ws, lang, cwd) {
+  let child = null;
+  try {
+    child = spawnLsp(lang, cwd);
+  } catch (e) {
+    console.error("[lsp] spawn failed", e);
+    ws.close(1011, `LSP for ${lang} not available`);
+    return;
+  }
+  child.on("error", (err) => {
+    console.warn(`[lsp] ${lang} child error: ${err.message}. Hint: npm i -g typescript typescript-language-server`);
+    try {
+      ws.close(1011, "LSP backend not installed");
+    } catch {
+    }
+  });
+  console.log(`[lsp] ws connected for ${lang} (pid=${child.pid})`);
+  ws.on("message", (data) => {
+    if (!child || !child.stdin.writable) return;
+    const text = typeof data === "string" ? data : data.toString("utf-8");
+    const payload = `Content-Length: ${Buffer.byteLength(text, "utf8")}\r
+\r
+${text}`;
+    try {
+      child.stdin.write(payload);
+    } catch {
+    }
+  });
+  let buf = Buffer.alloc(0);
+  child.stdout.on("data", (chunk) => {
+    buf = Buffer.concat([buf, chunk]);
+    while (true) {
+      const headerEnd = buf.indexOf("\r\n\r\n");
+      if (headerEnd === -1) return;
+      const header = buf.slice(0, headerEnd).toString("utf8");
+      const m = /Content-Length: (\d+)/i.exec(header);
+      if (!m) {
+        buf = buf.slice(headerEnd + 4);
+        continue;
+      }
+      const len = Number(m[1]);
+      const total = headerEnd + 4 + len;
+      if (buf.length < total) return;
+      const body = buf.slice(headerEnd + 4, total).toString("utf8");
+      buf = buf.slice(total);
+      try {
+        ws.send(body);
+      } catch {
+      }
+    }
+  });
+  child.stderr.on("data", (c) => {
+    process.stderr.write(`[lsp/${lang}] ${c}`);
+  });
+  child.on("exit", (code) => {
+    console.log(`[lsp] ${lang} child exited code=${code}`);
+    try {
+      ws.close();
+    } catch {
+    }
+  });
+  ws.on("close", () => {
+    console.log(`[lsp] ws closed for ${lang}`);
+    child?.kill();
+  });
+  ws.on("error", () => child?.kill());
+}
+function spawnLsp(lang, cwd) {
+  switch (lang) {
+    case "ts":
+    case "tsx":
+    case "js":
+    case "jsx":
+    case "typescript":
+    case "javascript":
+      return spawn3("typescript-language-server", ["--stdio"], { cwd });
+    default:
+      throw new Error(`Unsupported lang for LSP: ${lang}`);
+  }
+}
+
+// ../../packages/server-core/src/bridge/terminal-bridge.ts
+import { spawn as spawn4 } from "node:child_process";
+function attachTerminalBridge(httpServer, opts) {
+  const pathPrefix = opts.path ?? "/terminal";
+  const wss = new import_websocket_server.default({ noServer: true });
+  httpServer.on("upgrade", (req, socket, head) => {
+    const url = req.url ?? "";
+    if (!url.startsWith(pathPrefix)) return;
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      handleConnection2(ws, opts);
+    });
+  });
+  console.log(`[terminal] bridge ready on ws://host${pathPrefix}`);
+}
+function pickShell(override) {
+  if (override) return { cmd: override, args: [] };
+  const envShell = process.env.SHELL;
+  if (envShell) return { cmd: envShell, args: ["-i"] };
+  if (process.platform === "win32") {
+    return { cmd: "powershell.exe", args: ["-NoLogo"] };
+  }
+  return { cmd: "/bin/sh", args: ["-i"] };
+}
+function handleConnection2(ws, opts) {
+  let child = null;
+  try {
+    const { cmd, args } = pickShell(opts.shell);
+    child = spawn4(cmd, args, {
+      cwd: opts.cwd,
+      env: { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" }
+    });
+    console.log(`[terminal] spawned ${cmd} (pid=${child.pid}) cwd=${opts.cwd}`);
+  } catch (e) {
+    safeSend(ws, { type: "data", data: `\r
+[terminal] failed to spawn shell: ${e?.message ?? e}\r
+` });
+    ws.close(1011, "spawn failed");
+    return;
+  }
+  child.on("error", (err) => {
+    safeSend(ws, { type: "data", data: `\r
+[terminal] shell error: ${err.message}\r
+` });
+  });
+  ws.on("message", (raw) => {
+    if (!child) return;
+    let msg;
+    try {
+      msg = JSON.parse(typeof raw === "string" ? raw : raw.toString("utf-8"));
+    } catch {
+      return;
+    }
+    switch (msg.type) {
+      case "input": {
+        if (child.stdin.writable && typeof msg.data === "string") {
+          try {
+            child.stdin.write(msg.data);
+          } catch {
+          }
+        }
+        break;
+      }
+      case "signal": {
+        try {
+          child.kill(msg.sig === "SIGTERM" ? "SIGTERM" : "SIGINT");
+        } catch {
+        }
+        break;
+      }
+      case "resize": {
+        break;
+      }
+    }
+  });
+  const forward = (data) => {
+    safeSend(ws, { type: "data", data: data.toString("utf-8") });
+  };
+  child.stdout.on("data", forward);
+  child.stderr.on("data", forward);
+  child.on("exit", (code) => {
+    safeSend(ws, { type: "exit", code: code ?? 0 });
+    try {
+      ws.close();
+    } catch {
+    }
+  });
+  ws.on("close", () => {
+    try {
+      child?.kill();
+    } catch {
+    }
+  });
+  ws.on("error", () => {
+    try {
+      child?.kill();
+    } catch {
+    }
+  });
+}
+function safeSend(ws, obj) {
+  if (ws.readyState !== ws.OPEN) return;
+  try {
+    ws.send(JSON.stringify(obj));
+  } catch {
+  }
+}
 
 // src/approvals.ts
 var ApprovalsStore = class {
@@ -18156,10 +19301,10 @@ var ApprovalsStore = class {
 };
 
 // src/env.ts
-import path23 from "node:path";
+import path29 from "node:path";
 var env = {
   PORT: Number(process.env.PORT ?? 5175),
-  WORKSPACE: process.env.WORKSPACE ? path23.resolve(process.env.WORKSPACE) : process.cwd(),
+  WORKSPACE: process.env.WORKSPACE ? path29.resolve(process.env.WORKSPACE) : process.cwd(),
   AUTH_TOKEN: process.env.MINI_AUTH_TOKEN?.trim() || "",
   AUTH_TOKENS: (process.env.MINI_AUTH_TOKENS ?? "").split(",").map((s) => s.trim()).filter(Boolean),
   RATE_LIMIT: Number(process.env.MINI_RATE_LIMIT ?? 0),
@@ -18185,6 +19330,11 @@ var Services = class {
   subagents;
   mcpManager;
   approvals;
+  hookBus;
+  hookMetrics;
+  bgTasks;
+  verifyAfterAccept;
+  worktrees;
   llmChat;
   llmComplete;
   llmFast;
@@ -18196,6 +19346,8 @@ var Services = class {
   watcher;
   /** 文件变更 SSE 客户端集合 */
   fsEventClients = /* @__PURE__ */ new Set();
+  /** metrics 快照回调（由 main.ts 注入） */
+  metricsProvider = null;
   constructor(workspace) {
     this.workspace = workspace;
   }
@@ -18218,7 +19370,7 @@ var Services = class {
     this.workspace = next;
     this.providers = new ProviderStore(this.workspace);
     await this.providers.load();
-    this.vectorPath = path24.join(
+    this.vectorPath = path30.join(
       this.workspace,
       ".minicodeide",
       `vectors.${this.embedder.name.replace(/[^a-z0-9]+/gi, "_")}.jsonl`
@@ -18285,7 +19437,7 @@ var Services = class {
     this.llmFast = this.buildLlmFor("fast");
     this.embedder = this.buildEmbedderFor();
     this.reranker = buildReranker();
-    this.vectorPath = path24.join(
+    this.vectorPath = path30.join(
       this.workspace,
       ".minicodeide",
       `vectors.${this.embedder.name.replace(/[^a-z0-9]+/gi, "_")}.jsonl`
@@ -18297,7 +19449,7 @@ var Services = class {
       const oldName = this.embedder.name;
       this.embedder = this.buildEmbedderFor();
       if (this.embedder.name !== oldName) {
-        this.vectorPath = path24.join(
+        this.vectorPath = path30.join(
           this.workspace,
           ".minicodeide",
           `vectors.${this.embedder.name.replace(/[^a-z0-9]+/gi, "_")}.jsonl`
@@ -18335,6 +19487,19 @@ var Services = class {
       });
       await this.checkpoints.prune(100);
     };
+    const { bus: hookBus, metrics: hookMetrics } = createSystemHookBus({ checkpoints: this.checkpoints });
+    this.hookBus = hookBus;
+    this.hookMetrics = hookMetrics;
+    console.log("[hooks] system bus ready");
+    this.bgTasks = new BackgroundTaskManager({ workspace: this.workspace });
+    this.bgTasks.on("task_complete", (t2) => {
+      console.log(`[bg-tasks] ${t2.id} ${t2.status} (exit=${t2.exitCode}) cmd="${t2.command}"`);
+    });
+    this.verifyAfterAccept = new VerifyAfterAcceptStore(this.workspace);
+    this.worktrees = new WorktreeManager(this.workspace);
+    const isGitRepoForWorktree = await this.worktrees.isGitRepo();
+    if (isGitRepoForWorktree) console.log("[worktrees] git repo detected, isolation available");
+    else console.log("[worktrees] not a git repo, subagents will share workspace");
     this.rules = new RulesStore(this.workspace);
     await this.rules.load();
     this.projectMemory = new ProjectMemoryStore(this.workspace);
@@ -18363,9 +19528,10 @@ var Services = class {
       sessions: this.sessions,
       workspaceRoot: this.workspace,
       defaultModel: () => this.providers.getActive("fast")?.model ?? this.providers.getActive("chat")?.model,
+      worktrees: isGitRepoForWorktree ? this.worktrees : void 0,
       childToolCtxFactory: () => ({
         cwd: this.workspace,
-        execPolicy: (cmd) => decideCommand(cmd),
+        execPolicy: (cmd) => permissionAwareDecide(cmd, { sandbox: "read_only", approval: "unless_trusted" }),
         codeIntel: {
           findSymbol: async (q, limit) => this.index ? this.index.symbols.fuzzyFind(q, limit ?? 15) : [],
           findReferences: async (name) => this.index ? this.index.symbols.findReferences(name) : [],
@@ -18631,246 +19797,43 @@ function queryToObject(url) {
 }
 
 // src/handlers/register.ts
-import path26 from "node:path";
-import os4 from "node:os";
-import { promises as fs23 } from "node:fs";
-
-// ../server/src/mentions.ts
-import { promises as fs22 } from "node:fs";
-import path25 from "node:path";
-var MENTION_REGEX = /@(file|symbol|selection|docs|web):([^\s]+)/g;
-var MAX_FILE_LINES = 400;
-async function parseMentions(text, ctx) {
-  const items = [];
-  const unresolved = [];
-  const matches = [];
-  for (const m of text.matchAll(MENTION_REGEX)) {
-    matches.push({ kind: m[1], arg: m[2], raw: m[0] });
-  }
-  for (const { kind, arg, raw } of matches) {
-    try {
-      switch (kind) {
-        case "file":
-        case "selection": {
-          const m = arg.match(/^(.+?)(?::(\d+)-(\d+))?$/);
-          if (!m) {
-            unresolved.push({ kind, arg, reason: "invalid syntax" });
-            break;
-          }
-          const rel = m[1];
-          const startLine = m[2] ? Number(m[2]) : void 0;
-          const endLine = m[3] ? Number(m[3]) : void 0;
-          const item = await resolveFile(ctx.workspace, rel, startLine, endLine);
-          if (item) items.push(item);
-          else unresolved.push({ kind, arg, reason: "file not found" });
-          break;
-        }
-        case "symbol": {
-          if (!ctx.index) {
-            unresolved.push({ kind, arg, reason: "index not ready" });
-            break;
-          }
-          const found = ctx.index.symbols.fuzzyFind(arg, 1);
-          if (!found.length) {
-            unresolved.push({ kind, arg, reason: "symbol not found" });
-            break;
-          }
-          const sym = found[0];
-          const item = await resolveFile(
-            ctx.workspace,
-            sym.path,
-            Math.max(1, sym.startLine - 2),
-            sym.endLine + 30
-          );
-          if (item) {
-            item.type = "symbol";
-            item.label = `${sym.name} (${sym.kind})`;
-            items.push(item);
-          } else {
-            unresolved.push({ kind, arg, reason: "cannot read symbol file" });
-          }
-          break;
-        }
-        case "docs": {
-          const candidates = [`docs/${arg}.md`, `${arg}.md`];
-          let found = null;
-          for (const rel of candidates) {
-            const item = await resolveFile(ctx.workspace, rel);
-            if (item) {
-              found = item;
-              break;
-            }
-          }
-          if (found) items.push(found);
-          else unresolved.push({ kind, arg, reason: "doc not found" });
-          break;
-        }
-        case "web": {
-          unresolved.push({ kind, arg, reason: "web search not enabled" });
-          break;
-        }
-        default:
-          unresolved.push({ kind, arg, reason: `unknown mention kind: ${kind}` });
-      }
-    } catch (e) {
-      unresolved.push({ kind, arg, reason: e?.message ?? String(e) });
-    }
-  }
-  const cleanText = text.replace(MENTION_REGEX, " ").replace(/\s+/g, " ").trim();
-  return { cleanText, items, unresolved };
-}
-async function resolveFile(workspace, rel, startLine, endLine) {
-  const safeRel = rel.replace(/^\/+/, "").replace(/\.\.\//g, "");
-  const abs = path25.join(workspace, safeRel);
-  let raw;
-  try {
-    raw = await fs22.readFile(abs, "utf-8");
-  } catch {
-    return null;
-  }
-  const lines = raw.split("\n");
-  const total = lines.length;
-  let start = startLine ?? 1;
-  let end = endLine ?? Math.min(total, MAX_FILE_LINES);
-  if (!startLine && total > MAX_FILE_LINES) {
-    end = MAX_FILE_LINES;
-  }
-  start = Math.max(1, start);
-  end = Math.min(total, end);
-  const slice = lines.slice(start - 1, end).join("\n");
-  const label = startLine && endLine ? `${safeRel}:${startLine}-${endLine}` : safeRel;
-  return {
-    type: "file",
-    label,
-    content: slice + (end < total && !endLine ? `
-... (truncated, total ${total} lines)` : "")
-  };
-}
-
-// ../server/src/git-helpers.ts
-import { exec as _exec } from "node:child_process";
-import { promisify as promisify3 } from "node:util";
-var exec = promisify3(_exec);
-var MAX_BUFFER2 = 32 * 1024 * 1024;
-async function run(cmd, cwd) {
-  const { stdout } = await exec(cmd, { cwd, maxBuffer: MAX_BUFFER2 });
-  return stdout;
-}
-async function isGitRepo(cwd) {
-  try {
-    await run("git rev-parse --is-inside-work-tree", cwd);
-    return true;
-  } catch {
-    return false;
-  }
-}
-async function gitStatus(cwd) {
-  const out = await run("git status --porcelain", cwd);
-  const result = [];
-  for (const ln of out.split("\n")) {
-    if (!ln) continue;
-    const x = ln[0];
-    const y = ln[1];
-    const p = ln.slice(3).trim();
-    if (x !== " " && x !== "?") {
-      result.push({ status: x, path: p, staged: true });
-    }
-    if (y !== " " && (y !== " " || x === "?")) {
-      result.push({ status: y === " " ? x : y, path: p, staged: false });
-    }
-  }
-  return result;
-}
-async function gitDiff(cwd, opts = {}) {
-  const args = ["diff"];
-  if (opts.staged) args.push("--cached");
-  if (opts.path) args.push("--", opts.path.replace(/'/g, "'\\''"));
-  return run("git " + args.join(" "), cwd);
-}
-async function gitBranch(cwd) {
-  return (await run("git rev-parse --abbrev-ref HEAD", cwd)).trim();
-}
-async function gitLog(cwd, n = 20) {
-  const fmt = "%H%x1f%h%x1f%aI%x1f%an%x1f%s";
-  const out = await run(`git log --pretty=format:${fmt} -n ${n}`, cwd);
-  return out.split("\n").filter(Boolean).map((ln) => {
-    const [hash, shortHash, date, author, subject] = ln.split("");
-    return { hash, shortHash, date, author, subject };
-  });
-}
-async function gitCommit(cwd, message, paths = []) {
-  if (paths.length === 0) {
-    await run("git add -A", cwd);
-  } else {
-    const safe = paths.map((p) => `'${p.replace(/'/g, "'\\''")}'`).join(" ");
-    await run(`git add ${safe}`, cwd);
-  }
-  const file = `/tmp/.minicodeide-commit-${Date.now()}.txt`;
-  const fs24 = await import("node:fs/promises");
-  await fs24.writeFile(file, message, "utf-8");
-  try {
-    await run(`git commit -F '${file}'`, cwd);
-  } finally {
-    await fs24.unlink(file).catch(() => void 0);
-  }
-  const log = await gitLog(cwd, 1);
-  return { hash: log[0]?.hash ?? "", subject: log[0]?.subject ?? "" };
-}
-
-// src/handlers/register.ts
-function detectMultiStepHint(userMessage) {
-  const patterns = [
-    /\b(all|every|each)\b.*\b(file|function|class|method)\b/i,
-    /(\d+[.)]\s+.+){2,}/,
-    /\b(then|and then|after that|next)\b/i,
-    /先.{2,20}再.{2,20}/,
-    /分别|并行|同时|批量|全部|所有/,
-    /parallel|simultaneously/i
-  ];
-  const isMultiStep = patterns.some((p) => p.test(userMessage));
-  const pathMatches = userMessage.match(/\b[\w\/.-]+\.\w{1,6}\b/g) ?? [];
-  const hasMultiFile = new Set(pathMatches).size >= 3;
-  if (!isMultiStep && !hasMultiFile) return null;
-  return "\n[context] This user message appears to involve multiple steps or files. IMPORTANT: Before executing, call `update_plan` to list all steps with status=pending, set the first step to in_progress, then execute. Update after each step.";
-}
-function globToRegex2(glob) {
-  let out = "^";
-  let i = 0;
-  while (i < glob.length) {
-    const c = glob[i];
-    if (c === "*") {
-      if (glob[i + 1] === "*") {
-        out += ".*";
-        i += 2;
-      } else {
-        out += "[^/]*";
-        i++;
-      }
-    } else if (c === "?") {
-      out += ".";
-      i++;
-    } else if (c === "{") {
-      const end = glob.indexOf("}", i);
-      if (end < 0) {
-        out += "\\{";
-        i++;
-      } else {
-        const opts = glob.slice(i + 1, end).split(",").map((x) => x.replace(/[.+^$()|[\]\\]/g, "\\$&"));
-        out += "(?:" + opts.join("|") + ")";
-        i = end + 1;
-      }
-    } else if (/[.+^$()|[\]\\]/.test(c)) {
-      out += "\\" + c;
-      i++;
-    } else {
-      out += c;
-      i++;
-    }
-  }
-  out += "$";
-  return new RegExp(out);
-}
+import path31 from "node:path";
+import os5 from "node:os";
+import { promises as fs27 } from "node:fs";
 var VSCODE_TARGET = process.env.VSCODE_URL ?? "http://127.0.0.1:8000";
+var subagentEventBuffer = [];
+var SUBAGENT_EVENT_BUFFER_CAP = 300;
+var subagentTextAccum = /* @__PURE__ */ new Map();
+var SUBAGENT_TEXT_FLUSH_INTERVAL = 200;
+function flushSubagentTextBuffer() {
+  const now = Date.now();
+  for (const [runId, acc] of subagentTextAccum) {
+    if (acc.text && now - acc.lastFlush >= SUBAGENT_TEXT_FLUSH_INTERVAL) {
+      subagentEventBuffer.push({ type: "subagent_text", runId, text: acc.text, ts: now });
+      acc.text = "";
+      acc.lastFlush = now;
+    }
+  }
+  if (subagentEventBuffer.length > SUBAGENT_EVENT_BUFFER_CAP) {
+    subagentEventBuffer.splice(0, subagentEventBuffer.length - SUBAGENT_EVENT_BUFFER_CAP);
+  }
+}
+async function renderAutoTriggeredSkills(input, skillStore) {
+  const matched = skillStore.matchForInput(input);
+  if (!matched.length) return "";
+  const lines = ["# Auto-triggered Skills (matched by user input)"];
+  for (const meta of matched.slice(0, 2)) {
+    const full = await skillStore.loadFull(meta.name);
+    if (full?.body) {
+      lines.push(`## ${meta.name}
+${full.body.slice(0, 3e3)}`);
+    } else {
+      lines.push(`## ${meta.name}
+${meta.description}`);
+    }
+  }
+  return lines.join("\n");
+}
 function registerHandlers(r, s) {
   r.get("/health", (c) => sendJson(c.res, 200, { ok: true, ts: Date.now() }));
   r.get("/api/health", (c) => sendJson(c.res, 200, {
@@ -18888,9 +19851,33 @@ function registerHandlers(r, s) {
   r.get("/api/version", (c) => sendJson(c.res, 200, {
     version: process.env.npm_package_version ?? "0.0.0-dev",
     node: process.version,
-    platform: `${os4.platform()} ${os4.arch()}`
+    platform: `${os5.platform()} ${os5.arch()}`
   }));
-  r.get("/api/metrics", (c) => sendJson(c.res, 200, { ok: true, ts: Date.now() }));
+  r.get("/api/metrics", (c) => sendJson(c.res, 200, { ok: true, ts: Date.now(), ...s.metricsProvider?.() ?? {} }));
+  s.subagents.on("child_text", (p) => {
+    const acc = subagentTextAccum.get(p.runId) ?? { text: "", lastFlush: Date.now() };
+    acc.text += p.text;
+    subagentTextAccum.set(p.runId, acc);
+    flushSubagentTextBuffer();
+  });
+  s.subagents.on("child_tool", (p) => {
+    subagentEventBuffer.push({ type: "subagent_tool", runId: p.runId, tool: p.tool, ts: Date.now() });
+    if (subagentEventBuffer.length > SUBAGENT_EVENT_BUFFER_CAP) {
+      subagentEventBuffer.splice(0, subagentEventBuffer.length - SUBAGENT_EVENT_BUFFER_CAP);
+    }
+  });
+  s.subagents.on("child_tool_result", (p) => {
+    subagentEventBuffer.push({
+      type: "subagent_progress",
+      runId: p.runId,
+      tool: p.tool,
+      resultPreview: p.resultPreview,
+      ts: Date.now()
+    });
+    if (subagentEventBuffer.length > SUBAGENT_EVENT_BUFFER_CAP) {
+      subagentEventBuffer.splice(0, subagentEventBuffer.length - SUBAGENT_EVENT_BUFFER_CAP);
+    }
+  });
   r.get("/api/approvals", (c) => sendJson(c.res, 200, s.approvals.list()));
   r.post("/api/approve/:id", async (c) => {
     const body = await readBody(c.req);
@@ -18937,13 +19924,13 @@ function registerHandlers(r, s) {
   });
   r.get("/api/files", async (c) => {
     const rel = c.query.path ?? ".";
-    const abs = path26.resolve(s.workspace, rel);
+    const abs = path31.resolve(s.workspace, rel);
     if (!abs.startsWith(s.workspace)) return sendJson(c.res, 400, { error: "escape" });
     try {
-      const entries = await fs23.readdir(abs, { withFileTypes: true });
+      const entries = await fs27.readdir(abs, { withFileTypes: true });
       sendJson(c.res, 200, entries.filter((e) => !["node_modules", ".git", "dist"].includes(e.name)).map((e) => ({
         name: e.name,
-        path: path26.relative(s.workspace, path26.join(abs, e.name)),
+        path: path31.relative(s.workspace, path31.join(abs, e.name)),
         isDir: e.isDirectory()
       })).sort((a, b) => a.isDir === b.isDir ? a.name.localeCompare(b.name) : a.isDir ? -1 : 1));
     } catch (e) {
@@ -18952,10 +19939,10 @@ function registerHandlers(r, s) {
   });
   r.get("/api/file", async (c) => {
     const rel = c.query.path ?? "";
-    const abs = path26.resolve(s.workspace, rel);
+    const abs = path31.resolve(s.workspace, rel);
     if (!abs.startsWith(s.workspace)) return sendJson(c.res, 400, { error: "escape" });
     try {
-      const text = await fs23.readFile(abs, "utf-8");
+      const text = await fs27.readFile(abs, "utf-8");
       sendJson(c.res, 200, { path: rel, content: text });
     } catch (e) {
       sendJson(c.res, 500, { error: e.message });
@@ -18964,11 +19951,11 @@ function registerHandlers(r, s) {
   r.post("/api/file", async (c) => {
     const body = await readBody(c.req);
     const { path: rel, content } = body ?? {};
-    const abs = path26.resolve(s.workspace, rel);
+    const abs = path31.resolve(s.workspace, rel);
     if (!abs.startsWith(s.workspace)) return sendJson(c.res, 400, { error: "escape" });
     try {
-      await fs23.mkdir(path26.dirname(abs), { recursive: true });
-      await fs23.writeFile(abs, content ?? "", "utf-8");
+      await fs27.mkdir(path31.dirname(abs), { recursive: true });
+      await fs27.writeFile(abs, content ?? "", "utf-8");
       sendJson(c.res, 200, { ok: true });
     } catch (e) {
       sendJson(c.res, 500, { error: e.message });
@@ -18977,10 +19964,10 @@ function registerHandlers(r, s) {
   r.delete("/api/file", async (c) => {
     const rel = c.query.path ?? "";
     if (!rel || rel === "." || rel === "/") return sendJson(c.res, 400, { error: "invalid path" });
-    const abs = path26.resolve(s.workspace, rel);
+    const abs = path31.resolve(s.workspace, rel);
     if (!abs.startsWith(s.workspace) || abs === s.workspace) return sendJson(c.res, 400, { error: "escape" });
     try {
-      await fs23.rm(abs, { recursive: true, force: true });
+      await fs27.rm(abs, { recursive: true, force: true });
       sendJson(c.res, 200, { ok: true });
     } catch (e) {
       sendJson(c.res, 500, { error: e.message });
@@ -18990,17 +19977,17 @@ function registerHandlers(r, s) {
     const body = await readBody(c.req);
     const { from, to } = body ?? {};
     if (!from || !to) return sendJson(c.res, 400, { error: "from/to required" });
-    const fromAbs = path26.resolve(s.workspace, from);
-    const toAbs = path26.resolve(s.workspace, to);
+    const fromAbs = path31.resolve(s.workspace, from);
+    const toAbs = path31.resolve(s.workspace, to);
     if (!fromAbs.startsWith(s.workspace) || !toAbs.startsWith(s.workspace)) return sendJson(c.res, 400, { error: "escape" });
     try {
       try {
-        await fs23.access(toAbs);
+        await fs27.access(toAbs);
         return sendJson(c.res, 409, { error: "target exists" });
       } catch {
       }
-      await fs23.mkdir(path26.dirname(toAbs), { recursive: true });
-      await fs23.rename(fromAbs, toAbs);
+      await fs27.mkdir(path31.dirname(toAbs), { recursive: true });
+      await fs27.rename(fromAbs, toAbs);
       sendJson(c.res, 200, { ok: true });
     } catch (e) {
       sendJson(c.res, 500, { error: e.message });
@@ -19010,10 +19997,10 @@ function registerHandlers(r, s) {
     const body = await readBody(c.req);
     const { path: rel } = body ?? {};
     if (!rel) return sendJson(c.res, 400, { error: "path required" });
-    const abs = path26.resolve(s.workspace, rel);
+    const abs = path31.resolve(s.workspace, rel);
     if (!abs.startsWith(s.workspace)) return sendJson(c.res, 400, { error: "escape" });
     try {
-      await fs23.mkdir(abs, { recursive: true });
+      await fs27.mkdir(abs, { recursive: true });
       sendJson(c.res, 200, { ok: true });
     } catch (e) {
       sendJson(c.res, 500, { error: e.message });
@@ -19022,30 +20009,30 @@ function registerHandlers(r, s) {
   r.post("/api/file/reveal", async (c) => {
     const body = await readBody(c.req);
     const { path: rel } = body ?? {};
-    const abs = path26.resolve(s.workspace, rel ?? "");
+    const abs = path31.resolve(s.workspace, rel ?? "");
     if (!abs.startsWith(s.workspace)) return sendJson(c.res, 400, { error: "escape" });
     try {
-      const { spawn: spawn4 } = await import("child_process");
+      const { spawn: spawn5 } = await import("child_process");
       const platform = process.platform;
-      if (platform === "darwin") spawn4("open", ["-R", abs], { detached: true }).unref();
-      else if (platform === "win32") spawn4("explorer", ["/select,", abs], { detached: true }).unref();
-      else spawn4("xdg-open", [path26.dirname(abs)], { detached: true }).unref();
+      if (platform === "darwin") spawn5("open", ["-R", abs], { detached: true }).unref();
+      else if (platform === "win32") spawn5("explorer", ["/select,", abs], { detached: true }).unref();
+      else spawn5("xdg-open", [path31.dirname(abs)], { detached: true }).unref();
       sendJson(c.res, 200, { ok: true });
     } catch (e) {
       sendJson(c.res, 500, { error: e.message });
     }
   });
   r.get("/api/fs/list-abs", async (c) => {
-    const os5 = await import("node:os");
-    let abs = c.query.path ?? os5.homedir();
-    abs = path26.resolve(abs);
+    const os6 = await import("node:os");
+    let abs = c.query.path ?? os6.homedir();
+    abs = path31.resolve(abs);
     try {
-      const entries = await fs23.readdir(abs, { withFileTypes: true });
-      const dirs = entries.filter((e) => e.isDirectory() && !e.name.startsWith(".")).map((e) => ({ name: e.name, path: path26.join(abs, e.name) })).sort((a, b) => a.name.localeCompare(b.name));
+      const entries = await fs27.readdir(abs, { withFileTypes: true });
+      const dirs = entries.filter((e) => e.isDirectory() && !e.name.startsWith(".")).map((e) => ({ name: e.name, path: path31.join(abs, e.name) })).sort((a, b) => a.name.localeCompare(b.name));
       sendJson(c.res, 200, {
         path: abs,
-        parent: path26.dirname(abs) === abs ? null : path26.dirname(abs),
-        home: os5.homedir(),
+        parent: path31.dirname(abs) === abs ? null : path31.dirname(abs),
+        home: os6.homedir(),
         dirs
       });
     } catch (e) {
@@ -19059,9 +20046,9 @@ function registerHandlers(r, s) {
     const body = await readBody(c.req);
     const { path: next } = body ?? {};
     if (!next || typeof next !== "string") return sendJson(c.res, 400, { error: "path required" });
-    const abs = path26.resolve(next);
+    const abs = path31.resolve(next);
     try {
-      const st = await fs23.stat(abs);
+      const st = await fs27.stat(abs);
       if (!st.isDirectory()) return sendJson(c.res, 400, { error: "not a directory" });
       await s.switchWorkspace(abs);
       sendJson(c.res, 200, { ok: true, workspace: s.workspace });
@@ -19070,19 +20057,19 @@ function registerHandlers(r, s) {
     }
   });
   function safeJoin(rootAbs, rel) {
-    const target = path26.resolve(rootAbs, rel || ".");
-    return target === rootAbs || target.startsWith(rootAbs + path26.sep) ? target : null;
+    const target = path31.resolve(rootAbs, rel || ".");
+    return target === rootAbs || target.startsWith(rootAbs + path31.sep) ? target : null;
   }
   r.get("/api/agents/files", async (c) => {
     const ws = c.query.ws;
-    if (!ws || !path26.isAbsolute(ws)) return sendJson(c.res, 400, { error: "absolute ws required" });
+    if (!ws || !path31.isAbsolute(ws)) return sendJson(c.res, 400, { error: "absolute ws required" });
     const target = safeJoin(ws, c.query.path ?? ".");
     if (!target) return sendJson(c.res, 400, { error: "escape" });
     try {
-      const entries = await fs23.readdir(target, { withFileTypes: true });
+      const entries = await fs27.readdir(target, { withFileTypes: true });
       sendJson(c.res, 200, entries.filter((e) => !["node_modules", ".git", "dist", ".next", ".turbo"].includes(e.name)).map((e) => ({
         name: e.name,
-        path: path26.relative(ws, path26.join(target, e.name)),
+        path: path31.relative(ws, path31.join(target, e.name)),
         isDir: e.isDirectory()
       })).sort((a, b) => a.isDir === b.isDir ? a.name.localeCompare(b.name) : a.isDir ? -1 : 1));
     } catch (e) {
@@ -19091,13 +20078,13 @@ function registerHandlers(r, s) {
   });
   r.get("/api/agents/file", async (c) => {
     const ws = c.query.ws;
-    if (!ws || !path26.isAbsolute(ws)) return sendJson(c.res, 400, { error: "absolute ws required" });
+    if (!ws || !path31.isAbsolute(ws)) return sendJson(c.res, 400, { error: "absolute ws required" });
     const target = safeJoin(ws, c.query.path ?? "");
     if (!target) return sendJson(c.res, 400, { error: "escape" });
     try {
-      const st = await fs23.stat(target);
+      const st = await fs27.stat(target);
       if (st.size > 2 * 1024 * 1024) return sendJson(c.res, 413, { error: "file too large (>2MB)" });
-      const text = await fs23.readFile(target, "utf-8");
+      const text = await fs27.readFile(target, "utf-8");
       sendJson(c.res, 200, { path: c.query.path ?? "", content: text, size: st.size });
     } catch (e) {
       sendJson(c.res, 500, { error: e.message });
@@ -19105,7 +20092,7 @@ function registerHandlers(r, s) {
   });
   r.get("/api/agents/git/branch", async (c) => {
     const ws = c.query.ws;
-    if (!ws || !path26.isAbsolute(ws)) return sendJson(c.res, 400, { error: "absolute ws required" });
+    if (!ws || !path31.isAbsolute(ws)) return sendJson(c.res, 400, { error: "absolute ws required" });
     try {
       if (!await isGitRepo(ws)) return sendJson(c.res, 200, { isRepo: false });
       const branch = await gitBranch(ws);
@@ -19114,13 +20101,104 @@ function registerHandlers(r, s) {
       sendJson(c.res, 500, { error: e?.message ?? String(e) });
     }
   });
-  r.get("/api/agents/list-dirs", async (c) => {
-    const parent = c.query.parent || os4.homedir();
-    if (!path26.isAbsolute(parent)) return sendJson(c.res, 400, { error: "absolute parent required" });
+  r.get("/api/agents/git/status", async (c) => {
+    const ws = c.query.ws;
+    if (!ws || !path31.isAbsolute(ws)) return sendJson(c.res, 400, { error: "absolute ws required" });
     try {
-      const entries = await fs23.readdir(parent, { withFileTypes: true });
-      const dirs = entries.filter((e) => e.isDirectory() && !e.name.startsWith(".")).map((e) => ({ name: e.name, path: path26.join(parent, e.name) })).sort((a, b) => a.name.localeCompare(b.name));
-      sendJson(c.res, 200, { parent, home: os4.homedir(), dirs });
+      if (!await isGitRepo(ws)) return sendJson(c.res, 200, { isRepo: false });
+      const [status, branch] = await Promise.all([gitStatus(ws), gitBranch(ws)]);
+      const changes = status.map((e) => ({ path: e.path, status: e.status, raw: e.staged ? e.status : ` ${e.status}` }));
+      sendJson(c.res, 200, { isRepo: true, branch, changes });
+    } catch (e) {
+      sendJson(c.res, 500, { error: e?.message ?? String(e) });
+    }
+  });
+  r.get("/api/agents/git/diff", async (c) => {
+    const ws = c.query.ws;
+    if (!ws || !path31.isAbsolute(ws)) return sendJson(c.res, 400, { error: "absolute ws required" });
+    try {
+      if (!await isGitRepo(ws)) return sendJson(c.res, 200, { isRepo: false, diff: "" });
+      const diff = await gitDiff(ws, { path: c.query.path || void 0 });
+      sendJson(c.res, 200, { diff });
+    } catch (e) {
+      sendJson(c.res, 500, { error: e?.message ?? String(e) });
+    }
+  });
+  r.get("/api/agents/git/log", async (c) => {
+    const ws = c.query.ws;
+    if (!ws || !path31.isAbsolute(ws)) return sendJson(c.res, 400, { error: "absolute ws required" });
+    try {
+      if (!await isGitRepo(ws)) return sendJson(c.res, 200, { isRepo: false, commits: [] });
+      const limit = Math.min(Number(c.query.limit ?? 50), 200);
+      const entries = await gitLog(ws, limit);
+      const commits = entries.map((e) => ({
+        hash: e.hash,
+        short: e.shortHash,
+        author: e.author,
+        email: "",
+        ts: new Date(e.date).getTime(),
+        subject: e.subject,
+        isAi: e.author === "AI" || e.subject.startsWith("ai:")
+      }));
+      sendJson(c.res, 200, { isRepo: true, commits });
+    } catch (e) {
+      sendJson(c.res, 500, { error: e?.message ?? String(e) });
+    }
+  });
+  r.get("/api/agents/git/show", async (c) => {
+    const ws = c.query.ws;
+    if (!ws || !path31.isAbsolute(ws)) return sendJson(c.res, 400, { error: "absolute ws required" });
+    const hash = c.query.hash ?? "";
+    if (!hash) return sendJson(c.res, 400, { error: "hash required" });
+    try {
+      if (!await isGitRepo(ws)) return sendJson(c.res, 200, { isRepo: false, diff: "" });
+      const diff = await gitShow(ws, hash);
+      sendJson(c.res, 200, { diff });
+    } catch (e) {
+      sendJson(c.res, 500, { error: e?.message ?? String(e) });
+    }
+  });
+  r.post("/api/agents/git/revert", async (c) => {
+    const ws = c.query.ws;
+    if (!ws || !path31.isAbsolute(ws)) return sendJson(c.res, 400, { error: "absolute ws required" });
+    const body = await readBody(c.req);
+    const { path: filePath, status } = body ?? {};
+    if (!filePath) return sendJson(c.res, 400, { error: "path required" });
+    try {
+      if (!await isGitRepo(ws)) return sendJson(c.res, 400, { error: "not a git repo" });
+      if (status === "??") {
+        const abs = path31.resolve(ws, filePath);
+        if (!abs.startsWith(ws)) return sendJson(c.res, 400, { error: "escape" });
+        await fs27.rm(abs, { recursive: true, force: true });
+      } else {
+        await gitRevert(ws, filePath);
+      }
+      sendJson(c.res, 200, { ok: true });
+    } catch (e) {
+      sendJson(c.res, 500, { ok: false, error: e?.message ?? String(e) });
+    }
+  });
+  r.post("/api/agents/git/accept", async (c) => {
+    const ws = c.query.ws;
+    if (!ws || !path31.isAbsolute(ws)) return sendJson(c.res, 400, { error: "absolute ws required" });
+    const body = await readBody(c.req);
+    const { path: filePath, message } = body ?? {};
+    if (!filePath) return sendJson(c.res, 400, { error: "path required" });
+    try {
+      if (!await isGitRepo(ws)) return sendJson(c.res, 400, { error: "not a git repo" });
+      const result = await gitAccept(ws, [filePath], message ?? `ai: ${filePath}`);
+      sendJson(c.res, 200, { ok: true, hash: result.hash, subject: result.subject });
+    } catch (e) {
+      sendJson(c.res, 500, { ok: false, error: e?.message ?? String(e) });
+    }
+  });
+  r.get("/api/agents/list-dirs", async (c) => {
+    const parent = c.query.parent || os5.homedir();
+    if (!path31.isAbsolute(parent)) return sendJson(c.res, 400, { error: "absolute parent required" });
+    try {
+      const entries = await fs27.readdir(parent, { withFileTypes: true });
+      const dirs = entries.filter((e) => e.isDirectory() && !e.name.startsWith(".")).map((e) => ({ name: e.name, path: path31.join(parent, e.name) })).sort((a, b) => a.name.localeCompare(b.name));
+      sendJson(c.res, 200, { parent, home: os5.homedir(), dirs });
     } catch (e) {
       sendJson(c.res, 500, { error: e?.message ?? String(e) });
     }
@@ -19150,25 +20228,25 @@ function registerHandlers(r, s) {
       if (hits.length >= maxHits) return;
       let entries = [];
       try {
-        entries = await fs23.readdir(dir, { withFileTypes: true });
+        entries = await fs27.readdir(dir, { withFileTypes: true });
       } catch {
         return;
       }
       for (const e of entries) {
         if (hits.length >= maxHits) return;
         if (e.name.startsWith(".") || skipDirs.has(e.name)) continue;
-        const full = path26.join(dir, e.name);
+        const full = path31.join(dir, e.name);
         if (e.isDirectory()) await walk2(full);
         else {
           if (globRe && !globRe.test(e.name)) continue;
           scanned++;
           try {
-            const text = await fs23.readFile(full, "utf-8");
+            const text = await fs27.readFile(full, "utf-8");
             const lines = text.split("\n");
             for (let i = 0; i < lines.length; i++) {
               if (re.test(lines[i])) {
                 hits.push({
-                  file: path26.relative(s.workspace, full),
+                  file: path31.relative(s.workspace, full),
                   line: i + 1,
                   text: lines[i].slice(0, 400),
                   before: i > 0 ? lines[i - 1].slice(0, 400) : void 0,
@@ -19421,58 +20499,11 @@ ${answer.trim() || "(empty)"}
       sendJson(c.res, 500, { error: e?.message ?? String(e) });
     }
   });
-  let diagCache = {
-    ts: 0,
-    running: false,
-    result: []
-  };
-  const DIAG_TTL_MS = 3e4;
-  async function runDiagnostics() {
-    if (diagCache.running) return diagCache.result;
-    diagCache.running = true;
-    const t0 = Date.now();
-    try {
-      const { exec: exec2 } = await import("node:child_process");
-      const hasPnpm = await fs23.access(path26.join(s.workspace, "pnpm-workspace.yaml")).then(() => true).catch(() => false);
-      const pkgJson = await fs23.readFile(path26.join(s.workspace, "package.json"), "utf-8").catch(() => "{}");
-      const scripts = JSON.parse(pkgJson).scripts ?? {};
-      let cmd;
-      if (hasPnpm && scripts.typecheck) cmd = "pnpm -r typecheck";
-      else if (scripts.typecheck) cmd = "npm run typecheck";
-      else cmd = "npx tsc --noEmit";
-      const result = await new Promise((resolve3) => {
-        const p = exec2(
-          cmd,
-          { cwd: s.workspace, maxBuffer: 8 * 1024 * 1024, timeout: 12e4 },
-          (_e, so, se) => resolve3({ out: (so ?? "") + "\n" + (se ?? "") })
-        );
-        p.on?.("error", () => void 0);
-      });
-      const diagnostics = [];
-      const tscRe = /(.+?)\((\d+),(\d+)\):\s*(error|warning)\s+(TS\d+):\s*(.+)/g;
-      for (const m of result.out.matchAll(tscRe)) {
-        let file = m[1];
-        if (path26.isAbsolute(file)) file = path26.relative(s.workspace, file);
-        diagnostics.push({
-          file,
-          line: Number(m[2]),
-          col: Number(m[3]),
-          severity: m[4],
-          message: m[6].slice(0, 300),
-          code: m[5]
-        });
-        if (diagnostics.length >= 200) break;
-      }
-      diagCache = { ts: Date.now(), running: false, result: diagnostics, durationMs: Date.now() - t0 };
-    } catch (e) {
-      diagCache = { ts: Date.now(), running: false, result: [], lastError: e?.message ?? String(e), durationMs: Date.now() - t0 };
-    }
-    return diagCache.result;
-  }
+  let diagCache = createDiagCache();
   r.get("/api/diagnostics", async (c) => {
     const force = c.query.force === "1" || c.query.force === "true";
     const stale = Date.now() - diagCache.ts > DIAG_TTL_MS;
-    if (force || stale && !diagCache.running) runDiagnostics().catch(() => void 0);
+    if (force || stale && !diagCache.running) runDiagnostics(s.workspace, diagCache).catch(() => void 0);
     sendJson(c.res, 200, {
       diagnostics: diagCache.result,
       ts: diagCache.ts,
@@ -19496,7 +20527,9 @@ ${answer.trim() || "(empty)"}
   });
   r.post("/api/edits/:id/accept", async (c) => {
     try {
-      sendJson(c.res, 200, await s.pendingEdits.accept(c.params.id));
+      const e = await s.pendingEdits.accept(c.params.id);
+      s.verifyAfterAccept?.trigger([e.path]);
+      sendJson(c.res, 200, e);
     } catch (e) {
       sendJson(c.res, 400, { error: e.message });
     }
@@ -19508,7 +20541,11 @@ ${answer.trim() || "(empty)"}
       sendJson(c.res, 400, { error: e.message });
     }
   });
-  r.post("/api/edits/accept-all", async (c) => sendJson(c.res, 200, await s.pendingEdits.acceptAll()));
+  r.post("/api/edits/accept-all", async (c) => {
+    const out = await s.pendingEdits.acceptAll();
+    s.verifyAfterAccept?.trigger(out.map((e) => e.path));
+    sendJson(c.res, 200, out);
+  });
   r.post("/api/edits/reject-all", (c) => {
     const all = s.pendingEdits.list();
     sendJson(c.res, 200, all.map((e) => s.pendingEdits.reject(e.id)));
@@ -19772,16 +20809,16 @@ ${it.partialAssistant.slice(-2e3)}
   });
   r.get("/api/mcp/config", async (c) => {
     try {
-      const cfgPath = path26.join(s.workspace, ".minicodeide", "mcp.json");
+      const cfgPath = path31.join(s.workspace, ".minicodeide", "mcp.json");
       let raw = "";
       let exists = false;
       try {
-        raw = await fs23.readFile(cfgPath, "utf-8");
+        raw = await fs27.readFile(cfgPath, "utf-8");
         exists = true;
       } catch {
         try {
-          const ex = path26.join(s.workspace, ".minicodeide", "mcp.example.json");
-          raw = await fs23.readFile(ex, "utf-8");
+          const ex = path31.join(s.workspace, ".minicodeide", "mcp.example.json");
+          raw = await fs27.readFile(ex, "utf-8");
         } catch {
           raw = JSON.stringify({ servers: {} }, null, 2);
         }
@@ -19800,10 +20837,10 @@ ${it.partialAssistant.slice(-2e3)}
       } catch (e) {
         return sendJson(c.res, 400, { error: `invalid JSON: ${e?.message}` });
       }
-      const dir = path26.join(s.workspace, ".minicodeide");
-      await fs23.mkdir(dir, { recursive: true });
-      const cfgPath = path26.join(dir, "mcp.json");
-      await fs23.writeFile(cfgPath, content, "utf-8");
+      const dir = path31.join(s.workspace, ".minicodeide");
+      await fs27.mkdir(dir, { recursive: true });
+      const cfgPath = path31.join(dir, "mcp.json");
+      await fs27.writeFile(cfgPath, content, "utf-8");
       sendJson(c.res, 200, { ok: true, path: cfgPath, hint: "Restart server to apply MCP changes (or POST /api/mcp/reconnect)." });
     } catch (e) {
       sendJson(c.res, 500, { error: e?.message ?? String(e) });
@@ -19822,6 +20859,43 @@ ${it.partialAssistant.slice(-2e3)}
     }
   });
   r.get("/api/subagents", (c) => sendJson(c.res, 200, s.subagents.list(c.query.parent || void 0)));
+  r.get("/api/subagents/profiles", (c) => {
+    sendJson(c.res, 200, { profiles: s.subagents.getProfileNames() });
+  });
+  r.post("/api/subagents/spawn", async (c) => {
+    const body = await readBody(c.req);
+    const { task, label, role, parentSessionId } = body ?? {};
+    if (!task || typeof task !== "string") {
+      return sendJson(c.res, 400, { error: "task (string) is required" });
+    }
+    try {
+      const r2 = await s.subagents.spawn({
+        task,
+        label,
+        role,
+        parentSessionId: parentSessionId ?? "manual-" + Date.now(),
+        parentDepth: 0
+      });
+      sendJson(c.res, 200, { ok: true, runId: r2.runId, childSessionId: r2.childSessionId });
+    } catch (e) {
+      sendJson(c.res, 500, { error: e instanceof Error ? e.message : String(e) });
+    }
+  });
+  r.get("/api/hooks/metrics", (c) => {
+    if (!s.hookBus) return sendJson(c.res, 200, { tools: {}, hooks: {} });
+    sendJson(c.res, 200, {
+      tools: s.hookMetrics?.snapshot?.() ?? {},
+      hooks: {
+        UserPromptSubmit: s.hookBus.list("UserPromptSubmit"),
+        PreToolUse: s.hookBus.list("PreToolUse"),
+        PostToolUse: s.hookBus.list("PostToolUse"),
+        Stop: s.hookBus.list("Stop")
+      }
+    });
+  });
+  r.get("/api/bg/list", (c) => {
+    sendJson(c.res, 200, { tasks: s.bgTasks?.list?.() ?? [] });
+  });
   r.get("/api/mentions/suggest", async (c) => {
     const q = c.query.q ?? "";
     const m = q.match(/^(file|symbol|docs|selection|web):(.*)$/);
@@ -19854,8 +20928,8 @@ ${it.partialAssistant.slice(-2e3)}
             items.push({ kind, label: `${sym.name} \xB7 ${sym.path}:${sym.startLine}`, insert: `@symbol:${sym.name}`, hint: sym.kind });
       } else if (kind === "docs") {
         try {
-          const dir = path26.join(s.workspace, "docs");
-          for (const f of await fs23.readdir(dir)) {
+          const dir = path31.join(s.workspace, "docs");
+          for (const f of await fs27.readdir(dir)) {
             if (!f.endsWith(".md")) continue;
             const name = f.replace(/\.md$/, "");
             if (!arg || name.toLowerCase().includes(arg))
@@ -19939,7 +21013,8 @@ ${it.partialAssistant.slice(-2e3)}
       mode = "agent",
       sessionId: rawSessionId,
       images = [],
-      timeout: clientTimeout
+      timeout: clientTimeout,
+      profileId: requestedProfileId
     } = body;
     const persistSession = rawSessionId && s.sessions.get(rawSessionId);
     const chatSessionId = rawSessionId || `anon:${c.req.headers["x-forwarded-for"] ?? c.req.socket.remoteAddress ?? "local"}`;
@@ -19977,7 +21052,9 @@ ${it.partialAssistant.slice(-2e3)}
       if (it.type === "file" && it.label)
         s.recentActivity.record(chatSessionId, { kind: "view", target: it.label });
     let currentTurnId = null;
+    let sessionRelease = null;
     if (persistSession) {
+      sessionRelease = await s.sessions.lock.acquire(rawSessionId);
       await s.sessions.append(rawSessionId, { role: "user", content: rawUserMessage ?? "" }).catch(() => void 0);
       currentTurnId = await s.sessions.startTurn(rawSessionId, rawUserMessage ?? "").catch(() => null);
     }
@@ -20024,8 +21101,10 @@ ${it.partialAssistant.slice(-2e3)}
       autoContext: autoCtx,
       explicitContext,
       memory: s.memory,
-      meta: { cwd: s.workspace, os: `${os4.platform()} ${os4.release()}` },
+      meta: { cwd: s.workspace, os: `${os5.platform()} ${os5.release()}` },
       images,
+      sandbox: mode === "plan" ? "read_only" : "workspace_write",
+      approvalPolicy: "on_failure",
       systemExtras: [
         s.projectMemory.renderForSystem(),
         s.skills.renderForSystem(),
@@ -20040,12 +21119,18 @@ ${body2}`;
         )).filter(Boolean),
         ruleExtra,
         detectMultiStepHint(userMessage),
-        s.recentActivity.render(chatSessionId)
+        s.recentActivity.render(chatSessionId),
+        await renderAutoTriggeredSkills(userMessage, s.skills),
+        s.verifyAfterAccept?.consumeForSystem()
       ].filter(Boolean),
       providerFlavor: chatProfile?.kind === "anthropic" ? "anthropic" : chatProfile?.kind === "openai" ? "openai" : /gemini/i.test(chatProfile?.model ?? "") ? "gemini" : "generic",
       injectionCache: s.injectionCache,
       sessionId: chatSessionId,
-      compaction: { model: chatModel, summarize: llmSummarize },
+      compaction: {
+        model: chatModel,
+        tokenOpts: { contextWindowOverride: chatProfile?.contextWindow },
+        summarize: llmSummarize
+      },
       onMemoryRecalled: (items) => {
         if (items.length) sse.send({ type: "memory_recalled", items });
       }
@@ -20058,9 +21143,20 @@ ${body2}`;
         userAbort = true;
         abort.abort();
       });
-      const llmRouted = s.buildLlmFor("chat", (info) => sse.send({ type: "provider_switch", ...info }));
-      if (mode === "ask") {
-        const noToolRegistry = new ToolRegistry();
+      let llmRouted;
+      if (requestedProfileId) {
+        const requested = s.providers.get(requestedProfileId);
+        if (requested) {
+          llmRouted = createProvider(requested);
+        } else {
+          sse.send({ type: "error", error: `requested profile "${requestedProfileId}" not found, falling back to auto-routing` });
+          llmRouted = s.buildLlmFor("chat", (info) => sse.send({ type: "provider_switch", ...info }));
+        }
+      } else {
+        llmRouted = s.buildLlmFor("chat", (info) => sse.send({ type: "provider_switch", ...info }));
+      }
+      if (mode === "ask" || mode === "plan") {
+        const noToolRegistry = mode === "plan" ? s.registry.filter(ToolRegistry.CHAT_ONLY_PROFILE) : new ToolRegistry();
         for await (const ev of runAgent({
           llm: llmRouted,
           registry: noToolRegistry,
@@ -20068,7 +21164,9 @@ ${body2}`;
           toolCtx: { cwd: s.workspace },
           signal: abort.signal,
           maxSteps: 1,
-          llmTimeout: clientTimeout
+          llmTimeout: clientTimeout,
+          hooks: s.hookBus,
+          workspace: s.workspace
         })) {
           if (ev.type === "text" && ev.text) {
             assistantBuf += ev.text;
@@ -20079,9 +21177,10 @@ ${body2}`;
           sse.send(ev);
         }
       } else {
+        const activeRegistry = mode === "plan" ? s.registry.filter(ToolRegistry.CHAT_ONLY_PROFILE) : s.registry;
         for await (const ev of runAgent({
           llm: llmRouted,
-          registry: s.registry,
+          registry: activeRegistry,
           messages: initial,
           toolCtx: {
             cwd: s.workspace,
@@ -20093,7 +21192,10 @@ ${body2}`;
               sse.send({ type: "approve_request", id, tool: info.tool, args: info.args });
               return await p === "allow";
             },
-            execPolicy: (cmd) => decideCommand(cmd),
+            execPolicy: (cmd) => permissionAwareDecide(cmd, {
+              sandbox: mode === "plan" ? "read_only" : "workspace_write",
+              approval: mode === "plan" ? "unless_trusted" : "on_failure"
+            }),
             proposeEdit: async (req) => {
               const e = await s.pendingEdits.propose(req);
               sse.send({ type: "pending_edit", edit: e });
@@ -20101,6 +21203,26 @@ ${body2}`;
             },
             virtualRead: (p) => s.pendingEdits.virtualRead(p),
             updatePlan: (plan) => sse.send({ type: "plan", plan }),
+            checkpoint: async (opts) => {
+              await s.checkpoints.create(opts);
+              await s.checkpoints.prune(100);
+            },
+            backgroundTasks: {
+              start: (cmd, cwd) => {
+                const t = s.bgTasks.start(cmd, cwd);
+                return { id: t.id, status: t.status, startedAt: t.startedAt };
+              },
+              list: () => s.bgTasks.list().map((t) => ({
+                id: t.id,
+                command: t.command,
+                status: t.status,
+                startedAt: t.startedAt,
+                finishedAt: t.finishedAt,
+                exitCode: t.exitCode
+              })),
+              get: (id) => s.bgTasks.get(id),
+              cancel: (id) => s.bgTasks.cancel(id)
+            },
             codeIntel: {
               findSymbol: async (q, limit) => s.index ? s.index.symbols.fuzzyFind(q, limit ?? 15) : [],
               findReferences: async (name) => s.index ? s.index.symbols.findReferences(name) : [],
@@ -20138,6 +21260,8 @@ ${body2}`;
           },
           signal: abort.signal,
           llmTimeout: clientTimeout,
+          hooks: s.hookBus,
+          workspace: s.workspace,
           toolDescSubstitutions: {
             roles: (() => {
               const names = s.subagents.getProfileNames();
@@ -20181,6 +21305,10 @@ ${body2}`;
       if (persistSession && currentTurnId)
         await s.sessions.interruptTurn(rawSessionId, currentTurnId, e?.message ?? String(e)).catch(() => void 0);
     } finally {
+      while (subagentEventBuffer.length > 0) {
+        const p = subagentEventBuffer.shift();
+        sse.send(p);
+      }
       if (rawSessionId) {
         try {
           await s.subagents.awaitAllForParent(rawSessionId, 6e4);
@@ -20188,12 +21316,22 @@ ${body2}`;
         }
         const pending = s.subagents.pickPendingAnnouncements(rawSessionId);
         for (const ann of pending) sse.send({ type: "subagent_announce", message: ann });
+        if (pending.length > 0 && persistSession) {
+          for (const ann of pending) {
+            await s.sessions.append(rawSessionId, { role: "user", content: ann }).catch(() => void 0);
+          }
+          sse.send({ type: "subagent_followup", count: pending.length });
+        }
       }
       if (persistSession && currentTurnId) {
         if (userAbort)
           await s.sessions.interruptTurn(rawSessionId, currentTurnId, "user_stop").catch(() => void 0);
         else
           await s.sessions.endTurn(rawSessionId, currentTurnId, assistantBuf).catch(() => void 0);
+      }
+      if (sessionRelease) {
+        sessionRelease();
+        sessionRelease = null;
       }
       if (!userAbort && assistantBuf.length > 0 && (s.llmFast ?? s.llmChat)) {
         considerAutoMemory({
@@ -20216,221 +21354,6 @@ ${body2}`;
       sse.end();
     }
   });
-}
-
-// ../server/src/lsp-bridge.ts
-import { spawn as spawn2 } from "node:child_process";
-
-// ../../node_modules/.pnpm/ws@8.21.0/node_modules/ws/wrapper.mjs
-var import_stream = __toESM(require_stream(), 1);
-var import_extension = __toESM(require_extension(), 1);
-var import_permessage_deflate = __toESM(require_permessage_deflate(), 1);
-var import_receiver = __toESM(require_receiver(), 1);
-var import_sender = __toESM(require_sender(), 1);
-var import_subprotocol = __toESM(require_subprotocol(), 1);
-var import_websocket = __toESM(require_websocket(), 1);
-var import_websocket_server = __toESM(require_websocket_server(), 1);
-
-// ../server/src/lsp-bridge.ts
-function attachLspBridge(httpServer, opts) {
-  const path27 = opts.path ?? "/lsp";
-  const wss = new import_websocket_server.default({ noServer: true });
-  httpServer.on("upgrade", (req, socket, head) => {
-    const url = req.url ?? "";
-    if (!url.startsWith(path27)) return;
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      const lang = url.slice(path27.length).replace(/^\//, "") || "ts";
-      handleConnection(ws, lang, opts.cwd);
-    });
-  });
-  console.log(`[lsp] bridge ready on ws://host${path27}/<lang>`);
-}
-function handleConnection(ws, lang, cwd) {
-  let child = null;
-  try {
-    child = spawnLsp(lang, cwd);
-  } catch (e) {
-    console.error("[lsp] spawn failed", e);
-    ws.close(1011, `LSP for ${lang} not available`);
-    return;
-  }
-  child.on("error", (err) => {
-    console.warn(`[lsp] ${lang} child error: ${err.message}. Hint: npm i -g typescript typescript-language-server`);
-    try {
-      ws.close(1011, "LSP backend not installed");
-    } catch {
-    }
-  });
-  console.log(`[lsp] ws connected for ${lang} (pid=${child.pid})`);
-  ws.on("message", (data) => {
-    if (!child || !child.stdin.writable) return;
-    const text = typeof data === "string" ? data : data.toString("utf-8");
-    const payload = `Content-Length: ${Buffer.byteLength(text, "utf8")}\r
-\r
-${text}`;
-    try {
-      child.stdin.write(payload);
-    } catch {
-    }
-  });
-  let buf = Buffer.alloc(0);
-  child.stdout.on("data", (chunk) => {
-    buf = Buffer.concat([buf, chunk]);
-    while (true) {
-      const headerEnd = buf.indexOf("\r\n\r\n");
-      if (headerEnd === -1) return;
-      const header = buf.slice(0, headerEnd).toString("utf8");
-      const m = /Content-Length: (\d+)/i.exec(header);
-      if (!m) {
-        buf = buf.slice(headerEnd + 4);
-        continue;
-      }
-      const len = Number(m[1]);
-      const total = headerEnd + 4 + len;
-      if (buf.length < total) return;
-      const body = buf.slice(headerEnd + 4, total).toString("utf8");
-      buf = buf.slice(total);
-      try {
-        ws.send(body);
-      } catch {
-      }
-    }
-  });
-  child.stderr.on("data", (c) => {
-    process.stderr.write(`[lsp/${lang}] ${c}`);
-  });
-  child.on("exit", (code) => {
-    console.log(`[lsp] ${lang} child exited code=${code}`);
-    try {
-      ws.close();
-    } catch {
-    }
-  });
-  ws.on("close", () => {
-    console.log(`[lsp] ws closed for ${lang}`);
-    child?.kill();
-  });
-  ws.on("error", () => child?.kill());
-}
-function spawnLsp(lang, cwd) {
-  switch (lang) {
-    case "ts":
-    case "tsx":
-    case "js":
-    case "jsx":
-    case "typescript":
-    case "javascript":
-      return spawn2("typescript-language-server", ["--stdio"], { cwd });
-    default:
-      throw new Error(`Unsupported lang for LSP: ${lang}`);
-  }
-}
-
-// ../server/src/terminal-bridge.ts
-import { spawn as spawn3 } from "node:child_process";
-function attachTerminalBridge(httpServer, opts) {
-  const pathPrefix = opts.path ?? "/terminal";
-  const wss = new import_websocket_server.default({ noServer: true });
-  httpServer.on("upgrade", (req, socket, head) => {
-    const url = req.url ?? "";
-    if (!url.startsWith(pathPrefix)) return;
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      handleConnection2(ws, opts);
-    });
-  });
-  console.log(`[terminal] bridge ready on ws://host${pathPrefix}`);
-}
-function pickShell(override) {
-  if (override) return { cmd: override, args: [] };
-  const envShell = process.env.SHELL;
-  if (envShell) return { cmd: envShell, args: ["-i"] };
-  if (process.platform === "win32") {
-    return { cmd: "powershell.exe", args: ["-NoLogo"] };
-  }
-  return { cmd: "/bin/sh", args: ["-i"] };
-}
-function handleConnection2(ws, opts) {
-  let child = null;
-  try {
-    const { cmd, args } = pickShell(opts.shell);
-    child = spawn3(cmd, args, {
-      cwd: opts.cwd,
-      env: { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" }
-    });
-    console.log(`[terminal] spawned ${cmd} (pid=${child.pid}) cwd=${opts.cwd}`);
-  } catch (e) {
-    safeSend(ws, { type: "data", data: `\r
-[terminal] failed to spawn shell: ${e?.message ?? e}\r
-` });
-    ws.close(1011, "spawn failed");
-    return;
-  }
-  child.on("error", (err) => {
-    safeSend(ws, { type: "data", data: `\r
-[terminal] shell error: ${err.message}\r
-` });
-  });
-  ws.on("message", (raw) => {
-    if (!child) return;
-    let msg;
-    try {
-      msg = JSON.parse(typeof raw === "string" ? raw : raw.toString("utf-8"));
-    } catch {
-      return;
-    }
-    switch (msg.type) {
-      case "input": {
-        if (child.stdin.writable && typeof msg.data === "string") {
-          try {
-            child.stdin.write(msg.data);
-          } catch {
-          }
-        }
-        break;
-      }
-      case "signal": {
-        try {
-          child.kill(msg.sig === "SIGTERM" ? "SIGTERM" : "SIGINT");
-        } catch {
-        }
-        break;
-      }
-      case "resize": {
-        break;
-      }
-    }
-  });
-  const forward = (data) => {
-    safeSend(ws, { type: "data", data: data.toString("utf-8") });
-  };
-  child.stdout.on("data", forward);
-  child.stderr.on("data", forward);
-  child.on("exit", (code) => {
-    safeSend(ws, { type: "exit", code: code ?? 0 });
-    try {
-      ws.close();
-    } catch {
-    }
-  });
-  ws.on("close", () => {
-    try {
-      child?.kill();
-    } catch {
-    }
-  });
-  ws.on("error", () => {
-    try {
-      child?.kill();
-    } catch {
-    }
-  });
-}
-function safeSend(ws, obj) {
-  if (ws.readyState !== ws.OPEN) return;
-  try {
-    ws.send(JSON.stringify(obj));
-  } catch {
-  }
 }
 
 // src/main.ts
@@ -20458,10 +21381,46 @@ function takeToken(ip, capacity, windowMs = 6e4) {
   }
   return false;
 }
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of buckets) {
+    if (now - v.lastRefill > 5 * 6e4) buckets.delete(k);
+  }
+}, 6e4).unref();
+var metrics = { requests: 0, errors4xx: 0, errors5xx: 0, activeSse: 0, startTime: Date.now() };
+function metricsSnapshot() {
+  return {
+    requests: metrics.requests,
+    errors4xx: metrics.errors4xx,
+    errors5xx: metrics.errors5xx,
+    activeSse: metrics.activeSse,
+    bucketCount: buckets.size,
+    uptimeMs: Date.now() - metrics.startTime
+  };
+}
 var authTokens = /* @__PURE__ */ new Set();
 if (env.AUTH_TOKEN) authTokens.add(env.AUTH_TOKEN);
 for (const t of env.AUTH_TOKENS) authTokens.add(t);
 var authBypass = /* @__PURE__ */ new Set(["/health", "/api/health", "/api/version"]);
+function constTimeMatchAny(input, valid) {
+  const inputBuf = Buffer.from(input);
+  let matched = false;
+  for (const v of valid) {
+    const vBuf = Buffer.from(v);
+    if (vBuf.length !== inputBuf.length) {
+      try {
+        crypto3.timingSafeEqual(vBuf, vBuf);
+      } catch {
+      }
+      continue;
+    }
+    try {
+      if (crypto3.timingSafeEqual(inputBuf, vBuf)) matched = true;
+    } catch {
+    }
+  }
+  return matched;
+}
 function checkAuth(req, pathname) {
   if (authTokens.size === 0) return true;
   if (authBypass.has(pathname)) return true;
@@ -20469,7 +21428,8 @@ function checkAuth(req, pathname) {
   const fromBearer = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   const fromHeader = req.headers["x-mini-token"] ?? "";
   const provided = fromBearer || fromHeader;
-  return !!provided && authTokens.has(provided);
+  if (!provided) return false;
+  return constTimeMatchAny(provided, authTokens);
 }
 async function main() {
   console.log(`[server-node] workspace = ${env.WORKSPACE}`);
@@ -20477,12 +21437,14 @@ async function main() {
   const t0 = performance.now();
   const services = new Services(env.WORKSPACE);
   await services.init();
+  services.metricsProvider = () => metricsSnapshot();
   console.log(`[server-node] services ready (${(performance.now() - t0).toFixed(1)}ms)`);
   const router = new Router();
   registerHandlers(router, services);
   console.log(`[server-node] ${router.snapshot().length} routes registered`);
   const handler = async (req, res) => {
     const start = Date.now();
+    metrics.requests += 1;
     const reqIp = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket.remoteAddress || "unknown";
     let url;
     try {
@@ -20498,13 +21460,19 @@ async function main() {
       return;
     }
     if (!checkAuth(req, pathname)) {
+      metrics.errors4xx += 1;
       return sendJson(res, 401, { error: "unauthorized", hint: "Missing/invalid token" });
     }
-    if (!takeToken(reqIp, env.RATE_LIMIT)) {
-      return sendJson(res, 429, { error: "rate limit exceeded" });
+    const isHealth = pathname === "/health" || pathname === "/api/health" || pathname === "/api/version";
+    if (!isHealth && !takeToken(reqIp, env.RATE_LIMIT)) {
+      metrics.errors4xx += 1;
+      res.setHeader("Retry-After", "60");
+      return sendJson(res, 429, { error: "rate_limited", scope: "global", hint: "Try later" });
     }
     if (pathname === "/api/chat" && !takeToken(`chat:${reqIp}`, env.RATE_LIMIT_CHAT)) {
-      return sendJson(res, 429, { error: "chat rate limit exceeded" });
+      metrics.errors4xx += 1;
+      res.setHeader("Retry-After", "60");
+      return sendJson(res, 429, { error: "rate_limited", scope: "chat", hint: "LLM cost protected" });
     }
     const match = router.match(method, pathname);
     if (!match) {
@@ -20529,8 +21497,13 @@ async function main() {
       }
     } finally {
       const dur = Date.now() - start;
-      if (pathname !== "/api/chat" && pathname !== "/api/inline-edit") {
-        console.log(`[http] ${method} ${pathname} ${res.statusCode} ${dur}ms`);
+      const code = res.statusCode;
+      if (code >= 500) metrics.errors5xx += 1;
+      else if (code >= 400) metrics.errors4xx += 1;
+      if (pathname !== "/api/chat" && pathname !== "/api/inline-edit" && pathname !== "/api/fs/events") {
+        const level = code >= 500 ? "ERROR" : code >= 400 ? "WARN" : "INFO";
+        const logFn = code >= 500 ? console.error : code >= 400 ? console.warn : console.log;
+        logFn(`[http] ${level} ${method} ${pathname} ${code} ${dur}ms ip=${reqIp}`);
       }
     }
   };

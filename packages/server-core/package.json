@@ -1,0 +1,22 @@
+{
+  "name": "@mini/server-core",
+  "version": "0.0.1",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mini/core": "workspace:*",
+    "@mini/indexer": "workspace:*",
+    "chokidar": "^5.0.0",
+    "ws": "^8.18.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.4.5"
+  }
+}

@@ -2,7 +2,7 @@
 /**
  * handlers/register.ts —— 在 Router 上注册所有 HTTP endpoints
  * ---------------------------------------------------------------
- * 与 apps/server/src/main.ts 的 express 实现一一对应，只是把
+ * 与原 Express 版 (apps/server, 已废弃删除) 实现一一对应，只是把
  *   app.get/.post('/api/xxx', (req, res) => ...)
  * 换成
  *   r.get/.post('/api/xxx', async (ctx) => ...)
@@ -21,58 +21,66 @@ import {
   callStructured,
   type ChatMessage,
 } from '@mini/core';
-import { hybridRetrieve } from '../../../server/src/retrieval.js';
-import { decideCommand } from '../../../server/src/exec-policy.js';
-import { parseMentions } from '../../../server/src/mentions.js';
-import { isGitRepo, gitStatus, gitDiff, gitBranch, gitLog, gitCommit } from '../../../server/src/git-helpers.js';
-import { createProvider } from '../../../server/src/llm-router.js';
-import { McpManager } from '../../../server/src/mcp-client.js';
-import type { ProviderProfile } from '../../../server/src/providers.js';
-
-function detectMultiStepHint(userMessage: string): string | null {
-  const patterns = [
-    /\b(all|every|each)\b.*\b(file|function|class|method)\b/i,
-    /(\d+[.)]\s+.+){2,}/,
-    /\b(then|and then|after that|next)\b/i,
-    /先.{2,20}再.{2,20}/,
-    /分别|并行|同时|批量|全部|所有/,
-    /parallel|simultaneously/i,
-  ];
-  const isMultiStep = patterns.some((p) => p.test(userMessage));
-  const pathMatches = userMessage.match(/\b[\w\/.-]+\.\w{1,6}\b/g) ?? [];
-  const hasMultiFile = new Set(pathMatches).size >= 3;
-  if (!isMultiStep && !hasMultiFile) return null;
-  return (
-    '\n[context] This user message appears to involve multiple steps or files. ' +
-    'IMPORTANT: Before executing, call `update_plan` to list all steps with status=pending, ' +
-    'set the first step to in_progress, then execute. Update after each step.'
-  );
-}
-
-function globToRegex(glob: string): RegExp {
-  let out = '^'; let i = 0;
-  while (i < glob.length) {
-    const c = glob[i];
-    if (c === '*') {
-      if (glob[i + 1] === '*') { out += '.*'; i += 2; }
-      else { out += '[^/]*'; i++; }
-    } else if (c === '?') { out += '.'; i++; }
-    else if (c === '{') {
-      const end = glob.indexOf('}', i);
-      if (end < 0) { out += '\\{'; i++; }
-      else {
-        const opts = glob.slice(i + 1, end).split(',').map((x) => x.replace(/[.+^$()|[\]\\]/g, '\\$&'));
-        out += '(?:' + opts.join('|') + ')';
-        i = end + 1;
-      }
-    } else if (/[.+^$()|[\]\\]/.test(c)) { out += '\\' + c; i++; }
-    else { out += c; i++; }
-  }
-  out += '$';
-  return new RegExp(out);
-}
+import {
+  hybridRetrieve, parseMentions,
+  isGitRepo, gitStatus, gitDiff, gitBranch,
+  gitLog, gitCommit, gitShow, gitRevert, gitAccept,
+  createProvider, permissionAwareDecide,
+  McpManager,
+  type ProviderProfile,
+  detectMultiStepHint, globToRegex,
+  runDiagnostics, createDiagCache, DIAG_TTL_MS,
+  type DiagCache, type Diagnostic,
+} from '@mini/server-core';
 
 const VSCODE_TARGET = process.env.VSCODE_URL ?? 'http://127.0.0.1:8000';
+
+// ---- Subagent 事件缓冲 + 节流 ----
+interface SubagentEvent {
+  type: 'subagent_text' | 'subagent_tool' | 'subagent_progress';
+  runId: string;
+  text?: string;
+  tool?: string;
+  resultPreview?: string;
+  ts: number;
+}
+const subagentEventBuffer: SubagentEvent[] = [];
+const SUBAGENT_EVENT_BUFFER_CAP = 300;
+const subagentTextAccum = new Map<string, { text: string; lastFlush: number }>();
+const SUBAGENT_TEXT_FLUSH_INTERVAL = 200; // ms
+
+function flushSubagentTextBuffer(): void {
+  const now = Date.now();
+  for (const [runId, acc] of subagentTextAccum) {
+    if (acc.text && now - acc.lastFlush >= SUBAGENT_TEXT_FLUSH_INTERVAL) {
+      subagentEventBuffer.push({ type: 'subagent_text', runId, text: acc.text, ts: now });
+      acc.text = '';
+      acc.lastFlush = now;
+    }
+  }
+  if (subagentEventBuffer.length > SUBAGENT_EVENT_BUFFER_CAP) {
+    subagentEventBuffer.splice(0, subagentEventBuffer.length - SUBAGENT_EVENT_BUFFER_CAP);
+  }
+}
+
+/** 自动触发匹配用户输入的 Skill（最多 2 个，避免 context 膨胀） */
+async function renderAutoTriggeredSkills(
+  input: string,
+  skillStore: Services['skills'],
+): Promise<string> {
+  const matched = skillStore.matchForInput(input);
+  if (!matched.length) return '';
+  const lines = ['# Auto-triggered Skills (matched by user input)'];
+  for (const meta of matched.slice(0, 2)) {
+    const full = await skillStore.loadFull(meta.name);
+    if (full?.body) {
+      lines.push(`## ${meta.name}\n${full.body.slice(0, 3000)}`);
+    } else {
+      lines.push(`## ${meta.name}\n${meta.description}`);
+    }
+  }
+  return lines.join('\n');
+}
 
 export function registerHandlers(r: Router, s: Services) {
   
@@ -89,7 +97,30 @@ export function registerHandlers(r: Router, s: Services) {
     version: process.env.npm_package_version ?? '0.0.0-dev',
     node: process.version, platform: `${os.platform()} ${os.arch()}`,
   }));
-  r.get('/api/metrics', (c) => sendJson(c.res, 200, { ok: true, ts: Date.now() }));
+  r.get('/api/metrics', (c) => sendJson(c.res, 200, { ok: true, ts: Date.now(), ...(s.metricsProvider?.() ?? {}) }));
+
+  // ---- subagent 事件 → SSE bridge ----
+  s.subagents.on('child_text', (p: { runId: string; text: string }) => {
+    const acc = subagentTextAccum.get(p.runId) ?? { text: '', lastFlush: Date.now() };
+    acc.text += p.text;
+    subagentTextAccum.set(p.runId, acc);
+    flushSubagentTextBuffer();
+  });
+  s.subagents.on('child_tool', (p: { runId: string; tool: string }) => {
+    subagentEventBuffer.push({ type: 'subagent_tool', runId: p.runId, tool: p.tool, ts: Date.now() });
+    if (subagentEventBuffer.length > SUBAGENT_EVENT_BUFFER_CAP) {
+      subagentEventBuffer.splice(0, subagentEventBuffer.length - SUBAGENT_EVENT_BUFFER_CAP);
+    }
+  });
+  s.subagents.on('child_tool_result', (p: { runId: string; tool: string; resultPreview: string }) => {
+    subagentEventBuffer.push({
+      type: 'subagent_progress', runId: p.runId, tool: p.tool,
+      resultPreview: p.resultPreview, ts: Date.now(),
+    });
+    if (subagentEventBuffer.length > SUBAGENT_EVENT_BUFFER_CAP) {
+      subagentEventBuffer.splice(0, subagentEventBuffer.length - SUBAGENT_EVENT_BUFFER_CAP);
+    }
+  });
 
   // ---- approvals ----
   r.get('/api/approvals', (c) => sendJson(c.res, 200, s.approvals.list()));
@@ -306,6 +337,7 @@ export function registerHandlers(r: Router, s: Services) {
       sendJson(c.res, 200, { path: c.query.path ?? '', content: text, size: st.size });
     } catch (e: any) { sendJson(c.res, 500, { error: e.message }); }
   });
+  // ---- agents-window git namespace (独立于主 IDE，用 ?ws= 传入绝对路径) ----
   r.get('/api/agents/git/branch', async (c) => {
     const ws = c.query.ws;
     if (!ws || !path.isAbsolute(ws)) return sendJson(c.res, 400, { error: 'absolute ws required' });
@@ -314,6 +346,88 @@ export function registerHandlers(r: Router, s: Services) {
       const branch = await gitBranch(ws);
       sendJson(c.res, 200, { isRepo: true, branch });
     } catch (e: any) { sendJson(c.res, 500, { error: e?.message ?? String(e) }); }
+  });
+
+  r.get('/api/agents/git/status', async (c) => {
+    const ws = c.query.ws;
+    if (!ws || !path.isAbsolute(ws)) return sendJson(c.res, 400, { error: 'absolute ws required' });
+    try {
+      if (!(await isGitRepo(ws))) return sendJson(c.res, 200, { isRepo: false });
+      const [status, branch] = await Promise.all([gitStatus(ws), gitBranch(ws)]);
+      const changes = status.map((e) => ({ path: e.path, status: e.status, raw: e.staged ? e.status : ` ${e.status}` }));
+      sendJson(c.res, 200, { isRepo: true, branch, changes });
+    } catch (e: any) { sendJson(c.res, 500, { error: e?.message ?? String(e) }); }
+  });
+
+  r.get('/api/agents/git/diff', async (c) => {
+    const ws = c.query.ws;
+    if (!ws || !path.isAbsolute(ws)) return sendJson(c.res, 400, { error: 'absolute ws required' });
+    try {
+      if (!(await isGitRepo(ws))) return sendJson(c.res, 200, { isRepo: false, diff: '' });
+      const diff = await gitDiff(ws, { path: c.query.path || undefined });
+      sendJson(c.res, 200, { diff });
+    } catch (e: any) { sendJson(c.res, 500, { error: e?.message ?? String(e) }); }
+  });
+
+  r.get('/api/agents/git/log', async (c) => {
+    const ws = c.query.ws;
+    if (!ws || !path.isAbsolute(ws)) return sendJson(c.res, 400, { error: 'absolute ws required' });
+    try {
+      if (!(await isGitRepo(ws))) return sendJson(c.res, 200, { isRepo: false, commits: [] });
+      const limit = Math.min(Number(c.query.limit ?? 50), 200);
+      const entries = await gitLog(ws, limit);
+      const commits = entries.map((e) => ({
+        hash: e.hash, short: e.shortHash, author: e.author,
+        email: '', ts: new Date(e.date).getTime(), subject: e.subject,
+        isAi: e.author === 'AI' || e.subject.startsWith('ai:'),
+      }));
+      sendJson(c.res, 200, { isRepo: true, commits });
+    } catch (e: any) { sendJson(c.res, 500, { error: e?.message ?? String(e) }); }
+  });
+
+  r.get('/api/agents/git/show', async (c) => {
+    const ws = c.query.ws;
+    if (!ws || !path.isAbsolute(ws)) return sendJson(c.res, 400, { error: 'absolute ws required' });
+    const hash = c.query.hash ?? '';
+    if (!hash) return sendJson(c.res, 400, { error: 'hash required' });
+    try {
+      if (!(await isGitRepo(ws))) return sendJson(c.res, 200, { isRepo: false, diff: '' });
+      const diff = await gitShow(ws, hash);
+      sendJson(c.res, 200, { diff });
+    } catch (e: any) { sendJson(c.res, 500, { error: e?.message ?? String(e) }); }
+  });
+
+  r.post('/api/agents/git/revert', async (c) => {
+    const ws = c.query.ws;
+    if (!ws || !path.isAbsolute(ws)) return sendJson(c.res, 400, { error: 'absolute ws required' });
+    const body = await readBody(c.req);
+    const { path: filePath, status } = body ?? {};
+    if (!filePath) return sendJson(c.res, 400, { error: 'path required' });
+    try {
+      if (!(await isGitRepo(ws))) return sendJson(c.res, 400, { error: 'not a git repo' });
+      if (status === '??') {
+        // 未跟踪文件 → 直接删除
+        const abs = path.resolve(ws, filePath);
+        if (!abs.startsWith(ws)) return sendJson(c.res, 400, { error: 'escape' });
+        await fs.rm(abs, { recursive: true, force: true });
+      } else {
+        await gitRevert(ws, filePath);
+      }
+      sendJson(c.res, 200, { ok: true });
+    } catch (e: any) { sendJson(c.res, 500, { ok: false, error: e?.message ?? String(e) }); }
+  });
+
+  r.post('/api/agents/git/accept', async (c) => {
+    const ws = c.query.ws;
+    if (!ws || !path.isAbsolute(ws)) return sendJson(c.res, 400, { error: 'absolute ws required' });
+    const body = await readBody(c.req);
+    const { path: filePath, message } = body ?? {};
+    if (!filePath) return sendJson(c.res, 400, { error: 'path required' });
+    try {
+      if (!(await isGitRepo(ws))) return sendJson(c.res, 400, { error: 'not a git repo' });
+      const result = await gitAccept(ws, [filePath], message ?? `ai: ${filePath}`);
+      sendJson(c.res, 200, { ok: true, hash: result.hash, subject: result.subject });
+    } catch (e: any) { sendJson(c.res, 500, { ok: false, error: e?.message ?? String(e) }); }
   });
   // 列出某父目录下的子目录（用于"打开工作空间"对话框，浏览器 fallback）
   r.get('/api/agents/list-dirs', async (c) => {
@@ -591,50 +705,11 @@ export function registerHandlers(r: Router, s: Services) {
   });
 
   // ---- diagnostics (cached typecheck) ----
-  interface Diagnostic { file: string; line: number; col: number; severity: 'error' | 'warning'; message: string; code?: string; }
-  let diagCache: { ts: number; running: boolean; result: Diagnostic[]; lastError?: string; durationMs?: number } = {
-    ts: 0, running: false, result: [],
-  };
-  const DIAG_TTL_MS = 30_000;
-  async function runDiagnostics(): Promise<Diagnostic[]> {
-    if (diagCache.running) return diagCache.result;
-    diagCache.running = true;
-    const t0 = Date.now();
-    try {
-      const { exec } = await import('node:child_process');
-      const hasPnpm = await fs.access(path.join(s.workspace, 'pnpm-workspace.yaml')).then(() => true).catch(() => false);
-      const pkgJson = await fs.readFile(path.join(s.workspace, 'package.json'), 'utf-8').catch(() => '{}');
-      const scripts = (JSON.parse(pkgJson).scripts ?? {}) as Record<string, string>;
-      let cmd: string;
-      if (hasPnpm && scripts.typecheck) cmd = 'pnpm -r typecheck';
-      else if (scripts.typecheck) cmd = 'npm run typecheck';
-      else cmd = 'npx tsc --noEmit';
-      const result = await new Promise<{ out: string }>((resolve) => {
-        const p = exec(cmd, { cwd: s.workspace, maxBuffer: 8 * 1024 * 1024, timeout: 120_000 },
-          (_e: any, so: string, se: string) => resolve({ out: (so ?? '') + '\n' + (se ?? '') }));
-        (p as any).on?.('error', () => undefined);
-      });
-      const diagnostics: Diagnostic[] = [];
-      const tscRe = /(.+?)\((\d+),(\d+)\):\s*(error|warning)\s+(TS\d+):\s*(.+)/g;
-      for (const m of result.out.matchAll(tscRe)) {
-        let file = m[1];
-        if (path.isAbsolute(file)) file = path.relative(s.workspace, file);
-        diagnostics.push({
-          file, line: Number(m[2]), col: Number(m[3]),
-          severity: m[4] as any, message: m[6].slice(0, 300), code: m[5],
-        });
-        if (diagnostics.length >= 200) break;
-      }
-      diagCache = { ts: Date.now(), running: false, result: diagnostics, durationMs: Date.now() - t0 };
-    } catch (e: any) {
-      diagCache = { ts: Date.now(), running: false, result: [], lastError: e?.message ?? String(e), durationMs: Date.now() - t0 };
-    }
-    return diagCache.result;
-  }
+  let diagCache: DiagCache = createDiagCache();
   r.get('/api/diagnostics', async (c) => {
     const force = c.query.force === '1' || c.query.force === 'true';
     const stale = Date.now() - diagCache.ts > DIAG_TTL_MS;
-    if (force || (stale && !diagCache.running)) runDiagnostics().catch(() => undefined);
+    if (force || (stale && !diagCache.running)) runDiagnostics(s.workspace, diagCache).catch(() => undefined);
     sendJson(c.res, 200, {
       diagnostics: diagCache.result, ts: diagCache.ts, running: diagCache.running,
       durationMs: diagCache.durationMs, error: diagCache.lastError, stale,
@@ -655,14 +730,22 @@ export function registerHandlers(r: Router, s: Services) {
     sendJson(c.res, 200, e);
   });
   r.post('/api/edits/:id/accept', async (c) => {
-    try { sendJson(c.res, 200, await s.pendingEdits.accept(c.params.id)); }
+    try {
+      const e = await s.pendingEdits.accept(c.params.id);
+      s.verifyAfterAccept?.trigger([e.path]);
+      sendJson(c.res, 200, e);
+    }
     catch (e: any) { sendJson(c.res, 400, { error: e.message }); }
   });
   r.post('/api/edits/:id/reject', (c) => {
     try { sendJson(c.res, 200, s.pendingEdits.reject(c.params.id)); }
     catch (e: any) { sendJson(c.res, 400, { error: e.message }); }
   });
-  r.post('/api/edits/accept-all', async (c) => sendJson(c.res, 200, await s.pendingEdits.acceptAll()));
+  r.post('/api/edits/accept-all', async (c) => {
+    const out = await s.pendingEdits.acceptAll();
+    s.verifyAfterAccept?.trigger(out.map((e: any) => e.path));
+    sendJson(c.res, 200, out);
+  });
   r.post('/api/edits/reject-all', (c) => {
     const all = s.pendingEdits.list();
     sendJson(c.res, 200, all.map((e) => s.pendingEdits.reject(e.id)));
@@ -937,6 +1020,51 @@ export function registerHandlers(r: Router, s: Services) {
   // ---- subagents ----
   r.get('/api/subagents', (c) => sendJson(c.res, 200, s.subagents.list(c.query.parent || undefined)));
 
+  // ---- subagent profiles (前端 SubagentLauncher role picker) ----
+  r.get('/api/subagents/profiles', (c) => {
+    sendJson(c.res, 200, { profiles: s.subagents.getProfileNames() });
+  });
+
+  // ---- 直接派发 subagent（不走 LLM） ----
+  r.post('/api/subagents/spawn', async (c) => {
+    const body = await readBody(c.req);
+    const { task, label, role, parentSessionId } = body ?? {};
+    if (!task || typeof task !== 'string') {
+      return sendJson(c.res, 400, { error: 'task (string) is required' });
+    }
+    try {
+      const r = await s.subagents.spawn({
+        task,
+        label,
+        role,
+        parentSessionId: parentSessionId ?? 'manual-' + Date.now(),
+        parentDepth: 0,
+      });
+      sendJson(c.res, 200, { ok: true, runId: r.runId, childSessionId: r.childSessionId });
+    } catch (e: unknown) {
+      sendJson(c.res, 500, { error: e instanceof Error ? e.message : String(e) });
+    }
+  });
+
+  // ---- hooks metrics (Hook 系统指标) ----
+  r.get('/api/hooks/metrics', (c) => {
+    if (!s.hookBus) return sendJson(c.res, 200, { tools: {}, hooks: {} });
+    sendJson(c.res, 200, {
+      tools: s.hookMetrics?.snapshot?.() ?? {},
+      hooks: {
+        UserPromptSubmit: s.hookBus.list('UserPromptSubmit'),
+        PreToolUse: s.hookBus.list('PreToolUse'),
+        PostToolUse: s.hookBus.list('PostToolUse'),
+        Stop: s.hookBus.list('Stop'),
+      },
+    });
+  });
+
+  // ---- background tasks ----
+  r.get('/api/bg/list', (c) => {
+    sendJson(c.res, 200, { tasks: s.bgTasks?.list?.() ?? [] });
+  });
+
   // ---- mentions ----
   r.get('/api/mentions/suggest', async (c) => {
     const q = c.query.q ?? '';
@@ -1042,11 +1170,13 @@ export function registerHandlers(r: Router, s: Services) {
       mode = 'agent', sessionId: rawSessionId,
       images = [],
       timeout: clientTimeout,
+      profileId: requestedProfileId,
     } = body as {
       messages: ChatMessage[]; userMessage: string;
-      mode?: 'ask' | 'agent'; sessionId?: string;
+      mode?: 'ask' | 'agent' | 'plan'; sessionId?: string;
       images?: Array<{ type: 'image'; media_type: string; data: string }>;
       timeout?: { fetchTimeoutMs?: number; streamIdleTimeoutMs?: number };
+      profileId?: string;
     };
     const persistSession = rawSessionId && s.sessions.get(rawSessionId);
     const chatSessionId = rawSessionId ||
@@ -1086,7 +1216,9 @@ export function registerHandlers(r: Router, s: Services) {
         s.recentActivity.record(chatSessionId, { kind: 'view', target: it.label });
 
     let currentTurnId: string | null = null;
+    let sessionRelease: (() => void) | null = null;
     if (persistSession) {
+      sessionRelease = await s.sessions.lock.acquire(rawSessionId!);
       await s.sessions.append(rawSessionId!, { role: 'user', content: rawUserMessage ?? '' }).catch(() => undefined);
       currentTurnId = await s.sessions.startTurn(rawSessionId!, rawUserMessage ?? '').catch(() => null as any);
     }
@@ -1138,6 +1270,8 @@ export function registerHandlers(r: Router, s: Services) {
       memory: s.memory,
       meta: { cwd: s.workspace, os: `${os.platform()} ${os.release()}` },
       images,
+      sandbox: mode === 'plan' ? 'read_only' : 'workspace_write',
+      approvalPolicy: 'on_failure',
       systemExtras: [
         s.projectMemory.renderForSystem(),
         s.skills.renderForSystem(),
@@ -1152,6 +1286,8 @@ export function registerHandlers(r: Router, s: Services) {
         ruleExtra,
         detectMultiStepHint(userMessage),
         s.recentActivity.render(chatSessionId),
+        await renderAutoTriggeredSkills(userMessage, s.skills),
+        s.verifyAfterAccept?.consumeForSystem(),
       ].filter(Boolean) as string[],
       providerFlavor:
         chatProfile?.kind === 'anthropic' ? 'anthropic' :
@@ -1160,7 +1296,11 @@ export function registerHandlers(r: Router, s: Services) {
         'generic',
       injectionCache: s.injectionCache,
       sessionId: chatSessionId,
-      compaction: { model: chatModel, summarize: llmSummarize },
+      compaction: {
+        model: chatModel,
+        tokenOpts: { contextWindowOverride: chatProfile?.contextWindow },
+        summarize: llmSummarize,
+      },
       onMemoryRecalled: (items) => { if (items.length) sse.send({ type: 'memory_recalled', items }); },
     });
 
@@ -1171,14 +1311,30 @@ export function registerHandlers(r: Router, s: Services) {
       const abort = new AbortController();
       c.req.on('close', () => { userAbort = true; abort.abort(); });
 
-      const llmRouted = s.buildLlmFor('chat', (info) => sse.send({ type: 'provider_switch', ...info }));
+      // profileId: 如果前端指定了某个 provider，走单 profile；否则 auto-routing
+      let llmRouted: import('@mini/core').LLMProvider;
+      if (requestedProfileId) {
+        const requested = s.providers.get(requestedProfileId);
+        if (requested) {
+          llmRouted = createProvider(requested);
+        } else {
+          sse.send({ type: 'error', error: `requested profile "${requestedProfileId}" not found, falling back to auto-routing` });
+          llmRouted = s.buildLlmFor('chat', (info) => sse.send({ type: 'provider_switch', ...info }));
+        }
+      } else {
+        llmRouted = s.buildLlmFor('chat', (info) => sse.send({ type: 'provider_switch', ...info }));
+      }
 
-      if (mode === 'ask') {
-        const noToolRegistry = new ToolRegistry();
+      if (mode === 'ask' || mode === 'plan') {
+        const noToolRegistry = mode === 'plan'
+          ? s.registry.filter(ToolRegistry.CHAT_ONLY_PROFILE)
+          : new ToolRegistry();
         for await (const ev of runAgent({
           llm: llmRouted, registry: noToolRegistry, messages: initial,
           toolCtx: { cwd: s.workspace }, signal: abort.signal, maxSteps: 1,
           llmTimeout: clientTimeout,
+          hooks: s.hookBus,
+          workspace: s.workspace,
         })) {
           if (ev.type === 'text' && ev.text) {
             assistantBuf += ev.text;
@@ -1189,8 +1345,12 @@ export function registerHandlers(r: Router, s: Services) {
           sse.send(ev);
         }
       } else {
+        // Progressive Tool Disclosure: plan 模式只用只读工具，agent 模式全量
+        const activeRegistry = mode === 'plan'
+          ? s.registry.filter(ToolRegistry.CHAT_ONLY_PROFILE)
+          : s.registry;
         for await (const ev of runAgent({
-          llm: llmRouted, registry: s.registry, messages: initial,
+          llm: llmRouted, registry: activeRegistry, messages: initial,
           toolCtx: {
             cwd: s.workspace,
             approve: async (info) => {
@@ -1202,7 +1362,10 @@ export function registerHandlers(r: Router, s: Services) {
               sse.send({ type: 'approve_request', id, tool: info.tool, args: info.args });
               return (await p) === 'allow';
             },
-            execPolicy: (cmd) => decideCommand(cmd),
+            execPolicy: (cmd) => permissionAwareDecide(cmd, {
+              sandbox: mode === 'plan' ? 'read_only' : 'workspace_write',
+              approval: mode === 'plan' ? 'unless_trusted' : 'on_failure',
+            }),
             proposeEdit: async (req) => {
               const e = await s.pendingEdits.propose(req);
               sse.send({ type: 'pending_edit', edit: e });
@@ -1210,6 +1373,22 @@ export function registerHandlers(r: Router, s: Services) {
             },
             virtualRead: (p) => s.pendingEdits.virtualRead(p),
             updatePlan: (plan) => sse.send({ type: 'plan', plan }),
+            checkpoint: async (opts) => {
+              await s.checkpoints.create(opts);
+              await s.checkpoints.prune(100);
+            },
+            backgroundTasks: {
+              start: (cmd: string, cwd: string) => {
+                const t = s.bgTasks.start(cmd, cwd);
+                return { id: t.id, status: t.status, startedAt: t.startedAt };
+              },
+              list: () => s.bgTasks.list().map((t: any) => ({
+                id: t.id, command: t.command, status: t.status,
+                startedAt: t.startedAt, finishedAt: t.finishedAt, exitCode: t.exitCode,
+              })),
+              get: (id: string) => s.bgTasks.get(id),
+              cancel: (id: string) => s.bgTasks.cancel(id),
+            },
             codeIntel: {
               findSymbol: async (q, limit) => s.index ? s.index.symbols.fuzzyFind(q, limit ?? 15) : [],
               findReferences: async (name) => s.index ? s.index.symbols.findReferences(name) : [],
@@ -1241,6 +1420,8 @@ export function registerHandlers(r: Router, s: Services) {
           },
           signal: abort.signal,
           llmTimeout: clientTimeout,
+          hooks: s.hookBus,
+          workspace: s.workspace,
           toolDescSubstitutions: {
             roles: (() => {
               const names = s.subagents.getProfileNames();
@@ -1282,16 +1463,34 @@ export function registerHandlers(r: Router, s: Services) {
       if (persistSession && currentTurnId)
         await s.sessions.interruptTurn(rawSessionId!, currentTurnId, e?.message ?? String(e)).catch(() => undefined);
     } finally {
+      // flush subagent 事件 buffer
+      while (subagentEventBuffer.length > 0) {
+        const p = subagentEventBuffer.shift()!;
+        sse.send(p);
+      }
+
       if (rawSessionId) {
         try { await s.subagents.awaitAllForParent(rawSessionId, 60_000); } catch { /* */ }
         const pending = s.subagents.pickPendingAnnouncements(rawSessionId);
         for (const ann of pending) sse.send({ type: 'subagent_announce', message: ann });
+        // 将 announce 注入父 session，触发 followup
+        if (pending.length > 0 && persistSession) {
+          for (const ann of pending) {
+            await s.sessions.append(rawSessionId!, { role: 'user', content: ann }).catch(() => undefined);
+          }
+          sse.send({ type: 'subagent_followup', count: pending.length });
+        }
       }
       if (persistSession && currentTurnId) {
         if (userAbort)
           await s.sessions.interruptTurn(rawSessionId!, currentTurnId, 'user_stop').catch(() => undefined);
         else
           await s.sessions.endTurn(rawSessionId!, currentTurnId, assistantBuf).catch(() => undefined);
+      }
+      // 释放 session 并发锁
+      if (sessionRelease) {
+        sessionRelease();
+        sessionRelease = null;
       }
       if (!userAbort && assistantBuf.length > 0 && (s.llmFast ?? s.llmChat)) {
         considerAutoMemory({

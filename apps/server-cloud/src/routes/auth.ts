@@ -55,6 +55,7 @@ export const registerAuthRoutes: FastifyPluginAsync = async (app) => {
     reply.setCookie('mci_jwt', token, COOKIE_OPTS);
 
     return {
+      token,
       user: { id: user.id, username: user.username, name: user.name },
       message: '注册成功',
     };
@@ -82,6 +83,7 @@ export const registerAuthRoutes: FastifyPluginAsync = async (app) => {
     reply.setCookie('mci_jwt', token, COOKIE_OPTS);
 
     return {
+      token,
       user: { id: user.id, username: user.username, name: user.name },
       message: '登录成功',
     };

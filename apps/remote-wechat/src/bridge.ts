@@ -92,7 +92,7 @@ async function streamChat(sessionId: string, history: ChatTurn[], userMessage: s
 export function makeBridge(provider: Provider) {
   return async function handle(msg: InboundMessage) {
     const text = msg.text.trim();
-    const send = (out: string) => provider.send({ wxUserId: msg.wxUserId, roomId: msg.roomId, text: out });
+    const send = (out: string) => provider.send({ wxUserId: msg.wxUserId, roomId: msg.roomId, contextToken: msg.contextToken, text: out });
 
     // 1) 斜杠命令
     if (text === '/help') return send(HELP);

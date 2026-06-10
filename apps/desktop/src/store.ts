@@ -105,6 +105,10 @@ interface State {
   /** which entry path is currently in inline-rename mode (used by FileTree) */
   renameTarget: string | null;
   setRenameTarget: (p: string | null) => void;
+  // skills
+  /** bump this number to ask ChatPanel to reload skill list */
+  skillVersion: number;
+  bumpSkills: () => void;
   // tabs
   tabs: OpenTab[];
   activeTab: string | null;
@@ -266,6 +270,8 @@ export const useStore = create<State>((set, get) => ({
   renameTarget: null,
   setRenameTarget(p) { set({ renameTarget: p }); },
   bumpTree() { set((s) => ({ treeVersion: s.treeVersion + 1 })); },
+  skillVersion: 0,
+  bumpSkills() { set((s) => ({ skillVersion: s.skillVersion + 1 })); },
   async loadTree(p = '.') {
     const r = await fetch(`/api/files?path=${encodeURIComponent(p)}`);
     const data = await r.json();

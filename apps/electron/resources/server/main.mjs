@@ -16353,6 +16353,8 @@ var SkillStore = class {
   cache = /* @__PURE__ */ new Map();
   fullCache = /* @__PURE__ */ new Map();
   watcher = null;
+  /** 文件变更导致自动重载后的回调（用于 SSE 通知前端） */
+  onChange;
   constructor(workspace) {
     this.workspace = workspace;
   }
@@ -16379,19 +16381,33 @@ var SkillStore = class {
     const projectDir = await findExistingDir(this.workspace, ".minicodeide", "skills");
     const userDir = await findExistingDir(os3.homedir(), ".minicodeide", "skills");
     const dirs = [projectDir, userDir].filter((d) => d !== "");
+    if (!projectDir) {
+      const created = await ensureSkillsDir(this.workspace, ".minicodeide", "skills");
+      if (created) dirs.push(created);
+    }
+    if (!userDir) {
+      const created = await ensureSkillsDir(os3.homedir(), ".minicodeide", "skills");
+      if (created) dirs.push(created);
+    }
+    if (dirs.length === 0) {
+      dirs.push(this.workspace);
+    }
     this.watcher = chokidar_default.watch(dirs, {
       ignoreInitial: true,
-      depth: 2,
-      // 只关心 SKILL.md 文件变化
+      depth: 3,
       ignored: (p) => {
         const base = path19.basename(p);
-        return base !== "SKILL.md" && !p.endsWith("/skills") && !dirs.some((d) => p === d);
+        if (base === "SKILL.md") return false;
+        if (!path19.extname(base)) return false;
+        return true;
       }
     });
     const reload = () => {
-      this.load().catch((e) => console.warn("[skills] hot-reload failed:", e));
+      this.load().then(() => {
+        this.onChange?.();
+      }).catch((e) => console.warn("[skills] hot-reload failed:", e));
     };
-    this.watcher.on("add", reload).on("change", reload).on("unlink", reload);
+    this.watcher.on("add", reload).on("change", reload).on("unlink", reload).on("addDir", reload);
     console.log("[skills] watching for changes in", dirs.join(", "));
   }
   stopWatch() {
@@ -16610,6 +16626,27 @@ async function findExistingDir(parent, dirName, subDir) {
   } catch {
   }
   return exact;
+}
+async function ensureSkillsDir(parent, dirName, subDir) {
+  const parentDir = path19.join(parent, dirName);
+  try {
+    const stat4 = await fs19.stat(parentDir);
+    if (!stat4.isDirectory()) return "";
+  } catch {
+    return "";
+  }
+  const target = path19.join(parentDir, subDir);
+  try {
+    const stat4 = await fs19.stat(target);
+    if (stat4.isDirectory()) return target;
+  } catch {
+  }
+  try {
+    await fs19.mkdir(target, { recursive: false });
+    return target;
+  } catch {
+    return "";
+  }
 }
 
 // ../server/src/subagent-manager.ts
@@ -18199,6 +18236,18 @@ var Services = class {
     await this.sessions.load();
     this.skills = new SkillStore(this.workspace);
     await this.skills.load();
+    this.skills.onChange = () => {
+      const data = JSON.stringify({ event: "skills.changed" });
+      for (const client of this.fsEventClients) {
+        try {
+          client.write(`data: ${data}
+
+`);
+        } catch {
+        }
+      }
+    };
+    this.skills.startWatch();
     try {
       await this.mcpManager?.closeAll();
     } catch {
@@ -18296,6 +18345,18 @@ var Services = class {
     await this.sessions.load();
     this.skills = new SkillStore(this.workspace);
     await this.skills.load();
+    this.skills.onChange = () => {
+      const data = JSON.stringify({ event: "skills.changed" });
+      for (const client of this.fsEventClients) {
+        try {
+          client.write(`data: ${data}
+
+`);
+        } catch {
+        }
+      }
+    };
+    this.skills.startWatch();
     this.approvals = new ApprovalsStore();
     this.subagents = new SubagentManager({
       llm: () => this.llmFast ?? this.llmChat,

@@ -58,6 +58,8 @@ export class SkillStore {
   private cache = new Map<string, SkillMeta>();
   private fullCache = new Map<string, SkillFull>();
   private watcher: FSWatcher | null = null;
+  /** 文件变更导致自动重载后的回调（用于 SSE 通知前端） */
+  onChange?: () => void;
 
   constructor(workspace: string) {
     this.workspace = workspace;
@@ -66,8 +68,6 @@ export class SkillStore {
   async load(): Promise<void> {
     this.cache.clear();
     this.fullCache.clear();
-    // 尝试大小写变体扫描：.minicodeide / .minicodeIde / .MiniCodeIde
-    // macOS APFS 默认大小写不敏感通常不会出问题，但某些配置下会
     const projectDir = await findExistingDir(this.workspace, '.minicodeide', 'skills');
     const userDir = await findExistingDir(os.homedir(), '.minicodeide', 'skills');
     // 注意先加载 user 再加载 project，让 project 同名覆盖 user
@@ -92,19 +92,43 @@ export class SkillStore {
     const projectDir = await findExistingDir(this.workspace, '.minicodeide', 'skills');
     const userDir = await findExistingDir(os.homedir(), '.minicodeide', 'skills');
     const dirs = [projectDir, userDir].filter((d) => d !== '');
+
+    // 如果 skills 目录不存在但 .minicodeide 父目录存在，确保 skills 子目录存在
+    // （这样 chokidar 能 watch 到一个真实存在的目录，新建 skill 时能触发事件）
+    if (!projectDir) {
+      const created = await ensureSkillsDir(this.workspace, '.minicodeide', 'skills');
+      if (created) dirs.push(created);
+    }
+    if (!userDir) {
+      const created = await ensureSkillsDir(os.homedir(), '.minicodeide', 'skills');
+      if (created) dirs.push(created);
+    }
+
+    // 如果 dirs 仍为空（连 .minicodeide 都不存在），watch workspace 根目录作为兜底
+    // 用户首次创建 .minicodeide/skills/ 目录时 chokidar 才能检测到
+    if (dirs.length === 0) {
+      dirs.push(this.workspace);
+    }
+
     this.watcher = chokidar.watch(dirs, {
       ignoreInitial: true,
-      depth: 2,
-      // 只关心 SKILL.md 文件变化
+      depth: 3,
       ignored: (p: string) => {
         const base = path.basename(p);
-        return base !== 'SKILL.md' && !p.endsWith('/skills') && !dirs.some((d) => p === d);
+        // SKILL.md → 永远关注
+        if (base === 'SKILL.md') return false;
+        // 没有扩展名 → 可能是目录，让 chokidar 递归进去
+        if (!path.extname(base)) return false;
+        // 其他文件（.json, .ts, .md 非 SKILL.md 等）→ 忽略
+        return true;
       },
     });
     const reload = () => {
-      this.load().catch((e) => console.warn('[skills] hot-reload failed:', e));
+      this.load().then(() => {
+        this.onChange?.();
+      }).catch((e) => console.warn('[skills] hot-reload failed:', e));
     };
-    this.watcher.on('add', reload).on('change', reload).on('unlink', reload);
+    this.watcher.on('add', reload).on('change', reload).on('unlink', reload).on('addDir', reload);
     console.log('[skills] watching for changes in', dirs.join(', '));
   }
 
@@ -366,4 +390,30 @@ async function findExistingDir(parent: string, dirName: string, subDir: string):
 
   // 都没找到，返回原始路径（scanDir 会 graceful 处理不存在的目录）
   return exact;
+}
+
+/**
+ * 如果 parent/dirName/ 是一个已存在的目录，但其中没有 subDir 子目录，
+ * 则创建 subDir 并返回完整路径。不存在的 parent 不会创建。
+ * 返回空字符串表示没有创建（parent 不存在或已存在 subDir）。
+ */
+async function ensureSkillsDir(parent: string, dirName: string, subDir: string): Promise<string> {
+  const parentDir = path.join(parent, dirName);
+  try {
+    const stat = await fs.stat(parentDir);
+    if (!stat.isDirectory()) return '';
+  } catch {
+    return ''; // parent/dirName 不存在，不创建
+  }
+  const target = path.join(parentDir, subDir);
+  try {
+    const stat = await fs.stat(target);
+    if (stat.isDirectory()) return target; // 已存在
+  } catch { /* 不存在 */ }
+  try {
+    await fs.mkdir(target, { recursive: false }); // 只创建 skills，不递归创建 .minicodeide
+    return target;
+  } catch {
+    return '';
+  }
 }

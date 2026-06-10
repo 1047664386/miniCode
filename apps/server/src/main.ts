@@ -307,8 +307,11 @@ console.log(`[sessions] loaded ${sessions.list().length} historical sessions`);
 const skills = new SkillStore(WORKSPACE);
 await skills.load();
 console.log(`[skills] loaded ${skills.list().length} skills`);
-// 启动热更新监听（与 Agent Profile watcher 设计对齐）
-skills.startWatch(); // async but fire-and-forget is fine
+// onChange 先注册，再启动 watch（确保 chokidar 首次触发 reload 时 onChange 已就绪）
+// 注意：skills.onChange = () => { ... } 在 watcher.start() 之后赋值（见下方），
+// 但 startWatch() 是异步的（chokidar 初始化），所以实际上 onChange 会在首次事件前赋值。
+// 为安全起见，startWatch 放在 onChange 赋值之后。
+// → 移到 watcher.start() 之后
 
 /**
  * Skill 自动触发：用户输入匹配 skill 的 triggers 字段时，自动加载全文注入 context。
@@ -512,6 +515,16 @@ const watcher = new IndexWatcher({
   },
 });
 watcher.start();
+
+// Skill 文件变更时通过 SSE 通知前端刷新列表
+skills.onChange = () => {
+  const data = JSON.stringify({ event: 'skills.changed' });
+  for (const client of fsEventClients) {
+    try { client.write(`data: ${data}\n\n`); } catch { /* client disconnected */ }
+  }
+};
+// 启动热更新监听（onChange 已注册，chokidar 触发 reload 时能正确通知前端）
+skills.startWatch();
 
 // ----- HTTP -------------------------------------------------------
 const app = express();

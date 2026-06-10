@@ -116,6 +116,14 @@ export class Services {
     await this.sessions.load();
     this.skills = new SkillStore(this.workspace);
     await this.skills.load();
+    // Skill 文件变更时通过 SSE 通知前端刷新列表
+    this.skills.onChange = () => {
+      const data = JSON.stringify({ event: 'skills.changed' });
+      for (const client of this.fsEventClients) {
+        try { client.write(`data: ${data}\n\n`); } catch { /* client disconnected */ }
+      }
+    };
+    this.skills.startWatch();
 
     // 重建 MCP
     try { await this.mcpManager?.closeAll(); } catch { /* ignore */ }
@@ -215,6 +223,14 @@ export class Services {
     await this.sessions.load();
     this.skills = new SkillStore(this.workspace);
     await this.skills.load();
+    // Skill 文件变更时通过 SSE 通知前端刷新列表
+    this.skills.onChange = () => {
+      const data = JSON.stringify({ event: 'skills.changed' });
+      for (const client of this.fsEventClients) {
+        try { client.write(`data: ${data}\n\n`); } catch { /* client disconnected */ }
+      }
+    };
+    this.skills.startWatch();
 
     // ----- Approvals -----------------------------------
     this.approvals = new ApprovalsStore();

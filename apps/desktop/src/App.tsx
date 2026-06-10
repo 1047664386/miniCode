@@ -167,12 +167,37 @@ export function App() {
     };
   }, []);
 
-  // ---- composer event bridge: code-server (vscode-bridge-ext) → main shell ----
-  // 监听 server-node 的 SSE 事件流，把 VSCode 模式下用户右键 "Add to MCI Composer" 的
-  // payload 转成 store.addAttachment + 打开 Composer。
+  // ---- SSE event bridge: 后端文件变更 + skill 变更 + VSCode composer 转发 ----
+  // 监听 /api/fs/events：文件变更 (fs_change)、skill 变更 (skills.changed) 等
+  // 监听 /api/composer/events：VSCode 模式的 composer 转发事件
   useEffect(() => {
-    const es = new EventSource('/api/composer/events');
-    es.onmessage = (ev) => {
+    // ── /api/fs/events：后端 chokidar 检测到的所有变更 ──
+    let fsEs: EventSource | null = null;
+    let fsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    const connectFs = () => {
+      try {
+        fsEs = new EventSource('/api/fs/events');
+        fsEs.onmessage = (ev) => {
+          try {
+            const data = JSON.parse(ev.data);
+            // skill 文件变更事件（由 SkillStore.onChange 通过 fsEventClients 推送）
+            if (data.event === 'skills.changed') {
+              useStore.getState().bumpSkills();
+            }
+          } catch { /* ignore */ }
+        };
+        fsEs.onerror = () => {
+          fsEs?.close();
+          fsEs = null;
+          fsReconnectTimer = setTimeout(connectFs, 5000);
+        };
+      } catch { /* EventSource not available */ }
+    };
+    connectFs();
+
+    // ── /api/composer/events：VSCode code-server 转发的事件 ──
+    const compEs = new EventSource('/api/composer/events');
+    compEs.onmessage = (ev) => {
       try {
         const data = JSON.parse(ev.data);
         if (!data?.event) return;
@@ -181,7 +206,6 @@ export function App() {
           const p = data.payload || {};
           const wsPath: string = p.wsPath || '';
           const workspace = st.workspace || '';
-          // 把绝对路径转相对路径（chips 里展示更整洁）
           const rel = workspace && wsPath.startsWith(workspace)
             ? wsPath.slice(workspace.length + 1)
             : wsPath;
@@ -197,17 +221,24 @@ export function App() {
           const api = (window as any).mciAgents;
           if (api?.openWindow) void api.openWindow();
         } else if (data.event === 'workspace.current') {
-          // VSCode 模式下，code-server 上报当前 workspace 路径
           const incomingWs = data.payload?.path;
           if (incomingWs && incomingWs !== useStore.getState().workspace) {
             useStore.setState({ workspace: incomingWs });
             pushRecent(incomingWs);
           }
+        } else if (data.event === 'skills.changed') {
+          // 兼容：如果后端通过 composer 通道推送 skills 变更，也处理
+          useStore.getState().bumpSkills();
         }
       } catch { /* ignore */ }
     };
-    es.onerror = () => { /* server-node not ready yet, EventSource will auto-retry */ };
-    return () => es.close();
+    compEs.onerror = () => { /* server-node not ready yet, EventSource will auto-retry */ };
+
+    return () => {
+      fsEs?.close();
+      if (fsReconnectTimer) clearTimeout(fsReconnectTimer);
+      compEs.close();
+    };
   }, []);
 
   const switchMode = (m: Mode) => {

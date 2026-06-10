@@ -245,11 +245,12 @@ export function ChatPanel() {
     fetch('/api/slash').then((r) => r.json()).then(setSlashList).catch(() => {});
   };
   useEffect(() => { loadSlashList(); }, []);
-  // 加载 skill 列表（workspace 变化后也刷新）
+  // 加载 skill 列表（skillVersion 变化或 workspace 变化时刷新）
+  const skillVersion = useStore((s) => s.skillVersion);
   const loadSkillList = () => {
     fetch('/api/skills').then((r) => r.json()).then(setSkillList).catch(() => {});
   };
-  useEffect(() => { loadSkillList(); }, []);
+  useEffect(() => { loadSkillList(); }, [skillVersion]);
   // workspace 切换后刷新 skill 和 slash 列表
   useEffect(() => {
     if (workspace) {

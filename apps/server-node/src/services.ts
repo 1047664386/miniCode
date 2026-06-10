@@ -74,6 +74,8 @@ export class Services {
   index: CodebaseIndex | null = null;
   private indexing = false;
   watcher!: IndexWatcher;
+  /** 文件变更 SSE 客户端集合 */
+  fsEventClients = new Set<import('http').ServerResponse>();
 
   constructor(workspace: string) {
     this.workspace = workspace;
@@ -129,6 +131,12 @@ export class Services {
       embedder: () => this.embedder,
       vectorPath: () => this.vectorPath,
       onProgress: (m) => console.log(m),
+      onFileChange: (events) => {
+        const data = JSON.stringify({ type: 'fs_change', events });
+        for (const client of this.fsEventClients) {
+          try { client.write(`data: ${data}\n\n`); } catch { /* client disconnected */ }
+        }
+      },
     });
     this.watcher.start();
     void this.ensureIndex();
@@ -265,6 +273,12 @@ export class Services {
       embedder: () => this.embedder,
       vectorPath: () => this.vectorPath,
       onProgress: (m) => console.log(m),
+      onFileChange: (events) => {
+        const data = JSON.stringify({ type: 'fs_change', events });
+        for (const client of this.fsEventClients) {
+          try { client.write(`data: ${data}\n\n`); } catch { /* client disconnected */ }
+        }
+      },
     });
     this.watcher.start();
     void this.ensureIndex();

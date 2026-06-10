@@ -52,7 +52,7 @@ interface TreeNodeProps {
 }
 
 function TreeNode({ entry, depth, onContextMenu }: TreeNodeProps) {
-  const { openFile, activeTab, renameTarget, setRenameTarget } = useStore();
+  const { openFile, activeTab, renameTarget, setRenameTarget, treeVersion } = useStore();
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState<FileEntry[]>([]);
   const [newDraft, setNewDraft] = useState<'file' | 'folder' | null>(null);
@@ -61,6 +61,15 @@ function TreeNode({ entry, depth, onContextMenu }: TreeNodeProps) {
     const r = await fetch(`/api/files?path=${encodeURIComponent(entry.path)}`);
     setChildren(await r.json());
   };
+
+  // 当 treeVersion 变化时，已展开的节点刷新子节点
+  useEffect(() => {
+    if (expanded) {
+      refreshChildren();
+    }
+    // 故意不把 expanded 加入 deps：treeVersion 每次变化都刷新已展开节点
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [treeVersion]);
 
   const toggle = async () => {
     if (entry.isDir) {
@@ -202,7 +211,7 @@ declare global {
 /* ----------------------- Main FileTree ----------------------- */
 
 export function FileTree() {
-  const { tree, loadTree, openFile, appendChatInput, closeTab, tabs, setRenameTarget } =
+  const { tree, loadTree, openFile, appendChatInput, closeTab, tabs, setRenameTarget, bumpTree } =
     useStore();
   const [ctxMenu, setCtxMenu] = useState<CtxMenuState | null>(null);
   const [rootDraft, setRootDraft] = useState<'file' | 'folder' | null>(null);
@@ -211,6 +220,44 @@ export function FileTree() {
   useEffect(() => {
     loadTree('.');
   }, []);
+
+  // 监听后端文件变更 SSE → 刷新文件树
+  useEffect(() => {
+    let es: EventSource | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const connect = () => {
+      try {
+        es = new EventSource('/api/fs/events');
+        es.onmessage = (ev) => {
+          try {
+            const data = JSON.parse(ev.data);
+            if (data.type === 'fs_change') {
+              // 文件变更事件 → 递增 treeVersion，触发所有已展开 TreeNode 刷新
+              bumpTree();
+              // 同时刷新根目录列表（处理新增/删除的顶层文件）
+              loadTree('.');
+            }
+            // fs_heartbeat 忽略
+          } catch { /* parse error, ignore */ }
+        };
+        es.onerror = () => {
+          // 连接断开，清理后延迟重连
+          es?.close();
+          es = null;
+          reconnectTimer = setTimeout(connect, 5000);
+        };
+      } catch {
+        // EventSource 不可用（极老浏览器），静默降级
+      }
+    };
+
+    connect();
+    return () => {
+      es?.close();
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+    };
+  }, [bumpTree, loadTree]);
 
   useEffect(() => {
     if (!ctxMenu) return;

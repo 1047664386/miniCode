@@ -91,6 +91,16 @@ function summarizeHard(middle: ChatMessage[]): string {
   const paths = new Set<string>();
   const tools = new Map<string, number>();
   const errors: string[] = [];
+  /** P1 修复：保留 assistant 消息中的关键决策/推理片段 */
+  const decisions: string[] = [];
+
+  // 决策关键词（中英文）
+  const decisionPatterns = [
+    /I(?:'ll| will| need to| should| decided to| plan to| think)\b[^\n.]{5,120}/gi,
+    /let me\b[^\n.]{5,120}/gi,
+    /(?:决定|接下来|需要|应该|打算|计划|先|然后|因此)[^\n。]{3,80}/g,
+    /(?:based on|because|the issue is|the problem|root cause)[^\n.]{5,120}/gi,
+  ];
 
   for (const m of middle) {
     const txt = (m.content ?? '').toString();
@@ -108,10 +118,38 @@ function summarizeHard(middle: ChatMessage[]): string {
     for (const e of txt.matchAll(/(?:Error|error|failed|exception)[:\s][^\n]{0,180}/gi)) {
       if (errors.length < 5) errors.push(e[0].slice(0, 180));
     }
+
+    // P1 修复：从 assistant 消息中提取决策/推理片段
+    if (m.role === 'assistant' && txt.length > 10) {
+      let matchedInThisMsg = false;
+      for (const pattern of decisionPatterns) {
+        for (const match of txt.matchAll(pattern)) {
+          if (decisions.length < 5) {
+            decisions.push(match[0].trim().slice(0, 120));
+            matchedInThisMsg = true;
+          }
+        }
+        if (decisions.length >= 5) break;
+      }
+      // CR fix (P3): 只有当这条 assistant 消息没匹配到任何决策时，才 fallback 到首句
+      // 之前用 txt.startsWith(d) 判断不可靠（d 可能在消息中间），改用 flag
+      if (decisions.length < 5 && !matchedInThisMsg) {
+        const firstSentence = txt.split(/[.\n。]/)[0]?.trim();
+        if (firstSentence && firstSentence.length > 8 && firstSentence.length < 120) {
+          // 跳过以代码围栏开头的消息（没有决策价值）
+          if (!firstSentence.startsWith('```') && !firstSentence.startsWith('~~~')) {
+            decisions.push(firstSentence);
+          }
+        }
+      }
+    }
   }
 
   const lines: string[] = [];
   lines.push(`Compacted ${middle.length} messages.`);
+  if (decisions.length) {
+    lines.push(`Key decisions/reasoning:\n  - ${decisions.join('\n  - ')}`);
+  }
   if (tools.size) {
     const sorted = [...tools.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
     lines.push(`Tool usage: ${sorted.map(([n, c]) => `${n}×${c}`).join(', ')}`);

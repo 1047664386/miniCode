@@ -131,6 +131,17 @@ export function registerHandlers(r: Router, s: Services) {
   });
 
   // ---- files ----
+
+  // SSE 端点：向前端实时推送文件变更事件（chokidar → SSE）
+  r.get('/api/fs/events', (c) => {
+    const sse = openSse(c.req, c.res);
+    sse.send({ type: 'fs_heartbeat' });
+    s.fsEventClients.add(c.res);
+    c.req.on('close', () => {
+      s.fsEventClients.delete(c.res);
+    });
+  });
+
   r.get('/api/files', async (c) => {
     const rel = c.query.path ?? '.';
     const abs = path.resolve(s.workspace, rel);
@@ -853,7 +864,7 @@ export function registerHandlers(r: Router, s: Services) {
 
   // ---- skills ----
   r.get('/api/skills', (c) => sendJson(c.res, 200,
-    s.skills.list().map((sk) => ({ name: sk.name, description: sk.description, source: sk.source, userInvocable: sk.userInvocable }))));
+    s.skills.list().map((sk) => ({ name: sk.name, description: sk.description, source: sk.source, userInvocable: sk.userInvocable, triggers: sk.triggers }))));
   r.get('/api/skills/:name', async (c) => {
     const f = await s.skills.loadFull(c.params.name);
     if (!f) return sendJson(c.res, 404, { error: 'not found' });
@@ -1051,6 +1062,10 @@ export function registerHandlers(r: Router, s: Services) {
     const manualRules: string[] = [];
     userMessage = userMessage.replace(/@rule:([\w-]+)/g, (_m, n) => { manualRules.push(n); return ''; }).trim();
 
+    // explicit skill reference /skill:xxx (from frontend "/" picker)
+    const explicitSkills: string[] = [];
+    userMessage = userMessage.replace(/\/skill:([\w-]+)/g, (_m, n) => { explicitSkills.push(n); return ''; }).trim();
+
     // mentions
     const mentionResult = await parseMentions(userMessage, { workspace: s.workspace, index: s.index });
     userMessage = mentionResult.cleanText || userMessage;
@@ -1058,6 +1073,7 @@ export function registerHandlers(r: Router, s: Services) {
 
     const sse = openSse(c.req, c.res);
     if (slashName) sse.send({ type: 'slash', command: slashName });
+    if (explicitSkills.length) sse.send({ type: 'skills_activated', skills: explicitSkills });
     if (mentionResult.items.length || mentionResult.unresolved.length) {
       sse.send({
         type: 'mentions',
@@ -1125,6 +1141,14 @@ export function registerHandlers(r: Router, s: Services) {
       systemExtras: [
         s.projectMemory.renderForSystem(),
         s.skills.renderForSystem(),
+        ...(await Promise.all(
+          explicitSkills.map(async (name) => {
+            const f = await s.skills.loadFull(name);
+            if (!f) return `[Skill "${name}" not found]`;
+            const body = f.body?.slice(0, 4000) ?? '(empty)';
+            return `─── Skill: ${f.name} (explicitly selected by user) ───\n${body}`;
+          }),
+        )).filter(Boolean),
         ruleExtra,
         detectMultiStepHint(userMessage),
         s.recentActivity.render(chatSessionId),

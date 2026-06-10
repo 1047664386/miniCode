@@ -54,8 +54,6 @@ const DENY_PROGRAMS = new Set([
   'dd',
   'mkfs', 'fdisk',
   'mount', 'umount',
-  // 网络下载（可能拉恶意 payload）
-  'curl', 'wget',
   // 远程执行
   'ssh', 'scp', 'sftp', 'rsync',
   // shell 内联执行（用来绕白名单）
@@ -71,14 +69,35 @@ const DENY_PROGRAMS = new Set([
  */
 const DANGEROUS_PATTERNS: Array<{ re: RegExp; reason: string; to: 'ask' | 'deny' }> = [
   { re: /(^|\s)-rf?\s+\/(\s|$)/, reason: '尝试 rm -rf 根目录', to: 'deny' },
+  { re: /(^|\s)-rf?\s+~(\s|$)/, reason: '尝试 rm -rf 主目录', to: 'deny' },
   { re: /(^|\s)\/etc\//, reason: '访问系统配置目录 /etc', to: 'ask' },
   { re: /(^|\s)\/Users\/[^/\s]+\/\.ssh/, reason: '访问 SSH 私钥目录', to: 'deny' },
   { re: /(^|\s)\$HOME\/\.ssh/, reason: '访问 SSH 私钥目录', to: 'deny' },
+  { re: /(^|\s)~\/\.ssh/, reason: '访问 SSH 私钥目录', to: 'deny' },
   { re: /(^|\s)\.aws\//, reason: '访问 AWS 凭据', to: 'deny' },
   { re: /(^|\s)127\.0\.0\.1|localhost/, reason: '访问本机服务', to: 'ask' },
   { re: /(^|\s)169\.254|192\.168|10\.\d|172\.(1[6-9]|2\d|3[01])\./, reason: '访问内网 IP', to: 'ask' },
+  // 反混淆 / 管道执行（curl|bash 等注入手法）
   { re: /base64\s+-d/, reason: 'base64 解码后执行的反混淆', to: 'deny' },
+  { re: /base64\s+--decode/, reason: 'base64 解码后执行的反混淆', to: 'deny' },
+  { re: /python[23]?\s+-c/, reason: 'python -c 内联执行', to: 'ask' },
+  { re: /node\s+-e\s/, reason: 'node -e 内联执行（可能绕过黑名单）', to: 'ask' },
+  { re: /node\s+--eval\s/, reason: 'node --eval 内联执行（可能绕过黑名单）', to: 'ask' },
+  { re: /bash\s+-c\s/, reason: 'bash -c 内联执行', to: 'ask' },
+  { re: /sh\s+-c\s/, reason: 'sh -c 内联执行', to: 'ask' },
+  // 危险写目标
   { re: />\s*\/dev\/(?!null)/, reason: '写入特殊设备文件', to: 'deny' },
+  { re: />\s*~\/\.bashrc|>\s*~\/\.zshrc|>\s*~\/\.profile/, reason: '覆写 shell 配置文件', to: 'deny' },
+  { re: />\s*\/etc\//, reason: '写入系统配置目录', to: 'deny' },
+  // 环境变量泄露
+  { re: /\$\{?AWS_SECRET|AWS_ACCESS_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY/, reason: '读取敏感环境变量', to: 'deny' },
+  // crontab 注入
+  { re: /crontab\s+-[lei]/, reason: 'crontab 修改（持久化后门风险）', to: 'deny' },
+  // launchctl / systemctl 持久化
+  { re: /launchctl\s+load|systemctl\s+(enable|start)/, reason: '注册系统服务', to: 'deny' },
+  // curl/wget 管道执行（最危险的注入手法之一）
+  // 注意：单独的 curl 命令通过 decideSegment → ask；但在 pipeline 中跟 bash/sh/python 连接时由 splitPipeline 各段判定
+  { re: /\b(curl|wget)\b.+\|\s*(bash|sh|python[23]?|node|perl|ruby)/, reason: 'curl/wget 管道到解释器（远程代码执行）', to: 'deny' },
 ];
 
 /**

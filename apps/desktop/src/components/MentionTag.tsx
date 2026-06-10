@@ -8,7 +8,7 @@
 
 import type { FC, MouseEvent } from 'react';
 
-export type MentionKind = 'file' | 'folder' | 'selection' | 'symbol';
+export type MentionKind = 'file' | 'folder' | 'selection' | 'symbol' | 'skill';
 
 export interface MentionTagProps {
   kind: MentionKind;
@@ -28,6 +28,7 @@ const ICONS: Record<MentionKind, string> = {
   folder: '📁',
   selection: '✂️',
   symbol: '🔣',
+  skill: '⚡',
 };
 
 export const MentionTag: FC<MentionTagProps> = ({
@@ -84,8 +85,8 @@ export interface ParsedMention {
   line2?: number;
 }
 
-/** 匹配 @file:path / @folder:path / @symbol:name / @selection:path:l1-l2 */
-const MENTION_RE = /@(file|folder|symbol|selection):([^\s@]+)/g;
+/** 匹配 @file:path / @folder:path / @symbol:name / @selection:path:l1-l2 / /skill:name */
+const MENTION_RE = /@(file|folder|symbol|selection):([^\s@]+)|\/skill:([\w-]+)/g;
 
 /**
  * 从消息文本中提取所有 mention，返回 { mentions, cleanText }
@@ -102,6 +103,11 @@ export function parseMentions(text: string): {
 
   let match: RegExpExecArray | null;
   while ((match = MENTION_RE.exec(text)) !== null) {
+    // /skill:name 格式
+    if (match[3]) {
+      mentions.push({ kind: 'skill', label: match[3], path: match[3] });
+      continue;
+    }
     const kind = match[1] as MentionKind;
     const raw = match[2];
 

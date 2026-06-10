@@ -36,6 +36,8 @@ export interface WatcherOptions {
   burstLimit?: number;
   /** 进度回调 */
   onProgress?: (msg: string) => void;
+  /** 文件变更回调（用于通知前端刷新文件树），debounce 后批量触发 */
+  onFileChange?: (events: Array<{ path: string; kind: 'add' | 'change' | 'unlink' }>) => void;
 }
 
 const DEFAULT_IGNORED: (string | RegExp)[] = [
@@ -51,7 +53,7 @@ const DEFAULT_IGNORED: (string | RegExp)[] = [
 export class IndexWatcher {
   private watcher?: FSWatcher;
   /** 等待处理的文件队列：add/change/unlink */
-  private pending = new Map<string, 'change' | 'unlink'>();
+  private pending = new Map<string, 'add' | 'change' | 'unlink'>();
   private timer?: NodeJS.Timeout;
   private flushing = false;
 
@@ -69,7 +71,7 @@ export class IndexWatcher {
     });
 
     this.watcher
-      .on('add', (p: string) => this.enqueue(p, 'change'))
+      .on('add', (p: string) => this.enqueue(p, 'add'))
       .on('change', (p: string) => this.enqueue(p, 'change'))
       .on('unlink', (p: string) => this.enqueue(p, 'unlink'));
 
@@ -81,9 +83,12 @@ export class IndexWatcher {
     if (this.timer) clearTimeout(this.timer);
   }
 
-  private enqueue(abs: string, kind: 'change' | 'unlink') {
+  private enqueue(abs: string, kind: 'add' | 'change' | 'unlink') {
     const rel = path.relative(this.opts.root, abs);
     if (!rel || rel.startsWith('..')) return;
+    // 对于同一文件，保留最新的事件类型（add → change 升级，但 unlink 优先）
+    const existing = this.pending.get(rel);
+    if (existing === 'unlink' && kind !== 'unlink') return; // 已删除，后续 add/change 等下次 flush
     this.pending.set(rel, kind);
     if (this.timer) clearTimeout(this.timer);
     this.timer = setTimeout(() => void this.flush(), this.opts.debounceMs ?? 300);
@@ -183,6 +188,11 @@ export class IndexWatcher {
       this.opts.onProgress?.(
         `[watcher] flushed ${batch.length} change(s); +${allNewItems.length} vectors`,
       );
+
+      // 通知前端文件树刷新（批量传递原始事件类型）
+      if (this.opts.onFileChange && batch.length > 0) {
+        this.opts.onFileChange(batch.map(([path, kind]) => ({ path, kind })));
+      }
 
       // 异步持久化 vectors（不阻塞）
       if (allNewItems.length) {

@@ -120,6 +120,21 @@ const BUILTIN: SlashCommand[] = [
       `- The user's overall goal\n- Decisions made\n- Files / functions touched\n- Outstanding TODOs (if any)\n` +
       `Then continue from the current step.`,
   },
+  {
+    name: 'remember',
+    description: 'Explicitly save important information to long-term memory.',
+    source: 'builtin',
+    expand: (arg) =>
+      arg.trim()
+        ? `[REMEMBER REQUEST] The user explicitly asks you to remember the following information for future conversations:\n\n` +
+          `"${arg.trim()}"\n\n` +
+          `Call the \`upsert_memory\` tool (or equivalent) to save this to persistent memory. ` +
+          `Classify it as: preference / project_knowledge / experience as appropriate. ` +
+          `Confirm to the user once saved.`
+        : `[REMEMBER REQUEST] The user wants to save the most important information from this conversation to memory.\n\n` +
+          `Review the conversation and identify 1–3 key facts worth remembering (preferences, decisions, project-specific knowledge). ` +
+          `Save each one via \`upsert_memory\` and list what you saved.`,
+  },
 ];
 
 export class SlashCommandRegistry {

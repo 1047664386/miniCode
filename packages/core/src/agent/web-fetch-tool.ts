@@ -16,6 +16,7 @@ const CACHE = new Map<string, { at: number; text: string; title: string; finalUr
 const CACHE_TTL_MS = 15 * 60 * 1000;
 const CACHE_MAX = 128;
 const MAX_CONTENT_BYTES = 30 * 1024;
+const MAX_REDIRECTS = 5;
 
 function cacheGet(url: string) {
   const e = CACHE.get(url);
@@ -47,26 +48,86 @@ function ensureSafeUrl(raw: string): { ok: true; url: URL } | { ok: false; reaso
     return { ok: false, reason: `Disallowed protocol: ${u.protocol}` };
   }
   const host = u.hostname.toLowerCase();
+
+  // 纯 IP 地址检查（防止通过 IP 绕过域名黑名单）
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+    const octets = host.split('.').map(Number);
+    if (octets.some((o) => o > 255)) {
+      return { ok: false, reason: 'Invalid IP address' };
+    }
+    // 127.x.x.x
+    if (octets[0] === 127) {
+      return { ok: false, reason: 'Disallowed host: loopback' };
+    }
+    // 10.x.x.x
+    if (octets[0] === 10) {
+      return { ok: false, reason: 'Disallowed host: private network (10.0.0.0/8)' };
+    }
+    // 172.16-31.x.x
+    if (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) {
+      return { ok: false, reason: 'Disallowed host: private network (172.16.0.0/12)' };
+    }
+    // 192.168.x.x
+    if (octets[0] === 192 && octets[1] === 168) {
+      return { ok: false, reason: 'Disallowed host: private network (192.168.0.0/16)' };
+    }
+    // 169.254.x.x (link-local / cloud metadata)
+    if (octets[0] === 169 && octets[1] === 254) {
+      return { ok: false, reason: 'Disallowed host: link-local / cloud metadata' };
+    }
+    // 0.0.0.0
+    if (octets[0] === 0 && octets[1] === 0 && octets[2] === 0 && octets[3] === 0) {
+      return { ok: false, reason: 'Disallowed host: 0.0.0.0' };
+    }
+  }
+
+  // IPv6 loopback
+  if (host === '[::1]' || host === '::1') {
+    return { ok: false, reason: 'Disallowed host: IPv6 loopback' };
+  }
+
+  // 域名黑名单
   if (
     host === 'localhost' ||
-    host === '127.0.0.1' ||
     host === '0.0.0.0' ||
-    host === '::1' ||
     host.endsWith('.local') ||
-    host.endsWith('.localhost')
+    host.endsWith('.localhost') ||
+    host.endsWith('.internal') ||
+    host.endsWith('.arpa')
   ) {
-    return { ok: false, reason: 'Disallowed host: loopback / local' };
-  }
-  // RFC1918 + cloud metadata
-  if (
-    /^10\./.test(host) ||
-    /^192\.168\./.test(host) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
-    /^169\.254\./.test(host) // AWS / Azure metadata
-  ) {
-    return { ok: false, reason: 'Disallowed host: private network' };
+    return { ok: false, reason: 'Disallowed host: loopback / local / internal' };
   }
   return { ok: true, url: u };
+}
+
+/** DNS 重绑定防护：解析域名后再次检查 IP 是否为私有地址 */
+async function ensureSafeDns(url: URL): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const host = url.hostname.toLowerCase();
+  // 已经是 IP 地址的，ensureSafeUrl 已检查过
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || /^\[?[0-9a-f:]+\]?$/i.test(host)) {
+    return { ok: true };
+  }
+  try {
+    const { lookup } = await import('dns');
+    return new Promise((resolve) => {
+      lookup(host, (err, address) => {
+        if (err) {
+          // DNS 解析失败，不阻止请求（让 fetch 自行处理）
+          resolve({ ok: true });
+          return;
+        }
+        const safe = ensureSafeUrl(`http://${address}`);
+        if (!safe.ok) {
+          resolve({ ok: false, reason: `DNS resolved to blocked address: ${safe.reason}` });
+          return;
+        }
+        resolve({ ok: true });
+      });
+    });
+  } catch {
+    // dns 模块不可用（如浏览器环境），跳过 DNS 检查
+    return { ok: true };
+  }
 }
 
 /** 极简 HTML → Markdown：保留标题/列表/代码块/链接，丢掉脚本/样式/装饰 */
@@ -165,6 +226,12 @@ export const webFetchTool: Tool = {
       return { ok: false, error: safe.reason };
     }
 
+    // DNS 重绑定防护：解析域名后检查 IP
+    const dnsSafe = await ensureSafeDns(safe.url);
+    if (!dnsSafe.ok) {
+      return { ok: false, error: dnsSafe.reason };
+    }
+
     if (!noCache) {
       const hit = cacheGet(url);
       if (hit) {
@@ -180,62 +247,98 @@ export const webFetchTool: Tool = {
       }
     }
 
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 20_000);
-    try {
-      const resp = await fetch(safe.url.toString(), {
-        method: 'GET',
-        redirect: 'follow',
-        signal: ctrl.signal,
-        headers: {
-          'user-agent':
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-          accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        },
-      });
-      const ct = resp.headers.get('content-type') ?? '';
-      const buf = await resp.arrayBuffer();
-      let raw = new TextDecoder('utf-8', { fatal: false }).decode(buf);
+    // 手动处理重定向，限制次数并在每次重定向时做安全检查
+    let currentUrl = safe.url.toString();
+    let redirects = 0;
 
-      let title = '';
-      let content = raw;
-      if (/text\/html|application\/xhtml/i.test(ct)) {
-        const md = htmlToMarkdown(raw);
-        title = md.title;
-        content = md.markdown;
-      } else if (/application\/json/i.test(ct)) {
-        try {
-          content = JSON.stringify(JSON.parse(raw), null, 2);
-        } catch {
-          // 留 raw
+    while (redirects <= MAX_REDIRECTS) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 20_000);
+      try {
+        const resp = await fetch(currentUrl, {
+          method: 'GET',
+          redirect: 'manual',
+          signal: ctrl.signal,
+          headers: {
+            'user-agent':
+              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          },
+        });
+
+        // 处理重定向
+        if ([301, 302, 303, 307, 308].includes(resp.status)) {
+          const location = resp.headers.get('location');
+          if (!location) {
+            return { ok: false, error: `Redirect ${resp.status} without Location header` };
+          }
+          redirects++;
+          if (redirects > MAX_REDIRECTS) {
+            return { ok: false, error: `Too many redirects (max ${MAX_REDIRECTS})` };
+          }
+          // 解析重定向 URL（可能是相对路径）
+          const redirectUrl = new URL(location, currentUrl);
+          // 对重定向 URL 做安全检查
+          const redirectSafe = ensureSafeUrl(redirectUrl.toString());
+          if (!redirectSafe.ok) {
+            return { ok: false, error: `Redirect to disallowed URL: ${redirectSafe.reason}` };
+          }
+          // DNS 重绑定防护：检查重定向域名的 DNS 解析
+          const redirectDnsSafe = await ensureSafeDns(redirectSafe.url);
+          if (!redirectDnsSafe.ok) {
+            return { ok: false, error: `Redirect DNS check failed: ${redirectDnsSafe.reason}` };
+          }
+          currentUrl = redirectSafe.url.toString();
+          continue;
         }
+
+        // 非重定向响应，处理内容
+        const ct = resp.headers.get('content-type') ?? '';
+        const buf = await resp.arrayBuffer();
+        let raw = new TextDecoder('utf-8', { fatal: false }).decode(buf);
+
+        let title = '';
+        let content = raw;
+        if (/text\/html|application\/xhtml/i.test(ct)) {
+          const md = htmlToMarkdown(raw);
+          title = md.title;
+          content = md.markdown;
+        } else if (/application\/json/i.test(ct)) {
+          try {
+            content = JSON.stringify(JSON.parse(raw), null, 2);
+          } catch {
+            // 留 raw
+          }
+        }
+
+        let truncated = false;
+        if (content.length > MAX_CONTENT_BYTES) {
+          content = content.slice(0, MAX_CONTENT_BYTES) + '\n\n...[truncated]';
+          truncated = true;
+        }
+
+        const finalUrl = currentUrl;
+        cachePut(url, { text: content, title, finalUrl });
+
+        return {
+          ok: resp.ok,
+          status: resp.status,
+          finalUrl,
+          title,
+          content,
+          truncated,
+          cached: false,
+        };
+      } catch (e: any) {
+        return {
+          ok: false,
+          error: e?.name === 'AbortError' ? 'Fetch timeout (20s)' : e?.message ?? String(e),
+        };
+      } finally {
+        clearTimeout(timer);
       }
-
-      let truncated = false;
-      if (content.length > MAX_CONTENT_BYTES) {
-        content = content.slice(0, MAX_CONTENT_BYTES) + '\n\n...[truncated]';
-        truncated = true;
-      }
-
-      const finalUrl = resp.url || url;
-      cachePut(url, { text: content, title, finalUrl });
-
-      return {
-        ok: resp.ok,
-        status: resp.status,
-        finalUrl,
-        title,
-        content,
-        truncated,
-        cached: false,
-      };
-    } catch (e: any) {
-      return {
-        ok: false,
-        error: e?.name === 'AbortError' ? 'Fetch timeout (20s)' : e?.message ?? String(e),
-      };
-    } finally {
-      clearTimeout(timer);
     }
+
+    return { ok: false, error: `Too many redirects (max ${MAX_REDIRECTS})` };
   },
 };

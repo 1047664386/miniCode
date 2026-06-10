@@ -68,6 +68,12 @@ export interface ToolContext {
     get(id: string): { id: string; command: string; status: string; stdout: string; stderr: string; exitCode?: number | null; startedAt: number; finishedAt?: number } | undefined;
     cancel(id: string): boolean;
   };
+  /**
+   * P1 修复：run_command 执行前的 checkpoint 钩子。
+   * 对文件修改类命令（cp/mv/touch/mkdir/sed 等），在执行前快照目标文件，
+   * 使用户可以通过 checkpoint revert 撤销 run_command 的副作用。
+   */
+  checkpoint?: (opts: { label: string; trigger: string; files: { path: string; newContent: string }[] }) => Promise<void>;
 }
 
 export interface PlanItem {

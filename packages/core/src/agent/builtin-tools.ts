@@ -630,6 +630,19 @@ export const runCommandTool: Tool = {
       }
     }
 
+    // 2b. P1 修复：文件修改类命令执行前自动创建 checkpoint
+    //     使用户可以通过 checkpoint revert 撤销 run_command 的副作用
+    if (ctx.checkpoint) {
+      const affectedFiles = detectAffectedFiles(command, ctx.cwd);
+      if (affectedFiles.length > 0) {
+        await ctx.checkpoint({
+          label: `run_command: ${command.slice(0, 60)}`,
+          trigger: 'run_command',
+          files: affectedFiles.map((p) => ({ path: p, newContent: '' })),
+        }).catch(() => undefined);
+      }
+    }
+
     // 3. 同步执行
     try {
       const { stdout, stderr } = await pExecFile('sh', ['-c', command], {
@@ -661,6 +674,100 @@ function isLikelySlow(cmd: string): boolean {
     'pytest', 'jest', 'vitest run', 'tsc -b',
   ];
   return slow.some((kw) => c.includes(kw));
+}
+
+/**
+ * P1 修复：启发式检测命令可能修改的文件列表。
+ * 用于 run_command 执行前自动创建 checkpoint，使用户可以 revert。
+ *
+ * 覆盖常见的文件修改类命令：
+ *   cp/mv/ln → 目标文件；touch/mkdir → 指定路径；
+ *   sed -i/awk -i/tee → 目标文件；rm → 被删文件；
+ *   install/pip install/npm install → 标记项目根目录。
+ *
+ * 返回空数组 = 无法判断 / 纯只读命令 → 不需要 checkpoint。
+ */
+function detectAffectedFiles(command: string, cwd: string): string[] {
+  const cmd = command.trim();
+  const files: string[] = [];
+  // 按 | && || ; 拆分复合命令，逐段分析
+  const segments = cmd.split(/\s*(?:\|\||&&|\||;)\s*/);
+
+  for (const seg of segments) {
+    const trimmedSeg = seg.trim();
+    if (!trimmedSeg) continue;
+
+    // CR fix (P2): 提取 shell 重定向目标（> / >>）
+    // 匹配 >file, > file, >>file, >> file 等模式
+    for (const m of trimmedSeg.matchAll(/>{1,2}\s*(\S+)/g)) {
+      const target = m[1];
+      if (target && !target.startsWith('-') && !target.endsWith('/')) {
+        files.push(target);
+      }
+    }
+
+    const parts = trimmedSeg.split(/\s+/);
+    if (parts.length === 0) continue;
+    const prog = parts[0].replace(/^(?:sudo\s+)?/, '').split('/').pop()?.toLowerCase() ?? '';
+
+    // cp src dst / mv src dst / ln [-s] src dst
+    if (prog === 'cp' || prog === 'mv' || prog === 'ln') {
+      const target = parts[parts.length - 1];
+      // CR fix (P2): 目标以 / 结尾 = 目录，跳过（checkpoint 无法快照目录）
+      if (target && !target.startsWith('-') && !target.endsWith('/')) {
+        files.push(target);
+      }
+    }
+    // touch file1 file2 ...
+    else if (prog === 'touch') {
+      for (const p of parts.slice(1)) {
+        if (!p.startsWith('-') && !p.endsWith('/')) files.push(p);
+      }
+    }
+    // mkdir [-p] dir1 dir2 ...
+    else if (prog === 'mkdir') {
+      for (const p of parts.slice(1)) {
+        if (!p.startsWith('-') && !p.endsWith('/')) files.push(p);
+      }
+    }
+    // rm file1 file2 ...
+    else if (prog === 'rm') {
+      for (const p of parts.slice(1)) {
+        if (!p.startsWith('-') && !p.endsWith('/')) files.push(p);
+      }
+    }
+    // sed -i ... file / awk -i ... file
+    else if (prog === 'sed' || prog === 'awk') {
+      if (seg.includes(' -i ')) {
+        const target = parts[parts.length - 1];
+        if (target && !target.startsWith('-') && target.includes('.')) files.push(target);
+      }
+    }
+    // tee file
+    else if (prog === 'tee') {
+      for (const p of parts.slice(1)) {
+        if (!p.startsWith('-') && !p.startsWith('>') && !p.endsWith('/')) files.push(p);
+      }
+    }
+    // patch -p1 < file.patch / git apply file.patch
+    else if (prog === 'patch' || (prog === 'git' && parts[1] === 'apply')) {
+      // patch 可能修改多个文件，不做具体文件提取（太复杂）
+    }
+    // 包管理器 install → 标记 package.json / package-lock.json
+    else if (
+      (prog === 'npm' || prog === 'pnpm' || prog === 'yarn') &&
+      parts.slice(1).some((p) => p === 'install' || p === 'i' || p === 'add')
+    ) {
+      files.push('package.json', 'package-lock.json');
+    }
+    // pip install → pyproject.toml / requirements.txt
+    else if (prog === 'pip' && parts.slice(1).some((p) => p === 'install')) {
+      files.push('requirements.txt');
+    }
+  }
+
+  // 去重 + 过滤纯 flag / 空值
+  return [...new Set(files)].filter((f) => f && !f.startsWith('-'));
 }
 
 export const listBackgroundTasksTool: Tool = {

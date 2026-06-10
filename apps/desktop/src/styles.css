@@ -654,6 +654,8 @@ body,
 .composer-send:hover:not(:disabled) { background: #5fa0e0; }
 .composer-send:active:not(:disabled) { transform: scale(0.94); }
 .composer-send:disabled { background: #3a3a3a; color: #777; cursor: not-allowed; }
+.composer-send--stop { background: #d94848; }
+.composer-send--stop:hover:not(:disabled) { background: #e86060; }
 .composer-send svg { display: block; }
 .composer-send__spinner {
   width: 12px; height: 12px;
@@ -862,8 +864,25 @@ body,
 }
 .slash-item.active, .slash-item:hover { background: #094771; }
 .slash-name { color: #88c0d0; font-family: monospace; font-weight: bold; }
+.slash-name--skill { color: #d4a0ff; }
 .slash-source { color: #888; font-size: 10px; background: #1e1e1e; padding: 1px 5px; border-radius: 3px; }
-.slash-desc { flex: 1; color: #aaa; font-size: 11px; }
+.slash-desc { flex: 1; color: #aaa; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ========== Skill tag (in composer) ========== */
+.composer-attachments--skills { gap: 4px; }
+.skill-tag {
+  display: inline-flex; align-items: center; gap: 3px;
+  background: #3a1f5e; border: 1px solid #7c3aed; border-radius: 4px;
+  padding: 2px 6px; font-size: 11px; color: #d4a0ff;
+  line-height: 1.4;
+}
+.skill-tag__icon { font-size: 10px; }
+.skill-tag__label { font-weight: 500; }
+.skill-tag__x {
+  background: none; border: none; color: #9b7ec7; cursor: pointer;
+  font-size: 13px; line-height: 1; padding: 0 0 0 2px;
+}
+.skill-tag__x:hover { color: #fff; }
 
 /* ========== Settings panel (legacy classes kept for back-compat) ========== */
 .settings-panel { width: 560px; }
@@ -2799,6 +2818,7 @@ body,
 .mention-tag--selection { background: #3a3325; border-color: #5b4e2c; color: #f5d97a; }
 .mention-tag--folder { background: #2d3a2b; border-color: #486045; color: #b6e2ad; }
 .mention-tag--symbol { background: #2d2a3a; border-color: #4a4560; color: #c8b6ff; }
+.mention-tag--skill { background: #3a1f5e; border-color: #7c3aed; color: #d4a0ff; }
 
 /* 用户气泡中的提及标签行 */
 .user-bubble__mentions {

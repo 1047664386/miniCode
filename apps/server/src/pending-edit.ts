@@ -31,6 +31,8 @@ export interface PendingEdit {
   /** 时间戳 */
   createdAt: number;
   status: 'pending' | 'accepted' | 'rejected';
+  /** propose 时文件的 mtime（毫秒），用于检测外部修改 */
+  mtimeAtPropose: number;
 }
 
 /**
@@ -73,10 +75,14 @@ export class PendingEditStore {
   }): Promise<PendingEdit> {
     const abs = path.resolve(this.cwd, opts.path);
     let oldContent: string | null = null;
+    let mtimeAtPropose = 0;
     try {
+      const stat = await fs.stat(abs);
       oldContent = await fs.readFile(abs, 'utf-8');
+      mtimeAtPropose = stat.mtimeMs;
     } catch {
       oldContent = null; // 新建文件
+      mtimeAtPropose = 0;
     }
     const id = `edit_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const edit: PendingEdit = {
@@ -87,6 +93,7 @@ export class PendingEditStore {
       tool: opts.tool,
       createdAt: Date.now(),
       status: 'pending',
+      mtimeAtPropose,
     };
     // 替换同路径旧 pending
     const old = this.byPath.get(opts.path);
@@ -96,10 +103,38 @@ export class PendingEditStore {
     return edit;
   }
 
+  /**
+   * 检查文件在 propose 之后是否被外部修改过。
+   * 如果 mtime 变了（精确到毫秒），说明有人在 propose 和 accept 之间修改了文件。
+   */
+  private async checkExternalModification(edit: PendingEdit): Promise<void> {
+    // 新建文件（mtimeAtPropose=0）不需要检测
+    if (edit.mtimeAtPropose === 0) return;
+    const abs = path.resolve(this.cwd, edit.path);
+    let stat;
+    try {
+      stat = await fs.stat(abs);
+    } catch (e: any) {
+      // 文件被删除了（ENOENT），对于新建文件的 pending 不算冲突
+      if (e.code === 'ENOENT' && edit.oldContent === null) return;
+      throw e;
+    }
+    // mtime 变了说明文件被外部修改过（容差 1ms 防止浮点精度问题）
+    if (Math.abs(stat.mtimeMs - edit.mtimeAtPropose) > 1) {
+      throw new Error(
+        `File "${edit.path}" was modified externally since the edit was proposed. ` +
+        `The pending edit may be based on stale content. ` +
+        `Please re-read the file and propose a new edit.`,
+      );
+    }
+  }
+
   async accept(id: string) {
     const edit = this.byId.get(id);
     if (!edit) throw new Error('Edit not found');
     if (edit.status !== 'pending') return edit;
+    // P1 修复：accept 前检测文件是否被外部修改
+    await this.checkExternalModification(edit);
     if (this.onBeforeWrite) await this.onBeforeWrite([edit]);
     const abs = path.resolve(this.cwd, edit.path);
     await fs.mkdir(path.dirname(abs), { recursive: true });
@@ -121,6 +156,10 @@ export class PendingEditStore {
   async acceptAll() {
     const all = this.list();
     if (!all.length) return [];
+    // P1 修复：acceptAll 前批量检测文件是否被外部修改
+    for (const edit of all) {
+      await this.checkExternalModification(edit);
+    }
     if (this.onBeforeWrite) await this.onBeforeWrite(all);
 
     // ============ Phase 1: prepare to staging ============
@@ -156,7 +195,20 @@ export class PendingEditStore {
     try {
       for (const p of prepared) {
         await fs.mkdir(path.dirname(p.target), { recursive: true });
-        await fs.rename(p.stagingFile, p.target);
+        try {
+          await fs.rename(p.stagingFile, p.target);
+        } catch (renameErr: any) {
+          // P2 修复：EXDEV（跨设备）时 rename 会失败，改用 copyFile + unlink
+          if (renameErr?.code === 'EXDEV') {
+            await fs.copyFile(p.stagingFile, p.target);
+            // unlink 失败不影响 commit：copyFile 已成功，target 内容正确。
+            // 必须 catch 住，否则错误冒泡到外层会触发回滚，
+            // 用 oldContent 覆盖已经正确的 target（CR 发现的 bug）。
+            await fs.unlink(p.stagingFile).catch(() => undefined);
+          } else {
+            throw renameErr;
+          }
+        }
         committed.push({ edit: p.edit, target: p.target, oldContent: p.edit.oldContent });
       }
     } catch (err) {

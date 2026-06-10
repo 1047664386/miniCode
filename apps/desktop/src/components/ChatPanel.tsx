@@ -38,6 +38,26 @@ interface SlashSpec {
   source: 'builtin' | 'user';
 }
 
+interface SkillSpec {
+  name: string;
+  description: string;
+  source: 'project' | 'user';
+  triggers: string[];
+}
+
+/** Slash 弹窗中的统一候选项（slash 命令 + skill） */
+interface SuggestionItem {
+  /** 显示名（不含前缀） */
+  name: string;
+  /** 前缀：'/' 代表 slash 命令，'⚡' 代表 skill */
+  prefix: string;
+  description: string;
+  /** 来源标签 */
+  sourceLabel: string;
+  /** 类型：slash / skill */
+  type: 'slash' | 'skill';
+}
+
 export function ChatPanel() {
   const {
     messages, pushMessage, patchLastAssistant, patchMessageAt, resetChat,
@@ -54,6 +74,8 @@ export function ChatPanel() {
   } = useStore();
   const [input, setInput] = useState('');
   const [slashList, setSlashList] = useState<SlashSpec[]>([]);
+  const [skillList, setSkillList] = useState<SkillSpec[]>([]);
+  const [skillTags, setSkillTags] = useState<string[]>([]);  // 已选中的 skill name 列表
   const [slashActive, setSlashActive] = useState(0);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [mcpOpen, setMcpOpen] = useState(false);
@@ -62,6 +84,8 @@ export function ChatPanel() {
   const [modelDropdownOpen, setModelDropdownOpen] = useState(false);
   const [providerProfiles, setProviderProfiles] = useState<Array<{ id: string; name: string; model?: string }>>([]);
   const addCtxBtnRef = useRef<HTMLButtonElement>(null);
+  /** 当前 chat 请求的 AbortController，用于停止生成 */
+  const chatAbortRef = useRef<AbortController | null>(null);
   /** 待审批的 run_command（exec policy 判定为 ask 时弹出） */
   const [approvals, setApprovals] = useState<
     Array<{ id: string; tool: string; args: any }>
@@ -219,6 +243,10 @@ export function ChatPanel() {
   useEffect(() => {
     fetch('/api/slash').then((r) => r.json()).then(setSlashList).catch(() => {});
   }, []);
+  // 加载 skill 列表（一次性）
+  useEffect(() => {
+    fetch('/api/skills').then((r) => r.json()).then(setSkillList).catch(() => {});
+  }, []);
   // 加载 provider profiles（一次性 + settings 关闭后刷新）
   const loadProfiles = () => {
     fetch('/api/providers').then((r) => r.json()).then((data: any) => {
@@ -255,33 +283,76 @@ export function ChatPanel() {
     }).catch(() => {});
   };
 
-  // 当且仅当输入以 / 开头、且第一行没有空格时，展示候选
-  const slashSuggestions = useMemo(() => {
+  // 当且仅当输入以 / 开头、且第一行没有空格时，展示候选（合并 slash 命令 + skill）
+  const slashSuggestions = useMemo((): SuggestionItem[] => {
     if (!input.startsWith('/')) return [];
     const firstLine = input.split('\n')[0];
     if (firstLine.includes(' ')) return []; // 已开始填参数
     const q = firstLine.slice(1).toLowerCase();
-    return slashList.filter((c) => c.name.startsWith(q)).slice(0, 8);
-  }, [input, slashList]);
+
+    // Slash 命令
+    const slashItems: SuggestionItem[] = slashList
+      .filter((c) => c.name.startsWith(q))
+      .map((c) => ({
+        name: c.name,
+        prefix: '/',
+        description: c.description,
+        sourceLabel: c.source,
+        type: 'slash' as const,
+      }));
+
+    // Skill
+    const skillItems: SuggestionItem[] = skillList
+      .filter((s) => {
+        // name 匹配
+        if (s.name.toLowerCase().startsWith(q)) return true;
+        // trigger 关键词匹配
+        if (s.triggers?.some((t) => t.toLowerCase().startsWith(q))) return true;
+        return false;
+      })
+      .map((s) => ({
+        name: s.name,
+        prefix: '⚡',
+        description: s.description + (s.triggers?.length ? ` (triggers: ${s.triggers.join(', ')})` : ''),
+        sourceLabel: s.source === 'project' ? 'workspace' : s.source,
+        type: 'skill' as const,
+      }));
+
+    return [...slashItems, ...skillItems].slice(0, 10);
+  }, [input, slashList, skillList]);
 
   useEffect(() => {
     setSlashActive(0);
   }, [slashSuggestions.length]);
 
-  const applySlash = (name: string) => {
-    const rest = input.split('\n').slice(1).join('\n');
-    const next = '/' + name + ' ' + (rest ? '\n' + rest : '');
-    setInput(next);
-    setTimeout(() => textareaRef.current?.focus(), 0);
+  const applySuggestion = (item: SuggestionItem) => {
+    if (item.type === 'slash') {
+      // Slash 命令：替换输入框为 /name + 空格
+      const rest = input.split('\n').slice(1).join('\n');
+      const next = '/' + item.name + ' ' + (rest ? '\n' + rest : '');
+      setInput(next);
+      setTimeout(() => textareaRef.current?.focus(), 0);
+    } else {
+      // Skill：添加为 tag，清掉 / 前缀
+      if (!skillTags.includes(item.name)) {
+        setSkillTags((prev) => [...prev, item.name]);
+      }
+      // 去掉输入框中的 /xxx 部分
+      const rest = input.split('\n').slice(1).join('\n');
+      setInput(rest);
+      setTimeout(() => textareaRef.current?.focus(), 0);
+    }
   };
 
   const send = async () => {
     const text = input.trim();
     const atts = [...composerAttachments];
     const imgs = [...imageAttachments];
-    if ((!text && atts.length === 0 && imgs.length === 0) || running) return;
+    const activeSkillTags = [...skillTags];
+    if ((!text && atts.length === 0 && imgs.length === 0 && activeSkillTags.length === 0) || running) return;
     setInput('');
     setImageAttachments([]);
+    setSkillTags([]);
 
     // 拼接 attachments 到 message 头部 (不改变后台语义，仍靠 @file:xxx)
     const attPrefix = atts.length
@@ -294,7 +365,15 @@ export function ChatPanel() {
           .join(' ') + '\n'
       : '';
     let finalText = (attPrefix + text).trim();
+    // 如果有选中的 skill tags，在消息前面添加 skill 调用指令
+    if (activeSkillTags.length > 0) {
+      const skillPrefix = activeSkillTags.map((n) => `/skill:${n}`).join(' ');
+      finalText = skillPrefix + '\n' + finalText;
+    }
     clearAttachments();
+
+    // 用户显示文本：不显示 /skill:xxx 前缀，而是用更友好的提示
+    const displayText = text;
 
     // 图片：提取 base64 data + media_type → 传给后端作为 multimodal content blocks
     const multimodalImages = imgs.map((img) => {
@@ -318,8 +397,12 @@ export function ChatPanel() {
       /* bridge 不在就降级，保持原文 */
     }
 
-    pushMessage({ role: 'user', content: finalText, _images: imgs.length > 0 ? imgs.map(img => ({ name: img.name, dataUrl: img.dataUrl })) : undefined, _displayText: text });
+    pushMessage({ role: 'user', content: finalText, _images: imgs.length > 0 ? imgs.map(img => ({ name: img.name, dataUrl: img.dataUrl })) : undefined, _displayText: displayText });
     setRunning(true);
+
+    // 创建 AbortController，支持用户点击停止按钮中断当前请求
+    const chatAbort = new AbortController();
+    chatAbortRef.current = chatAbort;
 
     // 没有 active session → 自动创建一个；首条消息内容会被 server 用作 title
     let sid = sessionId;
@@ -374,6 +457,7 @@ export function ChatPanel() {
                 streamIdleTimeoutMs: (advancedSettings.streamIdleTimeoutSec || 120) * 1000,
               },
         }),
+        signal: chatAbort.signal,
       });
       if (!resp.ok) {
         const errText = await resp.text().catch(() => '');
@@ -416,12 +500,32 @@ export function ChatPanel() {
         } as any);
       }
     } catch (e: any) {
-      pushMessage({ role: 'assistant', content: `❌ Error: ${e.message}` });
+      // 用户主动中止时不显示错误消息
+      if (e.name === 'AbortError') {
+        // 给最后一条 assistant 消息追加中断标记（如果内容为空则移除）
+        const msgs = useStore.getState().messages;
+        const lastIdx = msgs.length - 1;
+        if (lastIdx >= 0 && msgs[lastIdx].role === 'assistant' && !msgs[lastIdx].content.trim()) {
+          // 空的 assistant 消息，替换为中止提示
+          useStore.getState().patchMessageAt(lastIdx, { content: '⏹ 已停止生成。' } as any);
+        }
+      } else {
+        pushMessage({ role: 'assistant', content: `❌ Error: ${e.message}` });
+      }
     } finally {
+      chatAbortRef.current = null;
       setRunning(false);
       // 若 Agent 改了文件，重新拉一下文件树
       loadTree('.');
       // subagent announce 续发已移至 useEffect（避免竞态）
+    }
+  };
+
+  /** 停止当前正在生成的回复 */
+  const stopChat = () => {
+    if (chatAbortRef.current) {
+      chatAbortRef.current.abort();
+      chatAbortRef.current = null;
     }
   };
 
@@ -514,6 +618,15 @@ export function ChatPanel() {
         break;
       case 'slash':
         pushMessage({ role: 'tool', content: `⚡ slash: /${ev.command} expanded` } as any);
+        break;
+      case 'skills_activated':
+        if (ev.skills?.length) {
+          pushMessage({
+            role: 'tool',
+            content: `⚡ skill activated: ${ev.skills.join(', ')}`,
+            _mentionItems: ev.skills.map((n: string) => ({ kind: 'skill', label: n, path: n })),
+          } as any);
+        }
         break;
       case 'rules':
         if (ev.activated?.length)
@@ -814,13 +927,13 @@ export function ChatPanel() {
           <div className="slash-popup">
             {slashSuggestions.map((c, i) => (
               <div
-                key={c.name}
+                key={`${c.type}-${c.name}`}
                 className={`slash-item ${i === slashActive ? 'active' : ''}`}
                 onMouseEnter={() => setSlashActive(i)}
-                onClick={() => applySlash(c.name)}
+                onClick={() => applySuggestion(c)}
               >
-                <span className="slash-name">/{c.name}</span>
-                <span className="slash-source">{c.source}</span>
+                <span className={`slash-name ${c.type === 'skill' ? 'slash-name--skill' : ''}`}>{c.prefix}{c.name}</span>
+                <span className="slash-source">{c.sourceLabel}</span>
                 <span className="slash-desc">{c.description}</span>
               </div>
             ))}
@@ -866,6 +979,24 @@ export function ChatPanel() {
               ))}
             </div>
           )}
+          {skillTags.length > 0 && (
+            <div className="composer-attachments composer-attachments--skills">
+              {skillTags.map((name) => (
+                <span key={name} className="skill-tag">
+                  <span className="skill-tag__icon">⚡</span>
+                  <span className="skill-tag__label">{name}</span>
+                  <button
+                    type="button"
+                    className="skill-tag__x"
+                    title="移除"
+                    onClick={() => setSkillTags((prev) => prev.filter((n) => n !== name))}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
           <MentionInput
             ref={textareaRef}
             value={input}
@@ -885,7 +1016,7 @@ export function ChatPanel() {
                   return;
                 }
                 if (e.key === 'Tab' || (e.key === 'Enter' && !(e.metaKey || e.ctrlKey))) {
-                  applySlash(slashSuggestions[slashActive].name);
+                  applySuggestion(slashSuggestions[slashActive]);
                   e.preventDefault();
                   return;
                 }
@@ -1028,14 +1159,16 @@ export function ChatPanel() {
               </button>
               <button
                 type="button"
-                onClick={send}
-                disabled={running || (!input.trim() && composerAttachments.length === 0)}
-                className="composer-send"
-                data-tip={running ? '正在生成…' : '发送（⌘/Ctrl + Enter）'}
-                title={running ? '正在生成…' : '发送（⌘/Ctrl + Enter）'}
+                onClick={running ? stopChat : send}
+                disabled={!running && (!input.trim() && composerAttachments.length === 0)}
+                className={`composer-send${running ? ' composer-send--stop' : ''}`}
+                data-tip={running ? '停止生成（点击中断）' : '发送（⌘/Ctrl + Enter）'}
+                title={running ? '停止生成（点击中断）' : '发送（⌘/Ctrl + Enter）'}
               >
                 {running ? (
-                  <span className="composer-send__spinner" />
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                    <rect x="2" y="2" width="12" height="12" rx="2" />
+                  </svg>
                 ) : (
                   <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
                     <path d="M2 8L14 2L8 14L7 9L2 8Z" fill="currentColor" />
@@ -1634,13 +1767,13 @@ function renderMessages(
         continue;
       }
 
-      // 单条非分组消息（如 slash, rules, pending_edit）
+      // 单条非分组消息（如 slash, rules, pending_edit, mentions, skills_activated）
       if (group.length === 1 && !(group[0] as any)._toolRole) {
         const gm = group[0];
         const hasPending = (gm as any).pendingEditId != null;
         elements.push(
           <div key={groupStart} className={`msg msg-tool${hasPending ? ' has-pending' : ''}`}>
-            <span className="msg-plain">{gm.content}</span>
+            <ToolContent m={gm} />
           </div>
         );
         continue;

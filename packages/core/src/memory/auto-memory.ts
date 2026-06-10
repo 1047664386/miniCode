@@ -36,16 +36,18 @@ export interface AutoMemoryContext {
 }
 
 const lastRunBySession = new Map<string, number>();
-const MIN_TURNS_BETWEEN_RUNS = 5;
+// 降低间隔到 3 turn（原为 5）
+const MIN_TURNS_BETWEEN_RUNS = 3;
 const MIN_USER_LEN = 20;
 
 /**
- * 简易触发判定：用户消息里含明确的偏好/约束/事实陈述关键词 → 才跑。
+ * 简易触发判定：用户消息里含明确的偏好/约束/事实陈述/项目知识关键词 → 才跑。
  * 这样 80% 普通 "帮我修 bug" 的请求不会触发，省成本。
  */
 function shouldRun(userMessage: string): boolean {
   if (userMessage.length < MIN_USER_LEN) return false;
   const signals = [
+    // 偏好信号（原有）
     /\b(prefer|like|don'?t like|hate|always|never|please|stop|remember|note that)\b/i,
     /我(希望|喜欢|不喜欢|讨厌|总是|从不|不要|要求|偏好|习惯)/,
     /(以后|今后|下次|always|永远|每次|每个|all|every)/i,
@@ -54,6 +56,17 @@ function shouldRun(userMessage: string): boolean {
     /\b(use|don'?t use|switch to)\b.*\b(library|framework|tool|version)\b/i,
     /(用|不用|改用|换成).*(库|框架|版本|工具|API)/,
     /\b(deprecated|legacy|migrate|deprecat)/i,
+    // 项目知识信号（新增）
+    /(这个项目|该项目|本项目|我们的项目)/,
+    /(入口(是|在|文件)|主文件是|main\s+(is|file))/i,
+    /(架构(是|如下)|目录结构|项目结构|模块划分)/,
+    /(数据库(是|用的)|数据库连接|DB\s+(is|uses))/i,
+    /(部署在|运行在|服务器是|端口是)/,
+    /(\.env|环境变量|config\s+file|配置文件)\s*(里|中|是|有)/,
+    /(token\s+limit|context\s+window|模型(是|用的|换成))/i,
+    // 用户显式要求记住（/remember 会在 slash-commands 里处理，这里是自然语言兜底）
+    /\b(remember|记住|记一下|记录一下|别忘了)\b/i,
+    /(帮我记|你需要记|你应该记|记好了)/,
   ];
   return signals.some((re) => re.test(userMessage));
 }

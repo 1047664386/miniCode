@@ -84,8 +84,13 @@ export interface BuildMessagesOptions {
  *
  * 返回的 messages 数组：
  *   [system, ...compactedHistory, user]
+ *   或对于支持多 system 的 provider：[system_stable, system_dynamic, ...compactedHistory, user]
  *
- * system 消息包含：system prompt + autoContext + explicitContext + memory + systemExtras
+ * system 消息按稳定性分层：
+ *   - 稳定层（cacheHint: ephemeral）：system prompt + rules + skills overview
+ *   - 动态层（无 cacheHint）：autoContext + memory + explicitContext
+ *
+ * 这样 Anthropic 的 Prompt Cache 按前缀匹配时，稳定部分跨轮不变，命中率高。
  */
 export async function buildMessages(opts: BuildMessagesOptions): Promise<ChatMessage[]> {
   const {
@@ -107,7 +112,7 @@ export async function buildMessages(opts: BuildMessagesOptions): Promise<ChatMes
     images,
   } = opts;
 
-  // ---- 1. 构建 system prompt ----
+  // ---- 1. 构建 system prompt（稳定层：跨轮不变） ----
   const systemBase = buildSystemPrompt({
     mode,
     cwd: meta.cwd,
@@ -117,30 +122,42 @@ export async function buildMessages(opts: BuildMessagesOptions): Promise<ChatMes
     approval: approvalPolicy,
   });
 
-  // ---- 2. 收集 context 段落 ----
-  const contextParts: string[] = [];
+  // ---- 2. 按稳定性分层收集 context 段落 ----
+  // 稳定层：rules / project-memory / skills overview（跨轮基本不变）
+  const stableParts: string[] = [];
+  // 动态层：autoContext / memory / explicitContext（每轮变化）
+  const dynamicParts: string[] = [];
 
-  // 2a. autoContext（检索召回）
+  // 2a. systemExtras（rules / project-memory / skills 等）→ 稳定层
+  for (const extra of systemExtras) {
+    if (extra?.trim()) stableParts.push(extra);
+  }
+
+  // 2b. autoContext（检索召回）→ 动态层
   if (autoContext.length) {
     const ctxLines = autoContext
       .slice(0, 6)
       .map((c) => `--- ${c.file} ---\n${c.text.slice(0, 2000)}`)
       .join('\n\n');
-    contextParts.push(`<retrieved-context>\n${ctxLines}\n</retrieved-context>`);
+    dynamicParts.push(`<retrieved-context>\n${ctxLines}\n</retrieved-context>`);
   }
 
-  // 2b. explicitContext（@-mentions）
+  // 2c. explicitContext（@-mentions）→ 动态层
   if (explicitContext.length) {
     const mentionLines = explicitContext
       .map((c) => `--- ${c.label} (${c.type}) ---\n${c.content.slice(0, 3000)}`)
       .join('\n\n');
-    contextParts.push(`<explicit-context>\n${mentionLines}\n</explicit-context>`);
+    dynamicParts.push(`<explicit-context>\n${mentionLines}\n</explicit-context>`);
   }
 
-  // 2c. memory recall
+  // 2d. memory recall → 动态层
   if (memory) {
     try {
-      const memItems = await memory.recall(userMessage, { topK: 5 });
+      // 构造增强 query：融合用户消息 + 最近 2 轮对话摘要，提升指代消解能力
+      // 例如用户说"帮我改一下那个函数"，纯 query 搜不到，但加上上轮对话的
+      // "parseFrontmatter 函数" 就能命中相关记忆
+      const enrichedQuery = buildEnrichedRecallQuery(userMessage, history);
+      const memItems = await memory.recall(enrichedQuery, { topK: 5 });
       if (memItems.length) {
         // 去重：通过 injectionCache 避免同一 session 里重复注入
         let filtered = memItems;
@@ -156,7 +173,7 @@ export async function buildMessages(opts: BuildMessagesOptions): Promise<ChatMes
           const memLines = filtered
             .map((m) => `- [${m.category}] ${m.title}: ${m.content.slice(0, 500)}`)
             .join('\n');
-          contextParts.push(`<memory>\n${memLines}\n</memory>`);
+          dynamicParts.push(`<memory>\n${memLines}\n</memory>`);
           onMemoryRecalled?.(filtered);
         }
       }
@@ -165,21 +182,48 @@ export async function buildMessages(opts: BuildMessagesOptions): Promise<ChatMes
     }
   }
 
-  // 2d. systemExtras（rules / project-memory / skills 等）
-  for (const extra of systemExtras) {
-    if (extra?.trim()) contextParts.push(extra);
+  // ---- 3. 组装 system 消息（按 provider 分层策略） ----
+  const systemMessages: ChatMessage[] = [];
+
+  // Anthropic 只接受一个 system 参数 → 拼成单条但按稳定性排序
+  // 其他 provider（OpenAI 等）→ 拆成多条 system 消息
+  const isAnthropic = providerFlavor === 'anthropic';
+
+  if (isAnthropic || dynamicParts.length === 0) {
+    // 单条 system：稳定部分在前 + 动态部分在后
+    // 稳定前缀不变 → Anthropic 的 prefix cache 可以命中
+    const systemContent = [systemBase, ...stableParts, ...dynamicParts]
+      .filter((p) => p?.trim())
+      .join('\n\n');
+
+    systemMessages.push({
+      role: 'system',
+      content: systemContent,
+      cacheHint: 'ephemeral',
+    });
+  } else {
+    // 多条 system：稳定部分带 cacheHint，动态部分不带
+    const stableContent = [systemBase, ...stableParts]
+      .filter((p) => p?.trim())
+      .join('\n\n');
+
+    systemMessages.push({
+      role: 'system',
+      content: stableContent,
+      cacheHint: 'ephemeral',
+    });
+
+    const dynamicContent = dynamicParts
+      .filter((p) => p?.trim())
+      .join('\n\n');
+
+    if (dynamicContent.trim()) {
+      systemMessages.push({
+        role: 'system',
+        content: dynamicContent,
+      });
+    }
   }
-
-  // ---- 3. 组装 system 消息 ----
-  const systemContent = [systemBase, ...contextParts]
-    .filter((p) => p?.trim())
-    .join('\n\n');
-
-  const systemMsg: ChatMessage = {
-    role: 'system',
-    content: systemContent,
-    cacheHint: 'ephemeral',
-  };
 
   // ---- 4. 压缩 history ----
   let compactedHistory = history;
@@ -216,7 +260,7 @@ export async function buildMessages(opts: BuildMessagesOptions): Promise<ChatMes
   }
 
   const messages: ChatMessage[] = [
-    systemMsg,
+    ...systemMessages,
     ...compactedHistory,
     userMsg,
   ];
@@ -227,3 +271,33 @@ export async function buildMessages(opts: BuildMessagesOptions): Promise<ChatMes
   return messages;
 }
 
+/**
+ * 构造增强版 memory recall query：融合用户消息 + 最近对话上下文。
+ *
+ * 问题场景：用户说"帮我改一下那个函数"，纯 userMessage 搜"那个函数"啥也找不到；
+ * 但如果上轮对话提到 "parseFrontmatter"，融合后 query = "帮我改一下那个函数 parseFrontmatter"
+ * 就能命中相关记忆。
+ *
+ * 策略：取最近 2 轮 assistant 消息的关键词（截断到 200 字），拼接到 userMessage 后。
+ * 不用 LLM 摘要（避免额外调用），简单截取即可——词法召回对关键词覆盖度要求高，精确度靠 RRF 融合兜底。
+ */
+function buildEnrichedRecallQuery(userMessage: string, history: ChatMessage[]): string {
+  // 取最近 2 条 assistant 消息
+  const recentAssistant: string[] = [];
+  for (let i = history.length - 1; i >= 0 && recentAssistant.length < 2; i--) {
+    const msg = history[i];
+    if (msg.role === 'assistant' && typeof msg.content === 'string' && msg.content.trim()) {
+      recentAssistant.push(msg.content.trim());
+    }
+  }
+  if (!recentAssistant.length) return userMessage;
+
+  // 每条截断到 200 字，拼接在 userMessage 后
+  const contextSnippet = recentAssistant
+    .map((s) => s.slice(0, 200))
+    .join(' ');
+  // 限制总 query 长度，避免词法召回被长上下文淹没
+  const maxLen = 600;
+  const combined = `${userMessage} ${contextSnippet}`;
+  return combined.length > maxLen ? combined.slice(0, maxLen) : combined;
+}

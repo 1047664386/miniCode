@@ -307,6 +307,29 @@ console.log(`[sessions] loaded ${sessions.list().length} historical sessions`);
 const skills = new SkillStore(WORKSPACE);
 await skills.load();
 console.log(`[skills] loaded ${skills.list().length} skills`);
+// 启动热更新监听（与 Agent Profile watcher 设计对齐）
+skills.startWatch(); // async but fire-and-forget is fine
+
+/**
+ * Skill 自动触发：用户输入匹配 skill 的 triggers 字段时，自动加载全文注入 context。
+ * 避免完全依赖 LLM 看到概览后主动调 use_skill —— 对面试"Skill 触发机制"的加分项。
+ * 匹配到的 skill 全文注入到 systemExtras（属于 stable 层，但每个 skill 最多触发一次/session）。
+ */
+async function renderAutoTriggeredSkills(input: string): Promise<string> {
+  const matched = skills.matchForInput(input);
+  if (!matched.length) return '';
+  const lines = ['# Auto-triggered Skills (matched by user input)'];
+  // 最多自动触发 2 个 skill，避免 context 膨胀
+  for (const meta of matched.slice(0, 2)) {
+    const full = await skills.loadFull(meta.name);
+    if (full?.body) {
+      lines.push(`## ${meta.name}\n${full.body.slice(0, 3000)}`);
+    } else {
+      lines.push(`## ${meta.name}\n${meta.description}`);
+    }
+  }
+  return lines.join('\n');
+}
 
 // Worktree 管理器（subagent 并行写文件时的目录隔离）
 const worktrees = new WorktreeManager(WORKSPACE);
@@ -363,20 +386,74 @@ const subagents = new SubagentManager({
 });
 
 // Subagent real-time progress → SSE bridge
-subagents.on('child_text', (p) => { /* text events are frequent; skip SSE for now to reduce bandwidth */ });
-subagents.on('child_tool', (p) => { /* tool calls already handled via spawned event */ });
-subagents.on('child_tool_result', (p) => {
-  // 将 subagent tool_result 进度事件广播给所有 SSE 连接
-  // 目前暂存到 pendingProgress，在 chat SSE 循环中 flush
-  subagentProgressBuffer.push({ ...p, ts: Date.now() });
-  // 防止无 SSE 连接消费时无界增长，超过 200 条时丢弃最旧的
-  if (subagentProgressBuffer.length > 200) {
-    subagentProgressBuffer.splice(0, subagentProgressBuffer.length - 200);
+// 子 Agent 事件统一 buffer，供 chat SSE flush 时批量发送
+interface SubagentEvent {
+  type: 'subagent_text' | 'subagent_tool' | 'subagent_progress';
+  runId: string;
+  text?: string;
+  tool?: string;
+  resultPreview?: string;
+  ts: number;
+}
+const subagentEventBuffer: SubagentEvent[] = [];
+const SUBAGENT_EVENT_BUFFER_CAP = 300;
+
+/** 节流状态：按 runId 聚合 text 事件，每 200ms 批量 flush 一次 */
+const subagentTextAccum = new Map<string, { text: string; lastFlush: number }>();
+const SUBAGENT_TEXT_FLUSH_INTERVAL = 200; // ms
+
+function flushSubagentTextBuffer() {
+  const now = Date.now();
+  for (const [runId, acc] of subagentTextAccum) {
+    if (acc.text && now - acc.lastFlush >= SUBAGENT_TEXT_FLUSH_INTERVAL) {
+      subagentEventBuffer.push({
+        type: 'subagent_text',
+        runId,
+        text: acc.text,
+        ts: now,
+      });
+      acc.text = '';
+      acc.lastFlush = now;
+    }
+  }
+  // cap
+  if (subagentEventBuffer.length > SUBAGENT_EVENT_BUFFER_CAP) {
+    subagentEventBuffer.splice(0, subagentEventBuffer.length - SUBAGENT_EVENT_BUFFER_CAP);
+  }
+}
+
+subagents.on('child_text', (p: { runId: string; text: string }) => {
+  // 节流：累积 text，200ms 批量发一次
+  const acc = subagentTextAccum.get(p.runId) ?? { text: '', lastFlush: Date.now() };
+  acc.text += p.text;
+  subagentTextAccum.set(p.runId, acc);
+  flushSubagentTextBuffer();
+});
+subagents.on('child_tool', (p: { runId: string; tool: string }) => {
+  // tool call 事件频率低，直接写入 buffer
+  subagentEventBuffer.push({
+    type: 'subagent_tool',
+    runId: p.runId,
+    tool: p.tool,
+    ts: Date.now(),
+  });
+  if (subagentEventBuffer.length > SUBAGENT_EVENT_BUFFER_CAP) {
+    subagentEventBuffer.splice(0, subagentEventBuffer.length - SUBAGENT_EVENT_BUFFER_CAP);
   }
 });
-
-/** 缓存 subagent 进度事件，供 chat SSE flush */
-const subagentProgressBuffer: Array<{ runId: string; tool: string; resultPreview: string; ts: number }> = [];
+subagents.on('child_tool_result', (p: { runId: string; tool: string; resultPreview: string }) => {
+  // 将 subagent tool_result 进度事件广播给所有 SSE 连接
+  subagentEventBuffer.push({
+    type: 'subagent_progress',
+    runId: p.runId,
+    tool: p.tool,
+    resultPreview: p.resultPreview,
+    ts: Date.now(),
+  });
+  if (subagentEventBuffer.length > SUBAGENT_EVENT_BUFFER_CAP) {
+    subagentEventBuffer.splice(0, subagentEventBuffer.length - SUBAGENT_EVENT_BUFFER_CAP);
+  }
+});
 
 // 任何 accept 前自动 snapshot
 pendingEdits.onBeforeWrite = async (edits) => {
@@ -416,13 +493,23 @@ async function ensureIndex() {
 }
 ensureIndex();
 
-// ---- File watcher: 启动增量索引 ----
+// ---- File watcher: 启动增量索引 + 文件变更事件广播 ----
+/** 文件变更 SSE 客户端集合 */
+const fsEventClients = new Set<import('express').Response>();
+
 const watcher = new IndexWatcher({
   root: WORKSPACE,
   index: () => index,
   embedder: () => embedder,
   vectorPath: () => vectorPath,
   onProgress: (m) => console.log(m),
+  onFileChange: (events) => {
+    // 广播文件变更事件给所有 SSE 客户端
+    const data = JSON.stringify({ type: 'fs_change', events });
+    for (const client of fsEventClients) {
+      try { client.write(`data: ${data}\n\n`); } catch { /* client disconnected */ }
+    }
+  },
 });
 watcher.start();
 
@@ -654,6 +741,23 @@ app.get('/api/vscode/health', async (_req, res) => {
 });
 
 // ---- 文件树 / 文件读写 ----
+
+// SSE 端点：向前端实时推送文件变更事件（chokidar → SSE）
+app.get('/api/fs/events', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no', // nginx 不缓冲
+  });
+  // 发送初始心跳，确认连接建立
+  res.write(`data: ${JSON.stringify({ type: 'fs_heartbeat' })}\n\n`);
+  fsEventClients.add(res);
+  req.on('close', () => {
+    fsEventClients.delete(res);
+  });
+});
+
 app.get('/api/files', async (req, res) => {
   const rel = String(req.query.path ?? '.');
   const abs = path.resolve(WORKSPACE, rel);
@@ -1605,6 +1709,7 @@ app.get('/api/skills', (_req, res) => {
       description: s.description,
       source: s.source,
       userInvocable: s.userInvocable,
+      triggers: s.triggers,
     })),
   );
 });
@@ -1830,6 +1935,13 @@ app.post('/api/chat', async (req, res) => {
     return '';
   }).trim();
 
+  // 解析显式 skill 引用 /skill:xxx（前端 "/" 选择器选中后发送）
+  const explicitSkills: string[] = [];
+  userMessage = userMessage.replace(/\/skill:([\w-]+)/g, (_m, n) => {
+    explicitSkills.push(n);
+    return '';
+  }).trim();
+
   // 解析 @-mentions（@file: / @symbol: / @docs: / @selection: / @web:）
   const mentionResult = await parseMentions(userMessage, {
     workspace: WORKSPACE,
@@ -1849,6 +1961,7 @@ app.post('/api/chat', async (req, res) => {
 
   const sse = (evt: any) => res.write(`data: ${JSON.stringify(evt)}\n\n`);
   if (slashName) sse({ type: 'slash', command: slashName });
+  if (explicitSkills.length) sse({ type: 'skills_activated', skills: explicitSkills });
 
   // 把 mention 解析结果广播给前端，便于显示"已注入哪些上下文"
   if (mentionResult.items.length || mentionResult.unresolved.length) {
@@ -1867,8 +1980,11 @@ app.post('/api/chat', async (req, res) => {
   }
 
   // 持久化 user 消息（如果是真实 session）+ 开新 turn
+  // P1 修复：获取 Session 并发锁，确保同一 session 的 turn 生命周期不会交叉
+  let sessionRelease: (() => void) | null = null;
   let currentTurnId: string | null = null;
   if (persistSession) {
+    sessionRelease = await sessions.lock.acquire(rawSessionId!);
     await sessions
       .append(rawSessionId!, { role: 'user', content: rawUserMessage ?? '' })
       .catch((e) => console.warn('[sessions] append user failed', e));
@@ -1979,6 +2095,17 @@ app.post('/api/chat', async (req, res) => {
       verifyAfterAccept.consumeForSystem(),
       // Skills 概览（progressive disclosure）—— stable，受 prompt cache 保护
       skills.renderForSystem(),
+      // Skill 自动触发：用户输入匹配 triggers → 直接注入全文，无需 LLM 主动调 use_skill
+      await renderAutoTriggeredSkills(userMessage),
+      // 显式 Skill 触发：用户通过 "/" 选择器选中的 skill，强制注入全文
+      ...(await Promise.all(
+        explicitSkills.map(async (name) => {
+          const f = await skills.loadFull(name);
+          if (!f) return `[Skill "${name}" not found]`;
+          const body = f.body?.slice(0, 4000) ?? '(empty)';
+          return `─── Skill: ${f.name} (explicitly selected by user) ───\n${body}`;
+        }),
+      )).filter(Boolean),
       // Rules（用户/项目级规则）
       ruleExtra,
       // 自动检测：multi-step user message → 提示 LLM 一开头就 update_plan
@@ -2054,17 +2181,34 @@ app.post('/api/chat', async (req, res) => {
             sessions.appendChunk(rawSessionId!, currentTurnId, ev.text).catch(() => undefined);
           }
         }
-        // Flush subagent progress events to SSE client
-        while (subagentProgressBuffer.length > 0) {
-          const p = subagentProgressBuffer.shift()!;
-          sse({ type: 'subagent_progress', ...p });
+        // Flush subagent events (text/tool/progress) to SSE client
+        // 先 flush 残留的 text 累积
+        for (const [runId, acc] of subagentTextAccum) {
+          if (acc.text) {
+            subagentEventBuffer.push({
+              type: 'subagent_text',
+              runId,
+              text: acc.text,
+              ts: Date.now(),
+            });
+            acc.text = '';
+            acc.lastFlush = Date.now();
+          }
+        }
+        while (subagentEventBuffer.length > 0) {
+          const p = subagentEventBuffer.shift()!;
+          sse(p);
         }
         sse(ev);
       }
     } else {
+      // Progressive Tool Disclosure：plan 模式只暴露只读工具，agent 模式暴露全量
+      const activeRegistry = mode === 'plan'
+        ? registry.filter(ToolRegistry.CHAT_ONLY_PROFILE)
+        : registry;
       for await (const ev of runAgent({
         llm: llmRouted,
-        registry,
+        registry: activeRegistry,
         messages: initial,
         toolCtx: {
           cwd: WORKSPACE,
@@ -2095,6 +2239,11 @@ app.post('/api/chat', async (req, res) => {
             return { id: e.id };
           },
           virtualRead: (p) => pendingEdits.virtualRead(p),
+          // P1 修复：run_command 执行前自动 checkpoint 文件修改类命令
+          checkpoint: async (opts) => {
+            await checkpoints.create(opts);
+            await checkpoints.prune(100);
+          },
           updatePlan: (plan) => {
             // 把 Agent 声明的任务计划广播给前端 PlanPanel
             sse({ type: 'plan', plan });
@@ -2211,6 +2360,11 @@ app.post('/api/chat', async (req, res) => {
             }
           }
         }
+        // Flush subagent events (text/tool/progress) to SSE client
+        while (subagentEventBuffer.length > 0) {
+          const p = subagentEventBuffer.shift()!;
+          sse(p);
+        }
         sse(ev);
       }
     }
@@ -2234,6 +2388,19 @@ app.post('/api/chat', async (req, res) => {
       const pending = subagents.pickPendingAnnouncements(rawSessionId);
       for (const ann of pending) {
         sse({ type: 'subagent_announce', message: ann });
+      }
+      // P1 修复：将 announce 注入父 session 的 messages 作为 user message，
+      // 使父 Agent 在下一轮 turn 能看到子 Agent 结果。
+      // 之前只通过 SSE 发给前端，与 dispatch_subagent 工具描述中
+      // "result will arrive as a [Subagent Completed] user message" 的承诺不一致。
+      if (pending.length > 0 && persistSession) {
+        for (const ann of pending) {
+          await sessions
+            .append(rawSessionId, { role: 'user', content: ann })
+            .catch(() => undefined);
+        }
+        // 通知前端：有子 Agent 结果待处理，建议自动触发 follow-up turn
+        sse({ type: 'subagent_followup', count: pending.length });
       }
     }
     // 正常结束 → endTurn（把 partial 升级为正式 msg 并清除 interrupt 标记）
@@ -2275,6 +2442,11 @@ app.post('/api/chat', async (req, res) => {
         .catch((e) => logger.warn('[auto-memory] failed', { err: String(e) }));
     }
     sse({ type: 'done' });
+    // P1 修复：释放 Session 并发锁（必须在 turn 生命周期完全结束后才释放）
+    if (sessionRelease) {
+      sessionRelease();
+      sessionRelease = null;
+    }
     res.end();
   }
 });

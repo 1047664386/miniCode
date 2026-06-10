@@ -398,6 +398,9 @@ export const useStore = create<State>((set, get) => ({
         ),
       }));
     }
+    // accept 后文件已落盘，刷新文件树（文件可能新建或目录结构改变）
+    get().loadTree('.');
+    get().bumpTree();
   },
   async rejectPending(id) {
     await fetch(`/api/edits/${id}/reject`, { method: 'POST' });

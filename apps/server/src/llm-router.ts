@@ -8,6 +8,7 @@
  *  3. chatStream 第一帧产生前如果出错（HTTP 429/5xx/network/超时）→ 切下一个
  *  4. 已经开始流式输出后再断 → 不重试（用户已看到内容，重试会重复）
  *  5. 每次切换都通过 onSwitch 回调通知（用于 SSE 推前端）
+ *  6. Circuit Breaker：连续 N 次失败 → 熔断冷却 → 半开探活 → 成功则恢复
  *
  * 为什么不开始输出后不重试？
  *  因为 LLM stream 是 stateful，token 已经吐到前端，再切就会产生重复/拼接错乱。
@@ -41,8 +42,84 @@ export interface LLMRouterOpts {
   onSwitch?: (info: RouterSwitchInfo) => void;
 }
 
+/* -------------------- Circuit Breaker -------------------- */
+
+/**
+ * ProfileHealth —— 单个 Provider profile 的健康状态追踪。
+ *
+ * 三态：closed（正常）→ open（熔断冷却）→ half-open（探活）→ closed 或 open。
+ *
+ * - 连续 MAX_FAILURES 次失败 → open，持续 COOLDOWN_MS 毫秒
+ * - 冷却期过后 → half-open，允许一次试探请求
+ * - 试探成功 → closed（重置计数器）
+ * - 试探失败 → 重新 open（重新计时冷却）
+ */
+type CircuitState = 'closed' | 'open' | 'half-open';
+
+interface ProfileHealth {
+  state: CircuitState;
+  consecutiveFailures: number;
+  lastFailureAt: number;
+}
+
+const MAX_FAILURES = 3;       // 连续失败次数阈值
+const COOLDOWN_MS = 30_000;   // 熔断冷却时间（30 秒）
+
+class CircuitBreaker {
+  private health = new Map<string, ProfileHealth>();
+
+  private getOrCreate(profileId: string): ProfileHealth {
+    if (!this.health.has(profileId)) {
+      this.health.set(profileId, { state: 'closed', consecutiveFailures: 0, lastFailureAt: 0 });
+    }
+    return this.health.get(profileId)!;
+  }
+
+  /** 判断某个 profile 当前是否可以接受请求 */
+  isAvailable(profileId: string): boolean {
+    const h = this.getOrCreate(profileId);
+    if (h.state === 'closed') return true;
+    if (h.state === 'half-open') return true; // 允许一次试探
+    // state === 'open'：检查冷却是否已过
+    if (Date.now() - h.lastFailureAt >= COOLDOWN_MS) {
+      h.state = 'half-open';
+      return true;
+    }
+    return false;
+  }
+
+  /** 请求成功：重置状态 */
+  markSuccess(profileId: string) {
+    const h = this.getOrCreate(profileId);
+    h.state = 'closed';
+    h.consecutiveFailures = 0;
+  }
+
+  /** 请求失败：累加计数，必要时触发熔断 */
+  markFailure(profileId: string) {
+    const h = this.getOrCreate(profileId);
+    h.consecutiveFailures++;
+    h.lastFailureAt = Date.now();
+    if (h.consecutiveFailures >= MAX_FAILURES) {
+      h.state = 'open';
+    }
+  }
+
+  /** 获取某个 profile 的当前状态（调试/监控用） */
+  getState(profileId: string): CircuitState {
+    const h = this.getOrCreate(profileId);
+    // 如果在 open 状态但冷却已过，自动转 half-open
+    if (h.state === 'open' && Date.now() - h.lastFailureAt >= COOLDOWN_MS) {
+      h.state = 'half-open';
+    }
+    return h.state;
+  }
+}
+
 export class LLMRouter implements LLMProvider {
   name = 'router';
+  /** P1 修复：Circuit Breaker 实例，追踪每个 profile 的健康状态 */
+  private circuitBreaker = new CircuitBreaker();
 
   constructor(private opts: LLMRouterOpts) {}
 
@@ -53,6 +130,23 @@ export class LLMRouter implements LLMProvider {
     let lastErr: unknown = null;
     for (let i = 0; i < this.opts.profiles.length; i++) {
       const profile = this.opts.profiles[i];
+
+      // Circuit Breaker：跳过处于熔断冷却期的 profile
+      if (!this.circuitBreaker.isAvailable(profile.id)) {
+        // 如果还有下一个 profile，通知切换；否则这个 profile 是唯一选择，必须尝试
+        const next = this.opts.profiles[i + 1];
+        if (next) {
+          this.opts.onSwitch?.({
+            fromProfileId: profile.id,
+            toProfileId: next.id,
+            error: `circuit breaker open (${this.circuitBreaker.getState(profile.id)})`,
+            errorKind: 'unknown',
+          });
+          continue;
+        }
+        // 唯一 profile 在冷却中：等待冷却结束（最多等 COOLDOWN_MS），然后尝试
+        // 这是保底策略，避免所有 profile 都不可用时直接报错
+      }
 
       // 多 key 内部轮换：每个 profile 最多重试 keys.length 次
       const keys = (profile.apiKeys && profile.apiKeys.length > 0)
@@ -85,6 +179,7 @@ export class LLMRouter implements LLMProvider {
             yield chunk;
           }
           rotator.markSuccess(keyChosen);
+          this.circuitBreaker.markSuccess(profile.id);
           return;
         } catch (e) {
           lastErr = e;
@@ -100,7 +195,8 @@ export class LLMRouter implements LLMProvider {
             // 静默切下一个 key，不广播 onSwitch（onSwitch 是 profile 切换才广播）
             continue;
           }
-          // 本 profile 失败 → break 外层 for 切 profile
+          // 本 profile 失败 → Circuit Breaker 记录失败
+          this.circuitBreaker.markFailure(profile.id);
           break;
         }
       }

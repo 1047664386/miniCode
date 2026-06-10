@@ -8780,6 +8780,13 @@ function summarizeHard(middle) {
   const paths = /* @__PURE__ */ new Set();
   const tools = /* @__PURE__ */ new Map();
   const errors = [];
+  const decisions = [];
+  const decisionPatterns = [
+    /I(?:'ll| will| need to| should| decided to| plan to| think)\b[^\n.]{5,120}/gi,
+    /let me\b[^\n.]{5,120}/gi,
+    /(?:决定|接下来|需要|应该|打算|计划|先|然后|因此)[^\n。]{3,80}/g,
+    /(?:based on|because|the issue is|the problem|root cause)[^\n.]{5,120}/gi
+  ];
   for (const m of middle) {
     const txt = (m.content ?? "").toString();
     for (const p of txt.matchAll(/[\w./-]+\.[a-zA-Z]{1,5}\b/g)) {
@@ -8796,9 +8803,33 @@ function summarizeHard(middle) {
     for (const e of txt.matchAll(/(?:Error|error|failed|exception)[:\s][^\n]{0,180}/gi)) {
       if (errors.length < 5) errors.push(e[0].slice(0, 180));
     }
+    if (m.role === "assistant" && txt.length > 10) {
+      let matchedInThisMsg = false;
+      for (const pattern of decisionPatterns) {
+        for (const match of txt.matchAll(pattern)) {
+          if (decisions.length < 5) {
+            decisions.push(match[0].trim().slice(0, 120));
+            matchedInThisMsg = true;
+          }
+        }
+        if (decisions.length >= 5) break;
+      }
+      if (decisions.length < 5 && !matchedInThisMsg) {
+        const firstSentence = txt.split(/[.\n。]/)[0]?.trim();
+        if (firstSentence && firstSentence.length > 8 && firstSentence.length < 120) {
+          if (!firstSentence.startsWith("```") && !firstSentence.startsWith("~~~")) {
+            decisions.push(firstSentence);
+          }
+        }
+      }
+    }
   }
   const lines = [];
   lines.push(`Compacted ${middle.length} messages.`);
+  if (decisions.length) {
+    lines.push(`Key decisions/reasoning:
+  - ${decisions.join("\n  - ")}`);
+  }
   if (tools.size) {
     const sorted = [...tools.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
     lines.push(`Tool usage: ${sorted.map(([n, c]) => `${n}\xD7${c}`).join(", ")}`);
@@ -9513,6 +9544,7 @@ var CACHE = /* @__PURE__ */ new Map();
 var CACHE_TTL_MS = 15 * 60 * 1e3;
 var CACHE_MAX = 128;
 var MAX_CONTENT_BYTES = 30 * 1024;
+var MAX_REDIRECTS = 5;
 function cacheGet(url) {
   const e = CACHE.get(url);
   if (!e) return null;
@@ -9540,13 +9572,62 @@ function ensureSafeUrl(raw) {
     return { ok: false, reason: `Disallowed protocol: ${u.protocol}` };
   }
   const host = u.hostname.toLowerCase();
-  if (host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === "::1" || host.endsWith(".local") || host.endsWith(".localhost")) {
-    return { ok: false, reason: "Disallowed host: loopback / local" };
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+    const octets = host.split(".").map(Number);
+    if (octets.some((o) => o > 255)) {
+      return { ok: false, reason: "Invalid IP address" };
+    }
+    if (octets[0] === 127) {
+      return { ok: false, reason: "Disallowed host: loopback" };
+    }
+    if (octets[0] === 10) {
+      return { ok: false, reason: "Disallowed host: private network (10.0.0.0/8)" };
+    }
+    if (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) {
+      return { ok: false, reason: "Disallowed host: private network (172.16.0.0/12)" };
+    }
+    if (octets[0] === 192 && octets[1] === 168) {
+      return { ok: false, reason: "Disallowed host: private network (192.168.0.0/16)" };
+    }
+    if (octets[0] === 169 && octets[1] === 254) {
+      return { ok: false, reason: "Disallowed host: link-local / cloud metadata" };
+    }
+    if (octets[0] === 0 && octets[1] === 0 && octets[2] === 0 && octets[3] === 0) {
+      return { ok: false, reason: "Disallowed host: 0.0.0.0" };
+    }
   }
-  if (/^10\./.test(host) || /^192\.168\./.test(host) || /^172\.(1[6-9]|2\d|3[01])\./.test(host) || /^169\.254\./.test(host)) {
-    return { ok: false, reason: "Disallowed host: private network" };
+  if (host === "[::1]" || host === "::1") {
+    return { ok: false, reason: "Disallowed host: IPv6 loopback" };
+  }
+  if (host === "localhost" || host === "0.0.0.0" || host.endsWith(".local") || host.endsWith(".localhost") || host.endsWith(".internal") || host.endsWith(".arpa")) {
+    return { ok: false, reason: "Disallowed host: loopback / local / internal" };
   }
   return { ok: true, url: u };
+}
+async function ensureSafeDns(url) {
+  const host = url.hostname.toLowerCase();
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || /^\[?[0-9a-f:]+\]?$/i.test(host)) {
+    return { ok: true };
+  }
+  try {
+    const { lookup } = await import("dns");
+    return new Promise((resolve3) => {
+      lookup(host, (err, address) => {
+        if (err) {
+          resolve3({ ok: true });
+          return;
+        }
+        const safe = ensureSafeUrl(`http://${address}`);
+        if (!safe.ok) {
+          resolve3({ ok: false, reason: `DNS resolved to blocked address: ${safe.reason}` });
+          return;
+        }
+        resolve3({ ok: true });
+      });
+    });
+  } catch {
+    return { ok: true };
+  }
 }
 function htmlToMarkdown(html) {
   const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
@@ -9590,6 +9671,10 @@ parallelSafe: true (pure read).`,
     if (!safe.ok) {
       return { ok: false, error: safe.reason };
     }
+    const dnsSafe = await ensureSafeDns(safe.url);
+    if (!dnsSafe.ok) {
+      return { ok: false, error: dnsSafe.reason };
+    }
     if (!noCache) {
       const hit = cacheGet(url);
       if (hit) {
@@ -9604,57 +9689,83 @@ parallelSafe: true (pure read).`,
         };
       }
     }
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 2e4);
-    try {
-      const resp = await fetch(safe.url.toString(), {
-        method: "GET",
-        redirect: "follow",
-        signal: ctrl.signal,
-        headers: {
-          "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-          accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    let currentUrl = safe.url.toString();
+    let redirects = 0;
+    while (redirects <= MAX_REDIRECTS) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 2e4);
+      try {
+        const resp = await fetch(currentUrl, {
+          method: "GET",
+          redirect: "manual",
+          signal: ctrl.signal,
+          headers: {
+            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+          }
+        });
+        if ([301, 302, 303, 307, 308].includes(resp.status)) {
+          const location = resp.headers.get("location");
+          if (!location) {
+            return { ok: false, error: `Redirect ${resp.status} without Location header` };
+          }
+          redirects++;
+          if (redirects > MAX_REDIRECTS) {
+            return { ok: false, error: `Too many redirects (max ${MAX_REDIRECTS})` };
+          }
+          const redirectUrl = new URL(location, currentUrl);
+          const redirectSafe = ensureSafeUrl(redirectUrl.toString());
+          if (!redirectSafe.ok) {
+            return { ok: false, error: `Redirect to disallowed URL: ${redirectSafe.reason}` };
+          }
+          const redirectDnsSafe = await ensureSafeDns(redirectSafe.url);
+          if (!redirectDnsSafe.ok) {
+            return { ok: false, error: `Redirect DNS check failed: ${redirectDnsSafe.reason}` };
+          }
+          currentUrl = redirectSafe.url.toString();
+          continue;
         }
-      });
-      const ct = resp.headers.get("content-type") ?? "";
-      const buf = await resp.arrayBuffer();
-      let raw = new TextDecoder("utf-8", { fatal: false }).decode(buf);
-      let title = "";
-      let content = raw;
-      if (/text\/html|application\/xhtml/i.test(ct)) {
-        const md = htmlToMarkdown(raw);
-        title = md.title;
-        content = md.markdown;
-      } else if (/application\/json/i.test(ct)) {
-        try {
-          content = JSON.stringify(JSON.parse(raw), null, 2);
-        } catch {
+        const ct = resp.headers.get("content-type") ?? "";
+        const buf = await resp.arrayBuffer();
+        let raw = new TextDecoder("utf-8", { fatal: false }).decode(buf);
+        let title = "";
+        let content = raw;
+        if (/text\/html|application\/xhtml/i.test(ct)) {
+          const md = htmlToMarkdown(raw);
+          title = md.title;
+          content = md.markdown;
+        } else if (/application\/json/i.test(ct)) {
+          try {
+            content = JSON.stringify(JSON.parse(raw), null, 2);
+          } catch {
+          }
         }
+        let truncated = false;
+        if (content.length > MAX_CONTENT_BYTES) {
+          content = content.slice(0, MAX_CONTENT_BYTES) + "\n\n...[truncated]";
+          truncated = true;
+        }
+        const finalUrl = currentUrl;
+        cachePut(url, { text: content, title, finalUrl });
+        return {
+          ok: resp.ok,
+          status: resp.status,
+          finalUrl,
+          title,
+          content,
+          truncated,
+          cached: false
+        };
+      } catch (e) {
+        return {
+          ok: false,
+          error: e?.name === "AbortError" ? "Fetch timeout (20s)" : e?.message ?? String(e)
+        };
+      } finally {
+        clearTimeout(timer);
       }
-      let truncated = false;
-      if (content.length > MAX_CONTENT_BYTES) {
-        content = content.slice(0, MAX_CONTENT_BYTES) + "\n\n...[truncated]";
-        truncated = true;
-      }
-      const finalUrl = resp.url || url;
-      cachePut(url, { text: content, title, finalUrl });
-      return {
-        ok: resp.ok,
-        status: resp.status,
-        finalUrl,
-        title,
-        content,
-        truncated,
-        cached: false
-      };
-    } catch (e) {
-      return {
-        ok: false,
-        error: e?.name === "AbortError" ? "Fetch timeout (20s)" : e?.message ?? String(e)
-      };
-    } finally {
-      clearTimeout(timer);
     }
+    return { ok: false, error: `Too many redirects (max ${MAX_REDIRECTS})` };
   }
 };
 
@@ -10594,6 +10705,16 @@ var runCommandTool = {
         return { ok: false, error: e?.message ?? String(e), policy: decision };
       }
     }
+    if (ctx.checkpoint) {
+      const affectedFiles = detectAffectedFiles(command, ctx.cwd);
+      if (affectedFiles.length > 0) {
+        await ctx.checkpoint({
+          label: `run_command: ${command.slice(0, 60)}`,
+          trigger: "run_command",
+          files: affectedFiles.map((p) => ({ path: p, newContent: "" }))
+        }).catch(() => void 0);
+      }
+    }
     try {
       const { stdout, stderr } = await pExecFile2("sh", ["-c", command], {
         cwd,
@@ -10638,6 +10759,57 @@ function isLikelySlow(cmd) {
     "tsc -b"
   ];
   return slow.some((kw) => c.includes(kw));
+}
+function detectAffectedFiles(command, cwd) {
+  const cmd = command.trim();
+  const files = [];
+  const segments = cmd.split(/\s*(?:\|\||&&|\||;)\s*/);
+  for (const seg of segments) {
+    const trimmedSeg = seg.trim();
+    if (!trimmedSeg) continue;
+    for (const m of trimmedSeg.matchAll(/>{1,2}\s*(\S+)/g)) {
+      const target = m[1];
+      if (target && !target.startsWith("-") && !target.endsWith("/")) {
+        files.push(target);
+      }
+    }
+    const parts = trimmedSeg.split(/\s+/);
+    if (parts.length === 0) continue;
+    const prog = parts[0].replace(/^(?:sudo\s+)?/, "").split("/").pop()?.toLowerCase() ?? "";
+    if (prog === "cp" || prog === "mv" || prog === "ln") {
+      const target = parts[parts.length - 1];
+      if (target && !target.startsWith("-") && !target.endsWith("/")) {
+        files.push(target);
+      }
+    } else if (prog === "touch") {
+      for (const p of parts.slice(1)) {
+        if (!p.startsWith("-") && !p.endsWith("/")) files.push(p);
+      }
+    } else if (prog === "mkdir") {
+      for (const p of parts.slice(1)) {
+        if (!p.startsWith("-") && !p.endsWith("/")) files.push(p);
+      }
+    } else if (prog === "rm") {
+      for (const p of parts.slice(1)) {
+        if (!p.startsWith("-") && !p.endsWith("/")) files.push(p);
+      }
+    } else if (prog === "sed" || prog === "awk") {
+      if (seg.includes(" -i ")) {
+        const target = parts[parts.length - 1];
+        if (target && !target.startsWith("-") && target.includes(".")) files.push(target);
+      }
+    } else if (prog === "tee") {
+      for (const p of parts.slice(1)) {
+        if (!p.startsWith("-") && !p.startsWith(">") && !p.endsWith("/")) files.push(p);
+      }
+    } else if (prog === "patch" || prog === "git" && parts[1] === "apply") {
+    } else if ((prog === "npm" || prog === "pnpm" || prog === "yarn") && parts.slice(1).some((p) => p === "install" || p === "i" || p === "add")) {
+      files.push("package.json", "package-lock.json");
+    } else if (prog === "pip" && parts.slice(1).some((p) => p === "install")) {
+      files.push("requirements.txt");
+    }
+  }
+  return [...new Set(files)].filter((f) => f && !f.startsWith("-"));
 }
 var listBackgroundTasksTool = {
   name: "list_background_tasks",
@@ -11422,11 +11594,12 @@ function simpleHash(s) {
 // ../../packages/core/src/memory/auto-memory.ts
 init_zod();
 var lastRunBySession = /* @__PURE__ */ new Map();
-var MIN_TURNS_BETWEEN_RUNS = 5;
+var MIN_TURNS_BETWEEN_RUNS = 3;
 var MIN_USER_LEN = 20;
 function shouldRun(userMessage) {
   if (userMessage.length < MIN_USER_LEN) return false;
   const signals = [
+    // 偏好信号（原有）
     /\b(prefer|like|don'?t like|hate|always|never|please|stop|remember|note that)\b/i,
     /我(希望|喜欢|不喜欢|讨厌|总是|从不|不要|要求|偏好|习惯)/,
     /(以后|今后|下次|always|永远|每次|每个|all|every)/i,
@@ -11434,7 +11607,18 @@ function shouldRun(userMessage) {
     /(规范|约定|惯例|风格|要求|强制)/,
     /\b(use|don'?t use|switch to)\b.*\b(library|framework|tool|version)\b/i,
     /(用|不用|改用|换成).*(库|框架|版本|工具|API)/,
-    /\b(deprecated|legacy|migrate|deprecat)/i
+    /\b(deprecated|legacy|migrate|deprecat)/i,
+    // 项目知识信号（新增）
+    /(这个项目|该项目|本项目|我们的项目)/,
+    /(入口(是|在|文件)|主文件是|main\s+(is|file))/i,
+    /(架构(是|如下)|目录结构|项目结构|模块划分)/,
+    /(数据库(是|用的)|数据库连接|DB\s+(is|uses))/i,
+    /(部署在|运行在|服务器是|端口是)/,
+    /(\.env|环境变量|config\s+file|配置文件)\s*(里|中|是|有)/,
+    /(token\s+limit|context\s+window|模型(是|用的|换成))/i,
+    // 用户显式要求记住（/remember 会在 slash-commands 里处理，这里是自然语言兜底）
+    /\b(remember|记住|记一下|记录一下|别忘了)\b/i,
+    /(帮我记|你需要记|你应该记|记好了)/
   ];
   return signals.some((re) => re.test(userMessage));
 }
@@ -12125,24 +12309,29 @@ async function buildMessages(opts) {
     sandbox,
     approval: approvalPolicy
   });
-  const contextParts = [];
+  const stableParts = [];
+  const dynamicParts = [];
+  for (const extra of systemExtras) {
+    if (extra?.trim()) stableParts.push(extra);
+  }
   if (autoContext.length) {
     const ctxLines = autoContext.slice(0, 6).map((c) => `--- ${c.file} ---
 ${c.text.slice(0, 2e3)}`).join("\n\n");
-    contextParts.push(`<retrieved-context>
+    dynamicParts.push(`<retrieved-context>
 ${ctxLines}
 </retrieved-context>`);
   }
   if (explicitContext.length) {
     const mentionLines = explicitContext.map((c) => `--- ${c.label} (${c.type}) ---
 ${c.content.slice(0, 3e3)}`).join("\n\n");
-    contextParts.push(`<explicit-context>
+    dynamicParts.push(`<explicit-context>
 ${mentionLines}
 </explicit-context>`);
   }
   if (memory) {
     try {
-      const memItems = await memory.recall(userMessage, { topK: 5 });
+      const enrichedQuery = buildEnrichedRecallQuery(userMessage, history);
+      const memItems = await memory.recall(enrichedQuery, { topK: 5 });
       if (memItems.length) {
         let filtered = memItems;
         if (injectionCache && sessionId) {
@@ -12155,7 +12344,7 @@ ${mentionLines}
         }
         if (filtered.length) {
           const memLines = filtered.map((m) => `- [${m.category}] ${m.title}: ${m.content.slice(0, 500)}`).join("\n");
-          contextParts.push(`<memory>
+          dynamicParts.push(`<memory>
 ${memLines}
 </memory>`);
           onMemoryRecalled?.(filtered);
@@ -12164,15 +12353,30 @@ ${memLines}
     } catch {
     }
   }
-  for (const extra of systemExtras) {
-    if (extra?.trim()) contextParts.push(extra);
+  const systemMessages = [];
+  const isAnthropic = providerFlavor === "anthropic";
+  if (isAnthropic || dynamicParts.length === 0) {
+    const systemContent = [systemBase, ...stableParts, ...dynamicParts].filter((p) => p?.trim()).join("\n\n");
+    systemMessages.push({
+      role: "system",
+      content: systemContent,
+      cacheHint: "ephemeral"
+    });
+  } else {
+    const stableContent = [systemBase, ...stableParts].filter((p) => p?.trim()).join("\n\n");
+    systemMessages.push({
+      role: "system",
+      content: stableContent,
+      cacheHint: "ephemeral"
+    });
+    const dynamicContent = dynamicParts.filter((p) => p?.trim()).join("\n\n");
+    if (dynamicContent.trim()) {
+      systemMessages.push({
+        role: "system",
+        content: dynamicContent
+      });
+    }
   }
-  const systemContent = [systemBase, ...contextParts].filter((p) => p?.trim()).join("\n\n");
-  const systemMsg = {
-    role: "system",
-    content: systemContent,
-    cacheHint: "ephemeral"
-  };
   let compactedHistory = history;
   let compactDebug = void 0;
   if (compaction) {
@@ -12202,12 +12406,26 @@ ${memLines}
     ];
   }
   const messages = [
-    systemMsg,
+    ...systemMessages,
     ...compactedHistory,
     userMsg
   ];
   messages.__compactDebug = compactDebug;
   return messages;
+}
+function buildEnrichedRecallQuery(userMessage, history) {
+  const recentAssistant = [];
+  for (let i = history.length - 1; i >= 0 && recentAssistant.length < 2; i--) {
+    const msg = history[i];
+    if (msg.role === "assistant" && typeof msg.content === "string" && msg.content.trim()) {
+      recentAssistant.push(msg.content.trim());
+    }
+  }
+  if (!recentAssistant.length) return userMessage;
+  const contextSnippet = recentAssistant.map((s) => s.slice(0, 200)).join(" ");
+  const maxLen = 600;
+  const combined = `${userMessage} ${contextSnippet}`;
+  return combined.length > maxLen ? combined.slice(0, maxLen) : combined;
 }
 
 // ../../packages/core/src/context/injection-cache.ts
@@ -13328,10 +13546,14 @@ var PendingEditStore = class {
   async propose(opts) {
     const abs = path12.resolve(this.cwd, opts.path);
     let oldContent = null;
+    let mtimeAtPropose = 0;
     try {
+      const stat4 = await fs12.stat(abs);
       oldContent = await fs12.readFile(abs, "utf-8");
+      mtimeAtPropose = stat4.mtimeMs;
     } catch {
       oldContent = null;
+      mtimeAtPropose = 0;
     }
     const id = `edit_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const edit = {
@@ -13341,7 +13563,8 @@ var PendingEditStore = class {
       newContent: opts.newContent,
       tool: opts.tool,
       createdAt: Date.now(),
-      status: "pending"
+      status: "pending",
+      mtimeAtPropose
     };
     const old = this.byPath.get(opts.path);
     if (old) this.byId.delete(old.id);
@@ -13349,10 +13572,31 @@ var PendingEditStore = class {
     this.byId.set(id, edit);
     return edit;
   }
+  /**
+   * 检查文件在 propose 之后是否被外部修改过。
+   * 如果 mtime 变了（精确到毫秒），说明有人在 propose 和 accept 之间修改了文件。
+   */
+  async checkExternalModification(edit) {
+    if (edit.mtimeAtPropose === 0) return;
+    const abs = path12.resolve(this.cwd, edit.path);
+    let stat4;
+    try {
+      stat4 = await fs12.stat(abs);
+    } catch (e) {
+      if (e.code === "ENOENT" && edit.oldContent === null) return;
+      throw e;
+    }
+    if (Math.abs(stat4.mtimeMs - edit.mtimeAtPropose) > 1) {
+      throw new Error(
+        `File "${edit.path}" was modified externally since the edit was proposed. The pending edit may be based on stale content. Please re-read the file and propose a new edit.`
+      );
+    }
+  }
   async accept(id) {
     const edit = this.byId.get(id);
     if (!edit) throw new Error("Edit not found");
     if (edit.status !== "pending") return edit;
+    await this.checkExternalModification(edit);
     if (this.onBeforeWrite) await this.onBeforeWrite([edit]);
     const abs = path12.resolve(this.cwd, edit.path);
     await fs12.mkdir(path12.dirname(abs), { recursive: true });
@@ -13372,6 +13616,9 @@ var PendingEditStore = class {
   async acceptAll() {
     const all = this.list();
     if (!all.length) return [];
+    for (const edit of all) {
+      await this.checkExternalModification(edit);
+    }
     if (this.onBeforeWrite) await this.onBeforeWrite(all);
     const stagingRoot = path12.resolve(this.cwd, ".minicodeide", "staging");
     await fs12.mkdir(stagingRoot, { recursive: true });
@@ -13396,7 +13643,16 @@ var PendingEditStore = class {
     try {
       for (const p of prepared) {
         await fs12.mkdir(path12.dirname(p.target), { recursive: true });
-        await fs12.rename(p.stagingFile, p.target);
+        try {
+          await fs12.rename(p.stagingFile, p.target);
+        } catch (renameErr) {
+          if (renameErr?.code === "EXDEV") {
+            await fs12.copyFile(p.stagingFile, p.target);
+            await fs12.unlink(p.stagingFile).catch(() => void 0);
+          } else {
+            throw renameErr;
+          }
+        }
         committed.push({ edit: p.edit, target: p.target, oldContent: p.edit.oldContent });
       }
     } catch (err) {
@@ -13860,6 +14116,18 @@ Produce a tight handoff summary of the conversation so far covering:
 - Files / functions touched
 - Outstanding TODOs (if any)
 Then continue from the current step.`
+  },
+  {
+    name: "remember",
+    description: "Explicitly save important information to long-term memory.",
+    source: "builtin",
+    expand: (arg) => arg.trim() ? `[REMEMBER REQUEST] The user explicitly asks you to remember the following information for future conversations:
+
+"${arg.trim()}"
+
+Call the \`upsert_memory\` tool (or equivalent) to save this to persistent memory. Classify it as: preference / project_knowledge / experience as appropriate. Confirm to the user once saved.` : `[REMEMBER REQUEST] The user wants to save the most important information from this conversation to memory.
+
+Review the conversation and identify 1\u20133 key facts worth remembering (preferences, decisions, project-specific knowledge). Save each one via \`upsert_memory\` and list what you saved.`
   }
 ];
 var SlashCommandRegistry = class {
@@ -14097,11 +14365,35 @@ var ProviderStore = class {
 // ../server/src/session-store.ts
 import { promises as fs18 } from "node:fs";
 import path18 from "node:path";
+var SessionLock = class {
+  chains = /* @__PURE__ */ new Map();
+  async acquire(sessionId) {
+    const prev = this.chains.get(sessionId) ?? Promise.resolve();
+    let release;
+    const next = new Promise((resolve3) => {
+      release = resolve3;
+    });
+    this.chains.set(sessionId, next);
+    await prev;
+    return () => {
+      release();
+      if (this.chains.get(sessionId) === next) {
+        this.chains.delete(sessionId);
+      }
+    };
+  }
+  /** 检查某个 session 是否正在被锁定（用于快速判断，不阻塞） */
+  isLocked(sessionId) {
+    return this.chains.has(sessionId);
+  }
+};
 var SessionStore = class {
   dir;
   /** session id → 内存缓存（避免每次 list 都扫盘） */
   cache = /* @__PURE__ */ new Map();
   loaded = false;
+  /** 并发锁：确保同一 session 的 turn 生命周期不会交叉 */
+  lock = new SessionLock();
   constructor(workspace) {
     this.dir = path18.join(workspace, ".minicodeide", "sessions");
   }
@@ -14322,1292 +14614,9 @@ var SessionStore = class {
 import { promises as fs19 } from "node:fs";
 import path19 from "node:path";
 import os3 from "node:os";
-var SkillStore = class {
-  workspace;
-  cache = /* @__PURE__ */ new Map();
-  fullCache = /* @__PURE__ */ new Map();
-  constructor(workspace) {
-    this.workspace = workspace;
-  }
-  async load() {
-    this.cache.clear();
-    this.fullCache.clear();
-    const projectDir = path19.join(this.workspace, ".minicodeide", "skills");
-    const userDir = path19.join(os3.homedir(), ".minicodeide", "skills");
-    await this.scanDir(userDir, "user");
-    await this.scanDir(projectDir, "project");
-  }
-  list() {
-    return [...this.cache.values()].sort((a, b) => a.name.localeCompare(b.name));
-  }
-  get(name) {
-    return this.cache.get(name);
-  }
-  /** 加载 skill 全文（懒加载 + 缓存） */
-  async loadFull(name) {
-    const cached = this.fullCache.get(name);
-    if (cached) return cached;
-    const meta = this.cache.get(name);
-    if (!meta) return null;
-    const raw = await fs19.readFile(meta.filePath, "utf-8").catch(() => "");
-    const { body } = parseFrontmatter(raw);
-    const supportFiles = await listSupportFiles(meta.directory).catch(() => []);
-    const full = { ...meta, body, supportFiles };
-    this.fullCache.set(name, full);
-    return full;
-  }
-  /**
-   * 生成 system prompt 注入文本：仅概览（name + description），不含全文
-   *
-   * 设计：每条 skill 1 行，最多 30 行；超出截断告知 LLM 用 `/api/skills` 查更多
-   */
-  renderForSystem() {
-    const all = this.list();
-    if (all.length === 0) return "";
-    const lines = ["# Available Skills (call `use_skill(name=...)` to load full instructions)"];
-    const cap = 30;
-    for (const s of all.slice(0, cap)) {
-      lines.push(`- **${s.name}** [${s.source}]: ${s.description.slice(0, 160)}`);
-    }
-    if (all.length > cap) {
-      lines.push(`- ... ${all.length - cap} more available; use \`use_skill\` with the exact name.`);
-    }
-    return lines.join("\n");
-  }
-  async scanDir(dir, source) {
-    let entries = [];
-    try {
-      entries = await fs19.readdir(dir);
-    } catch {
-      return;
-    }
-    for (const name of entries) {
-      const skillDir = path19.join(dir, name);
-      let stat4;
-      try {
-        stat4 = await fs19.stat(skillDir);
-      } catch {
-        continue;
-      }
-      if (!stat4.isDirectory()) continue;
-      const skillMd = path19.join(skillDir, "SKILL.md");
-      let raw;
-      try {
-        raw = await fs19.readFile(skillMd, "utf-8");
-      } catch {
-        continue;
-      }
-      const { frontmatter } = parseFrontmatter(raw);
-      const skillName = frontmatter.name ?? name;
-      const description = frontmatter.description ?? "";
-      const userInvocable = frontmatter.user_invocable !== false;
-      const meta = {
-        name: skillName,
-        description,
-        userInvocable,
-        source,
-        filePath: skillMd,
-        directory: skillDir
-      };
-      this.cache.set(skillName, meta);
-    }
-  }
-};
-function parseFrontmatter(raw) {
-  if (!raw.startsWith("---")) return { frontmatter: {}, body: raw };
-  const end = raw.indexOf("\n---", 3);
-  if (end < 0) return { frontmatter: {}, body: raw };
-  const headerBlock = raw.slice(3, end).trim();
-  const body = raw.slice(end + 4).replace(/^\n/, "");
-  const fm = {};
-  for (const line of headerBlock.split("\n")) {
-    const m = line.match(/^([\w-]+)\s*:\s*(.*)$/);
-    if (!m) continue;
-    let value = m[2].trim();
-    if (value === "true") value = true;
-    else if (value === "false") value = false;
-    else if (typeof value === "string" && /^-?\d+$/.test(value)) value = Number(value);
-    if (typeof value === "string" && /^["'].*["']$/.test(value)) value = value.slice(1, -1);
-    fm[m[1]] = value;
-  }
-  return { frontmatter: fm, body };
-}
-async function listSupportFiles(dir) {
-  const out = [];
-  const walk2 = async (cur, rel) => {
-    const entries = await fs19.readdir(cur, { withFileTypes: true }).catch(() => []);
-    for (const e of entries) {
-      const child = path19.join(cur, e.name);
-      const childRel = rel ? `${rel}/${e.name}` : e.name;
-      if (e.isDirectory()) {
-        if (e.name.startsWith(".") || e.name === "node_modules") continue;
-        await walk2(child, childRel);
-      } else if (e.isFile() && e.name !== "SKILL.md") {
-        out.push(childRel);
-      }
-    }
-  };
-  await walk2(dir, "");
-  return out.slice(0, 100);
-}
-
-// ../server/src/subagent-manager.ts
-import { EventEmitter } from "node:events";
-import * as fsSync from "node:fs";
-import path20 from "node:path";
-var TypedEmitter = class {
-  ee = new EventEmitter();
-  on(ev, fn) {
-    this.ee.on(ev, fn);
-    return this;
-  }
-  off(ev, fn) {
-    this.ee.off(ev, fn);
-    return this;
-  }
-  emit(ev, payload) {
-    this.ee.emit(ev, payload);
-  }
-};
-var SubagentManager = class extends TypedEmitter {
-  opts;
-  runs = /* @__PURE__ */ new Map();
-  /** parentSessionId → active runIds（用于并发限制 + announce 路由） */
-  byParent = /* @__PURE__ */ new Map();
-  /** runId 幂等：已经 announce 过的不再二次推送 */
-  announced = /* @__PURE__ */ new Set();
-  /** 已推送但还没被父 turn 消费的 announce message（父端 follow-up turn 拉取） */
-  pendingAnnounceByParent = /* @__PURE__ */ new Map();
-  /** 角色 profile 缓存（启动时加载一次，文件变更时可手动 refresh） */
-  profiles = /* @__PURE__ */ new Map();
-  /** fs.watch watcher instance（hot-reload 用） */
-  profileWatcher = null;
-  /** debounce timer for hot-reload */
-  profileReloadTimer = null;
-  /** 等待某个 parent 当前所有 active subagent 完成（或 timeout）。父 turn 末尾用 */
-  async awaitAllForParent(parentSessionId, timeoutMs = 6e4) {
-    const active = this.byParent.get(parentSessionId);
-    if (!active || active.size === 0) return;
-    const deadline = Date.now() + timeoutMs;
-    await new Promise((resolve3) => {
-      const tick = () => {
-        const cur = this.byParent.get(parentSessionId);
-        if (!cur || cur.size === 0) return resolve3();
-        if (Date.now() >= deadline) return resolve3();
-        setTimeout(tick, 100);
-      };
-      tick();
-    });
-  }
-  constructor(opts) {
-    super();
-    this.opts = {
-      maxDepth: 2,
-      maxConcurrentPerParent: 3,
-      runTimeoutMs: 12e4,
-      ...opts
-    };
-    loadAgentProfiles(opts.workspaceRoot).then((map) => {
-      this.profiles = map;
-      if (map.size > 0) {
-        console.log(`[subagents] Loaded ${map.size} agent profiles: ${[...map.keys()].join(", ")}`);
-      }
-    }).catch(() => void 0);
-    this._startProfileWatcher(opts.workspaceRoot);
-  }
-  /** 手动刷新 profile（用户编辑 .minicodeide/agents/ 后调用） */
-  async refreshProfiles() {
-    this.profiles = await loadAgentProfiles(this.opts.workspaceRoot);
-    return this.profiles.size;
-  }
-  /** 返回当前所有 profile 名（用于 tool description 动态填充） */
-  getProfileNames() {
-    return [...this.profiles.values()].map((p) => ({ name: p.name, description: p.description }));
-  }
-  /**
-   * 父 Agent 调 dispatch_subagent 时进入这里。
-   * 立刻返回 runId（不阻塞父 turn），后台跑 runAgent。
-   */
-  async spawn(spec) {
-    const childDepth = spec.parentDepth + 1;
-    if (childDepth > this.opts.maxDepth) {
-      throw new Error(`Subagent depth limit (${this.opts.maxDepth}) reached`);
-    }
-    const activeForParent = this.byParent.get(spec.parentSessionId)?.size ?? 0;
-    if (activeForParent >= this.opts.maxConcurrentPerParent) {
-      throw new Error(
-        `Max concurrent subagents per parent (${this.opts.maxConcurrentPerParent}) reached`
-      );
-    }
-    const child = await this.opts.sessions.create(
-      `[subagent] ${spec.label ?? spec.task.slice(0, 40)}`
-    );
-    const runId = `srun_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    const run2 = {
-      runId,
-      childSessionId: child.id,
-      parentSessionId: spec.parentSessionId,
-      label: spec.label ?? "(no-label)",
-      task: spec.task,
-      role: spec.role,
-      status: "running",
-      startedAt: Date.now(),
-      depth: childDepth
-    };
-    this.runs.set(runId, run2);
-    if (!this.byParent.has(spec.parentSessionId)) this.byParent.set(spec.parentSessionId, /* @__PURE__ */ new Set());
-    this.byParent.get(spec.parentSessionId).add(runId);
-    void this.runChild(run2);
-    return { runId, childSessionId: child.id };
-  }
-  /** 父端在新 turn 启动前拉取累积的 announce，作为合成 user 消息合入 */
-  pickPendingAnnouncements(parentSessionId) {
-    const buf = this.pendingAnnounceByParent.get(parentSessionId);
-    if (!buf || buf.length === 0) return [];
-    this.pendingAnnounceByParent.delete(parentSessionId);
-    return buf;
-  }
-  hasPending(parentSessionId) {
-    return (this.pendingAnnounceByParent.get(parentSessionId)?.length ?? 0) > 0;
-  }
-  list(parentSessionId) {
-    const all = [...this.runs.values()];
-    if (parentSessionId) return all.filter((r) => r.parentSessionId === parentSessionId);
-    return all;
-  }
-  async runChild(run2) {
-    const profile = run2.role ? getProfile(this.profiles, run2.role) : void 0;
-    const systemLines = [];
-    if (profile) {
-      systemLines.push(
-        `[Subagent Role: ${profile.name}]`,
-        profile.systemPrompt,
-        "",
-        `[Subagent Context]`,
-        `You are running as a subagent (depth ${run2.depth}/${this.opts.maxDepth}) with role "${profile.name}".`,
-        `Role description: ${profile.description}`,
-        'Your output will be auto-delivered to the requester as a single "[Subagent Completed]" message.'
-      );
-      if (profile.sandbox === "read_only") {
-        systemLines.push("", "[Sandbox: read_only]", "You CANNOT write files. Your job is to read, analyze, and report findings.");
-      }
-    } else {
-      systemLines.push(
-        "[Subagent Context]",
-        `You are running as a subagent (depth ${run2.depth}/${this.opts.maxDepth}).`,
-        'Your output will be auto-delivered to the requester as a single "[Subagent Completed]" message.'
-      );
-    }
-    systemLines.push(
-      "",
-      "[Rules]",
-      "- You CANNOT spawn further subagents (dispatch_subagent is disabled here).",
-      "- You CANNOT modify the parent plan (update_plan is disabled here).",
-      "- Be concise. Produce a final answer in 1 turn if possible; max 8 steps.",
-      "- Do not poll status of other agents. You have no visibility into siblings.",
-      "",
-      `[Subagent Task]: ${run2.task}`
-    );
-    const SUBAGENT_SYSTEM = systemLines.join("\n");
-    const childRegistry = this.buildChildRegistry(profile);
-    const messages = [
-      { role: "system", content: SUBAGENT_SYSTEM },
-      { role: "user", content: run2.task }
-    ];
-    const abort = new AbortController();
-    const timeoutHandle = setTimeout(() => abort.abort(), this.opts.runTimeoutMs);
-    let childTurnId;
-    try {
-      childTurnId = await this.opts.sessions.startTurn(run2.childSessionId, run2.task).catch(() => void 0);
-      await this.opts.sessions.append(run2.childSessionId, { role: "user", content: run2.task });
-      const childCtx = {
-        ...this.opts.childToolCtxFactory(),
-        subagentDepth: run2.depth
-        // 即使子 registry 没有 dispatch tool，也带上 depth 信息
-      };
-      let isolatedPath;
-      if (this.opts.worktrees) {
-        try {
-          const wt = await this.opts.worktrees.createForSubagent(run2.runId);
-          if (wt.isolated) {
-            isolatedPath = wt.path;
-            childCtx.cwd = wt.path;
-          }
-        } catch {
-        }
-      }
-      let assistantBuf = "";
-      const resolvedLlm = typeof this.opts.llm === "function" ? this.opts.llm() : this.opts.llm;
-      const resolvedModel = typeof this.opts.defaultModel === "function" ? this.opts.defaultModel() : this.opts.defaultModel;
-      for await (const ev of runAgent({
-        llm: resolvedLlm,
-        registry: childRegistry,
-        messages,
-        toolCtx: childCtx,
-        signal: abort.signal,
-        maxSteps: 8,
-        model: resolvedModel
-      })) {
-        if (ev.type === "text" && ev.text) {
-          assistantBuf += ev.text;
-          if (childTurnId) {
-            this.opts.sessions.appendChunk(run2.childSessionId, childTurnId, ev.text).catch(() => void 0);
-          }
-          this.emit("child_text", { runId: run2.runId, text: ev.text });
-        }
-        if (ev.type === "tool_call" && ev.toolCall) {
-          this.emit("child_tool", { runId: run2.runId, tool: ev.toolCall.name });
-          if (childTurnId) {
-            this.opts.sessions.appendTool(run2.childSessionId, childTurnId, {
-              name: ev.toolCall.name,
-              args: ev.toolCall.arguments
-            }).catch(() => void 0);
-          }
-        }
-        if (ev.type === "tool_result") {
-          const preview = typeof ev.toolResult === "string" ? ev.toolResult.slice(0, 80).replace(/\n/g, " ") : "";
-          this.emit("child_tool_result", {
-            runId: run2.runId,
-            tool: ev.toolCall?.name ?? "unknown",
-            resultPreview: preview
-          });
-        }
-        if (ev.type === "error") {
-          throw new Error(ev.error ?? "subagent error");
-        }
-      }
-      const finalText = assistantBuf.trim();
-      run2.result = finalText;
-      run2.status = "completed";
-      if (childTurnId) {
-        await this.opts.sessions.endTurn(run2.childSessionId, childTurnId, finalText).catch(() => void 0);
-      }
-    } catch (e) {
-      const isTimeout = abort.signal.aborted;
-      run2.status = isTimeout ? "timeout" : "error";
-      run2.error = e?.message ?? String(e);
-      if (childTurnId) {
-        await this.opts.sessions.interruptTurn(run2.childSessionId, childTurnId, run2.error).catch(() => void 0);
-      }
-    } finally {
-      clearTimeout(timeoutHandle);
-      run2.finishedAt = Date.now();
-      this.byParent.get(run2.parentSessionId)?.delete(run2.runId);
-      this.deliverAnnounce(run2);
-      if (this.opts.worktrees) {
-        this.opts.worktrees.remove(run2.runId, { keepBranch: true }).catch(() => void 0);
-      }
-    }
-  }
-  /** 把 run 结果构建 announce message 并放入父的 pending 队列（zero-token，user 角色注入） */
-  deliverAnnounce(run2) {
-    if (this.announced.has(run2.runId)) return;
-    this.announced.add(run2.runId);
-    const lines = [];
-    lines.push(`[Subagent Completed] runId=${run2.runId} label=${run2.label} outcome=${run2.status}`);
-    if (run2.status === "completed") {
-      lines.push("---");
-      lines.push(run2.result ?? "(empty)");
-    } else {
-      lines.push(`error: ${run2.error ?? "(unknown)"}`);
-    }
-    const msg = lines.join("\n");
-    if (!this.pendingAnnounceByParent.has(run2.parentSessionId)) {
-      this.pendingAnnounceByParent.set(run2.parentSessionId, []);
-    }
-    this.pendingAnnounceByParent.get(run2.parentSessionId).push(msg);
-    this.emit("announce", { run: run2 });
-  }
-  /** 子 Agent 的 registry：拿全 builtin，然后剔除危险/不该有的；profile 可进一步裁剪 */
-  buildChildRegistry(profile) {
-    const r = new ToolRegistry();
-    registerBuiltinTools(r);
-    r.unregister("dispatch_subagent");
-    r.unregister("update_plan");
-    if (profile) {
-      if (profile.allowedTools && profile.allowedTools.length > 0) {
-        const allNames = r.list().map((t) => t.name);
-        for (const name of allNames) {
-          if (!profile.allowedTools.includes(name)) {
-            r.unregister(name);
-          }
-        }
-      } else if (profile.deniedTools && profile.deniedTools.length > 0) {
-        for (const name of profile.deniedTools) {
-          r.unregister(name);
-        }
-      }
-      if (profile.sandbox === "read_only") {
-        r.unregister("write_file");
-        r.unregister("edit_file");
-        r.unregister("run_command");
-      }
-    } else {
-      r.unregister("write_file");
-      r.unregister("edit_file");
-      r.unregister("run_command");
-    }
-    return r;
-  }
-  // --- P3-D5: Agent Profile hot-reload ---
-  /**
-   * 启动 fs.watch 监听 .minicodeide/agents/ 目录变更。
-   * 文件增/删/改 → debounce 500ms → 自动 refreshProfiles。
-   * 无 agents 目录或 fs.watch 不可用 → 静默跳过。
-   */
-  _startProfileWatcher(workspaceRoot) {
-    const agentsDir = path20.join(workspaceRoot, ".minicodeide", "agents");
-    try {
-      const stat4 = fsSync.statSync(agentsDir);
-      if (!stat4.isDirectory()) return;
-    } catch {
-      return;
-    }
-    try {
-      this.profileWatcher = fsSync.watch(agentsDir, (eventType, filename) => {
-        if (!filename || !filename.endsWith(".md")) return;
-        if (this.profileReloadTimer) clearTimeout(this.profileReloadTimer);
-        this.profileReloadTimer = setTimeout(async () => {
-          try {
-            const count = await this.refreshProfiles();
-            console.log(`[subagents] Hot-reloaded ${count} agent profiles (trigger: ${eventType} ${filename})`);
-          } catch (e) {
-            console.error(`[subagents] Hot-reload failed: ${e?.message ?? e}`);
-          }
-        }, 500);
-      });
-      console.log(`[subagents] Watching ${agentsDir} for profile hot-reload`);
-    } catch (e) {
-      console.warn(`[subagents] fs.watch on ${agentsDir} failed: ${e?.message ?? e}. Profiles will NOT auto-reload.`);
-    }
-  }
-  /** 停止 profile watcher（server shutdown 时调用） */
-  stopProfileWatcher() {
-    if (this.profileWatcher) {
-      this.profileWatcher.close();
-      this.profileWatcher = null;
-    }
-    if (this.profileReloadTimer) {
-      clearTimeout(this.profileReloadTimer);
-      this.profileReloadTimer = null;
-    }
-  }
-};
-
-// ../server/src/mcp-client.ts
-import { spawn } from "node:child_process";
-import * as fs20 from "node:fs";
-import * as path21 from "node:path";
-var DEFAULT_ALLOWLIST = {
-  allowedCommands: ["npx", "uvx", "node", "python3", "python", "bunx", "pnpm", "docker"],
-  denyArgs: ["--allow-shell", "--unsafe", "--rm-rf"]
-};
-function loadAllowlist(workspace) {
-  const f = path21.join(workspace, ".minicodeide", "mcp-allowlist.json");
-  if (!fs20.existsSync(f)) return DEFAULT_ALLOWLIST;
-  try {
-    const raw = JSON.parse(fs20.readFileSync(f, "utf8"));
-    return {
-      allowedCommands: raw.allowedCommands ?? DEFAULT_ALLOWLIST.allowedCommands,
-      denyArgs: raw.denyArgs ?? DEFAULT_ALLOWLIST.denyArgs
-    };
-  } catch {
-    return DEFAULT_ALLOWLIST;
-  }
-}
-function validateServerAgainstAllowlist(cfg, allow) {
-  const base = path21.basename(cfg.command).toLowerCase();
-  if (!allow.allowedCommands.map((c) => c.toLowerCase()).includes(base)) {
-    return `command "${cfg.command}" not in allowedCommands. Add it to .minicodeide/mcp-allowlist.json`;
-  }
-  const argsLower = (cfg.args ?? []).map((a) => String(a).toLowerCase());
-  for (const deny of allow.denyArgs ?? []) {
-    const dl = deny.toLowerCase();
-    if (argsLower.some((a) => a.includes(dl))) {
-      return `args contain forbidden token "${deny}"`;
-    }
-  }
-  return null;
-}
-var McpClient = class {
-  constructor(name, config) {
-    this.name = name;
-    this.config = config;
-  }
-  name;
-  config;
-  proc = null;
-  nextId = 1;
-  pending = /* @__PURE__ */ new Map();
-  buf = "";
-  readyPromise = null;
-  tools = [];
-  connected = false;
-  async connect() {
-    if (this.readyPromise) return this.readyPromise;
-    this.readyPromise = (async () => {
-      const proc = spawn(this.config.command, this.config.args ?? [], {
-        env: { ...process.env, ...this.config.env ?? {} },
-        stdio: ["pipe", "pipe", "pipe"]
-      });
-      this.proc = proc;
-      proc.stdout.setEncoding("utf8");
-      proc.stdout.on("data", (chunk) => this.onStdout(chunk));
-      proc.stderr.on("data", (c) => {
-      });
-      proc.on("exit", (code) => {
-        this.connected = false;
-        for (const [, p] of this.pending) {
-          p.reject(new Error(`MCP server "${this.name}" exited (code=${code})`));
-        }
-        this.pending.clear();
-      });
-      proc.on("error", (e) => {
-        for (const [, p] of this.pending) p.reject(e);
-        this.pending.clear();
-      });
-      await this.request("initialize", {
-        protocolVersion: "2024-11-05",
-        capabilities: {},
-        clientInfo: { name: "minicodeide", version: "0.1" }
-      });
-      this.notify("notifications/initialized", {});
-      const r = await this.request("tools/list", {});
-      this.tools = r?.tools ?? [];
-      if (this.config.disabledTools?.length) {
-        const disabled = new Set(this.config.disabledTools);
-        this.tools = this.tools.filter((t) => !disabled.has(t.name));
-      }
-      this.connected = true;
-    })();
-    return this.readyPromise;
-  }
-  async callTool(name, args) {
-    if (!this.connected) await this.connect();
-    const r = await this.request("tools/call", { name, arguments: args ?? {} });
-    return r;
-  }
-  async close() {
-    if (this.proc) {
-      try {
-        this.proc.kill("SIGTERM");
-      } catch {
-      }
-      this.proc = null;
-    }
-    this.connected = false;
-  }
-  request(method, params) {
-    const id = this.nextId++;
-    const req = { jsonrpc: "2.0", id, method, params };
-    return new Promise((resolve3, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`MCP request "${method}" timeout (30s)`));
-      }, 3e4);
-      this.pending.set(id, {
-        resolve: (v) => {
-          clearTimeout(timer);
-          resolve3(v);
-        },
-        reject: (e) => {
-          clearTimeout(timer);
-          reject(e);
-        }
-      });
-      this.proc.stdin.write(JSON.stringify(req) + "\n");
-    });
-  }
-  notify(method, params) {
-    const req = { jsonrpc: "2.0", method, params };
-    try {
-      this.proc.stdin.write(JSON.stringify(req) + "\n");
-    } catch {
-    }
-  }
-  onStdout(chunk) {
-    this.buf += chunk;
-    let nl;
-    while ((nl = this.buf.indexOf("\n")) >= 0) {
-      const line = this.buf.slice(0, nl).trim();
-      this.buf = this.buf.slice(nl + 1);
-      if (!line) continue;
-      try {
-        const msg = JSON.parse(line);
-        if (typeof msg.id === "number" && this.pending.has(msg.id)) {
-          const p = this.pending.get(msg.id);
-          this.pending.delete(msg.id);
-          if (msg.error) p.reject(new Error(`${msg.error.code}: ${msg.error.message}`));
-          else p.resolve(msg.result);
-        }
-      } catch {
-      }
-    }
-  }
-};
-var McpManager = class {
-  constructor(workspace) {
-    this.workspace = workspace;
-  }
-  workspace;
-  clients = /* @__PURE__ */ new Map();
-  async loadAndConnect() {
-    const cfgPath = path21.join(this.workspace, ".minicodeide", "mcp.json");
-    if (!fs20.existsSync(cfgPath)) return [];
-    let cfg;
-    try {
-      cfg = JSON.parse(fs20.readFileSync(cfgPath, "utf8"));
-    } catch (e) {
-      return [{ name: "<config>", ok: false, error: `mcp.json parse error: ${e?.message ?? e}` }];
-    }
-    const allow = loadAllowlist(this.workspace);
-    const out = [];
-    for (const [name, sc] of Object.entries(cfg.servers ?? {})) {
-      const reject = validateServerAgainstAllowlist(sc, allow);
-      if (reject) {
-        out.push({ name, ok: false, error: `denied by allowlist: ${reject}` });
-        continue;
-      }
-      const client = new McpClient(name, sc);
-      try {
-        await client.connect();
-        this.clients.set(name, client);
-        out.push({ name, ok: true, toolCount: client.tools.length });
-      } catch (e) {
-        out.push({ name, ok: false, error: e?.message ?? String(e) });
-      }
-    }
-    return out;
-  }
-  list() {
-    return [...this.clients.values()];
-  }
-  get(name) {
-    return this.clients.get(name);
-  }
-  async closeAll() {
-    for (const c of this.clients.values()) await c.close();
-    this.clients.clear();
-  }
-  /**
-   * 把所有已连接的 MCP tools 注册到 ToolRegistry。
-   * 命名：mcp__<server>__<tool>
-   */
-  registerToolsTo(registry) {
-    for (const client of this.clients.values()) {
-      for (const tool of client.tools) {
-        const fqName = `mcp__${client.name}__${tool.name}`;
-        const desc = (tool.description ?? "").slice(0, 1e3) || `MCP tool ${tool.name} from "${client.name}".`;
-        const t = {
-          name: fqName,
-          description: `[MCP:${client.name}] ${desc}`,
-          // MCP 工具没有 zod schema；用透传 record；上层 zod 校验只兜底为 object
-          schema: external_exports.record(external_exports.string(), external_exports.any()),
-          parallelSafe: false,
-          // 保守：未知副作用 → 串行
-          async execute(input) {
-            const r = await client.callTool(tool.name, input);
-            if (r?.content && Array.isArray(r.content)) {
-              const text = r.content.map((c) => {
-                if (c?.type === "text") return c.text;
-                if (c?.type === "image") return `[image ${c.mimeType}]`;
-                if (c?.type === "resource") return `[resource ${c.resource?.uri}]`;
-                return JSON.stringify(c);
-              }).join("\n");
-              return { ok: !r.isError, content: text, raw: r };
-            }
-            return r;
-          }
-        };
-        registry.register(t);
-      }
-    }
-  }
-};
-
-// ../server/src/key-rotator.ts
-var AllKeysCooldownError = class extends Error {
-  constructor(profileId, nextAvailableInMs) {
-    super(
-      `[KeyRotator] all keys for profile '${profileId}' are in cooldown; next slot available in ${Math.ceil(
-        nextAvailableInMs / 1e3
-      )}s`
-    );
-    this.profileId = profileId;
-    this.nextAvailableInMs = nextAvailableInMs;
-  }
-  profileId;
-  nextAvailableInMs;
-};
-var KeyRotator = class {
-  constructor(profileId, keys) {
-    this.profileId = profileId;
-    if (keys.length === 0) throw new Error("KeyRotator: at least 1 key required");
-    this.keys = keys.map((k) => ({ key: k, cooldownUntil: 0, successCount: 0, failCount: 0 }));
-  }
-  profileId;
-  keys;
-  cursor = 0;
-  /**
-   * 拿一个可用 key。round-robin。
-   * 全在冷却 → 抛 AllKeysCooldownError。
-   */
-  pick() {
-    const now = Date.now();
-    for (let i = 0; i < this.keys.length; i++) {
-      const idx = (this.cursor + i) % this.keys.length;
-      const s = this.keys[idx];
-      if (s.cooldownUntil <= now) {
-        this.cursor = (idx + 1) % this.keys.length;
-        return s;
-      }
-    }
-    const nextAt = Math.min(...this.keys.map((k) => k.cooldownUntil));
-    throw new AllKeysCooldownError(this.profileId, Math.max(0, nextAt - now));
-  }
-  markSuccess(key) {
-    const s = this.keys.find((x) => x.key === key);
-    if (s) {
-      s.successCount++;
-      s.cooldownUntil = 0;
-    }
-  }
-  markFailure(key, errKind) {
-    const s = this.keys.find((x) => x.key === key);
-    if (!s) return;
-    s.failCount++;
-    const now = Date.now();
-    let cd = 0;
-    switch (errKind) {
-      case "http_429":
-        cd = 6e4;
-        break;
-      case "http_401":
-        cd = 5 * 6e4;
-        break;
-      case "http_5xx":
-        cd = 1e4;
-        break;
-      case "timeout":
-      case "network":
-        cd = 5e3;
-        break;
-      default:
-        cd = 3e3;
-    }
-    s.cooldownUntil = now + cd;
-  }
-  /** 调试 / metrics */
-  stats() {
-    const now = Date.now();
-    return this.keys.map((k) => ({
-      keyTail: k.key.slice(-6),
-      cooldownMs: Math.max(0, k.cooldownUntil - now),
-      success: k.successCount,
-      fail: k.failCount
-    }));
-  }
-  size() {
-    return this.keys.length;
-  }
-};
-var rotators = /* @__PURE__ */ new Map();
-function getOrCreateRotator(profileId, keys) {
-  const sig = profileId + ":" + keys.length + ":" + keys.map((k) => k.slice(-4)).join(",");
-  const cached = rotators.get(profileId);
-  if (cached && cached.__sig === sig) return cached;
-  const r = new KeyRotator(profileId, keys);
-  r.__sig = sig;
-  rotators.set(profileId, r);
-  return r;
-}
-
-// ../server/src/llm-router.ts
-var LLMRouter = class {
-  constructor(opts) {
-    this.opts = opts;
-  }
-  opts;
-  name = "router";
-  async *chatStream(messages, opts = {}) {
-    if (this.opts.profiles.length === 0) {
-      throw new Error("LLMRouter: no profiles configured");
-    }
-    let lastErr = null;
-    for (let i = 0; i < this.opts.profiles.length; i++) {
-      const profile = this.opts.profiles[i];
-      const keys = profile.apiKeys && profile.apiKeys.length > 0 ? profile.apiKeys : [profile.apiKey];
-      const rotator = getOrCreateRotator(profile.id, keys);
-      const innerMaxTries = keys.length;
-      let keyChosen = null;
-      let providerStarted = false;
-      for (let attempt = 0; attempt < innerMaxTries; attempt++) {
-        let keyState;
-        try {
-          keyState = rotator.pick();
-        } catch (e) {
-          lastErr = e;
-          break;
-        }
-        keyChosen = keyState.key;
-        const provider = createProvider({ ...profile, apiKey: keyChosen });
-        const model = opts.model ?? profile.model;
-        let started = false;
-        try {
-          const stream = provider.chatStream(messages, { ...opts, model });
-          for await (const chunk of stream) {
-            if (!started) started = true;
-            providerStarted = true;
-            yield chunk;
-          }
-          rotator.markSuccess(keyChosen);
-          return;
-        } catch (e) {
-          lastErr = e;
-          const kind = classifyError2(e);
-          rotator.markFailure(keyChosen, kind === "unknown" ? "unknown" : kind);
-          if (started) {
-            throw e;
-          }
-          const retryableInner = kind === "http_429" || kind === "http_5xx" || kind === "timeout" || kind === "network";
-          if (retryableInner && attempt + 1 < innerMaxTries) {
-            continue;
-          }
-          break;
-        }
-      }
-      if (providerStarted) return;
-      const nextProfile = this.opts.profiles[i + 1];
-      if (nextProfile) {
-        const kind = classifyError2(lastErr);
-        this.opts.onSwitch?.({
-          fromProfileId: profile.id,
-          toProfileId: nextProfile.id,
-          error: stringifyError(lastErr),
-          errorKind: kind
-        });
-        continue;
-      }
-      throw lastErr ?? new Error(`LLMRouter: profile '${profile.id}' exhausted, no fallback`);
-    }
-    throw lastErr ?? new Error("LLMRouter: no providers succeeded");
-  }
-  async embed(texts) {
-    let lastErr = null;
-    for (let i = 0; i < this.opts.profiles.length; i++) {
-      const profile = this.opts.profiles[i];
-      const provider = createProvider(profile);
-      if (!provider.embed) {
-        lastErr = new Error(`provider ${profile.id} (${profile.kind ?? "auto"}) has no embed()`);
-        continue;
-      }
-      try {
-        return await provider.embed(texts);
-      } catch (e) {
-        lastErr = e;
-        const next = this.opts.profiles[i + 1];
-        if (next) {
-          this.opts.onSwitch?.({
-            fromProfileId: profile.id,
-            toProfileId: next.id,
-            error: stringifyError(e),
-            errorKind: classifyError2(e)
-          });
-          continue;
-        }
-        throw e;
-      }
-    }
-    throw lastErr ?? new Error("LLMRouter.embed: no providers succeeded");
-  }
-};
-function createProvider(profile) {
-  const kind = profile.kind ?? (isAnthropicEndpoint(profile.baseUrl) ? "anthropic" : "openai");
-  if (kind === "anthropic") {
-    return new AnthropicProvider({
-      baseURL: profile.baseUrl || "https://api.anthropic.com",
-      apiKey: profile.apiKey,
-      defaultModel: profile.model || "claude-3-5-sonnet-20241022",
-      enableCacheControl: true
-    });
-  }
-  return new OpenAICompatProvider({
-    baseURL: profile.baseUrl || "https://api.deepseek.com/v1",
-    apiKey: profile.apiKey || "sk-mock",
-    defaultModel: profile.model || "deepseek-chat",
-    embedModel: profile.embedModel || "text-embedding-3-small",
-    // 走 OpenAI 兼容代理调 Claude 也支持 cache_control
-    enableAnthropicCache: /claude|anthropic/i.test(profile.model ?? ""),
-    // 多模态 vision 支持：默认 true；用户可在 profile 里设为 false
-    supportsVision: profile.supportsVision !== false
-  });
-}
-function classifyError2(e) {
-  const s = stringifyError(e);
-  if (/HTTP 401|unauthorized|invalid.?api.?key/i.test(s)) return "unknown";
-  if (/HTTP 429/.test(s) || /rate.?limit/i.test(s)) return "http_429";
-  if (/HTTP 5\d\d/.test(s)) return "http_5xx";
-  if (/timeout|ETIMEDOUT|ESOCKETTIMEDOUT/i.test(s)) return "timeout";
-  if (/ECONNREFUSED|ENOTFOUND|ECONNRESET|fetch failed|network/i.test(s)) return "network";
-  return "unknown";
-}
-function stringifyError(e) {
-  if (!e) return "";
-  if (typeof e === "string") return e;
-  const any = e;
-  return any?.message ?? String(e);
-}
-
-// ../server/src/reranker.ts
-var IdentityReranker = class {
-  name = "identity";
-  async rerank(_q, cs, topN) {
-    return cs.slice(0, topN ?? cs.length).map((c, i) => ({
-      candidate: c,
-      score: 1 - i / cs.length
-    }));
-  }
-};
-var TransformersReranker = class {
-  name;
-  pipelinePromise = null;
-  modelId;
-  failed = false;
-  constructor(modelId = "Xenova/ms-marco-MiniLM-L-6-v2") {
-    this.modelId = modelId;
-    this.name = `xenova:${modelId.split("/").pop()}`;
-  }
-  async getPipeline() {
-    if (this.failed) return null;
-    if (!this.pipelinePromise) {
-      this.pipelinePromise = (async () => {
-        try {
-          const modName = "@xenova/transformers";
-          const mod = await import(
-            /* @vite-ignore */
-            modName
-          );
-          if (mod.env) {
-            mod.env.allowLocalModels = mod.env.allowLocalModels ?? false;
-            mod.env.useBrowserCache = false;
-          }
-          return await mod.pipeline("text-classification", this.modelId);
-        } catch (e) {
-          console.warn(`[reranker] failed to load ${this.modelId}:`, e.message);
-          this.failed = true;
-          return null;
-        }
-      })();
-    }
-    return this.pipelinePromise;
-  }
-  async rerank(query, candidates, topN) {
-    if (candidates.length === 0) return [];
-    const pipe = await this.getPipeline();
-    if (!pipe) {
-      return candidates.slice(0, topN ?? candidates.length).map((c, i) => ({
-        candidate: c,
-        score: 1 - i / candidates.length
-      }));
-    }
-    try {
-      const inputs = candidates.map((c) => ({
-        text: query,
-        text_pair: c.text.slice(0, 2e3)
-      }));
-      const out = await pipe(inputs, { topk: 1 });
-      const scored = candidates.map((c, i) => {
-        const r = Array.isArray(out[i]) ? out[i][0] : out[i];
-        const s = typeof r?.score === "number" ? r.score : 0;
-        return { candidate: c, score: s };
-      });
-      scored.sort((a, b) => b.score - a.score);
-      return scored.slice(0, topN ?? scored.length);
-    } catch (e) {
-      console.warn("[reranker] rerank failed, fallback to identity:", e.message);
-      return candidates.slice(0, topN ?? candidates.length).map((c, i) => ({
-        candidate: c,
-        score: 1 - i / candidates.length
-      }));
-    }
-  }
-};
-function buildReranker(env2 = process.env) {
-  const v = (env2.RERANKER ?? "off").trim();
-  if (!v || v === "off" || v === "0" || v === "false") return new IdentityReranker();
-  if (v === "on" || v === "1" || v === "true") return new TransformersReranker();
-  return new TransformersReranker(v);
-}
-
-// ../server/src/retrieval.ts
-async function hybridRetrieve(index, embedder, query, topK = 8, reranker) {
-  const RRF_K = 60;
-  const overFetch = reranker && reranker.name !== "identity" ? topK * 3 : topK * 2;
-  const bmHits = index.bm25.search(query, overFetch);
-  let vecHits = [];
-  if (index.vectors.size() > 0) {
-    try {
-      const [v] = await embedder.embed([query]);
-      vecHits = index.vectors.search(v, overFetch);
-    } catch (e) {
-      console.warn("[retrieval] vector search failed, falling back to BM25 only:", e.message);
-    }
-  }
-  const scores = /* @__PURE__ */ new Map();
-  bmHits.forEach((h, rank) => {
-    const id = h.chunk.id;
-    scores.set(id, {
-      id,
-      path: h.chunk.file,
-      startLine: h.chunk.startLine,
-      endLine: h.chunk.endLine,
-      text: h.chunk.text,
-      score: 1 / (RRF_K + rank + 1),
-      sources: ["bm25"]
-    });
-  });
-  vecHits.forEach((h, rank) => {
-    const id = h.item.id;
-    const existing = scores.get(id);
-    if (existing) {
-      existing.score += 1 / (RRF_K + rank + 1);
-      if (!existing.sources.includes("vector")) existing.sources.push("vector");
-    } else {
-      scores.set(id, {
-        id,
-        path: h.item.path,
-        startLine: h.item.startLine,
-        endLine: h.item.endLine,
-        text: h.item.text,
-        score: 1 / (RRF_K + rank + 1),
-        sources: ["vector"]
-      });
-    }
-  });
-  const fused = Array.from(scores.values()).sort((a, b) => b.score - a.score);
-  if (reranker && reranker.name !== "identity" && fused.length > 1) {
-    const candidates = fused.slice(0, overFetch).map((h) => ({
-      id: h.id,
-      text: h.text,
-      meta: h
-    }));
-    try {
-      const reranked = await reranker.rerank(query, candidates, topK);
-      return reranked.map((r) => ({
-        ...r.candidate.meta,
-        rerankScore: r.score
-      }));
-    } catch (e) {
-      console.warn("[retrieval] rerank failed, using RRF order:", e.message);
-    }
-  }
-  return fused.slice(0, topK);
-}
-
-// ../server/src/exec-policy.ts
-var AUTO_PROGRAMS = /* @__PURE__ */ new Set([
-  // 读类
-  "ls",
-  "cat",
-  "head",
-  "tail",
-  "wc",
-  "file",
-  "stat",
-  "pwd",
-  "which",
-  "whoami",
-  "date",
-  "echo",
-  "printf",
-  // git 只读
-  // ↓ git 的子命令在 isGitReadOnly 单独判断
-  // 项目工具（典型 dev-loop，不会改 host）
-  "node",
-  "npm",
-  "pnpm",
-  "yarn",
-  "npx",
-  "tsc",
-  "eslint",
-  "prettier",
-  "vitest",
-  "jest",
-  "mocha",
-  "python",
-  "python3",
-  "pip",
-  "pip3",
-  // 搜索
-  "grep",
-  "rg",
-  "ripgrep",
-  "find",
-  "fd",
-  "ag",
-  // 其他无害
-  "jq",
-  "yq",
-  "tree",
-  "env"
-]);
-var DENY_PROGRAMS = /* @__PURE__ */ new Set([
-  "sudo",
-  "su",
-  "rm",
-  // rm 单独看（有 -rf / 路径敏感）
-  "chmod",
-  "chown",
-  "kill",
-  "killall",
-  "pkill",
-  "shutdown",
-  "reboot",
-  "halt",
-  "dd",
-  "mkfs",
-  "fdisk",
-  "mount",
-  "umount",
-  // 网络下载（可能拉恶意 payload）
-  "curl",
-  "wget",
-  // 远程执行
-  "ssh",
-  "scp",
-  "sftp",
-  "rsync",
-  // shell 内联执行（用来绕白名单）
-  "eval",
-  "exec",
-  "source",
-  ".",
-  // 包管理（host 级别副作用）
-  "brew",
-  "apt",
-  "apt-get",
-  "yum",
-  "dnf",
-  "pacman",
-  // 加密/解密命令行（常被用来转储敏感数据）
-  "gpg",
-  "openssl"
-]);
-var DANGEROUS_PATTERNS = [
-  { re: /(^|\s)-rf?\s+\/(\s|$)/, reason: "\u5C1D\u8BD5 rm -rf \u6839\u76EE\u5F55", to: "deny" },
-  { re: /(^|\s)\/etc\//, reason: "\u8BBF\u95EE\u7CFB\u7EDF\u914D\u7F6E\u76EE\u5F55 /etc", to: "ask" },
-  { re: /(^|\s)\/Users\/[^/\s]+\/\.ssh/, reason: "\u8BBF\u95EE SSH \u79C1\u94A5\u76EE\u5F55", to: "deny" },
-  { re: /(^|\s)\$HOME\/\.ssh/, reason: "\u8BBF\u95EE SSH \u79C1\u94A5\u76EE\u5F55", to: "deny" },
-  { re: /(^|\s)\.aws\//, reason: "\u8BBF\u95EE AWS \u51ED\u636E", to: "deny" },
-  { re: /(^|\s)127\.0\.0\.1|localhost/, reason: "\u8BBF\u95EE\u672C\u673A\u670D\u52A1", to: "ask" },
-  { re: /(^|\s)169\.254|192\.168|10\.\d|172\.(1[6-9]|2\d|3[01])\./, reason: "\u8BBF\u95EE\u5185\u7F51 IP", to: "ask" },
-  { re: /base64\s+-d/, reason: "base64 \u89E3\u7801\u540E\u6267\u884C\u7684\u53CD\u6DF7\u6DC6", to: "deny" },
-  { re: />\s*\/dev\/(?!null)/, reason: "\u5199\u5165\u7279\u6B8A\u8BBE\u5907\u6587\u4EF6", to: "deny" }
-];
-function splitPipeline(raw) {
-  const sub = [];
-  const cleaned = raw.replace(/\$\(([^)]+)\)/g, (_m, inner) => {
-    sub.push(inner);
-    return " ";
-  }).replace(/`([^`]+)`/g, (_m, inner) => {
-    sub.push(inner);
-    return " ";
-  });
-  const parts = cleaned.split(/\|\||&&|\||;|\bthen\b|\bdo\b/g).map((s) => s.trim()).filter(Boolean);
-  return [...parts, ...sub];
-}
-function programOf(segment) {
-  const tokens = segment.trim().split(/\s+/);
-  if (tokens.length === 0) return "";
-  let p = tokens[0];
-  while (/^[A-Z_][A-Z0-9_]*=/.test(p) && tokens.length > 1) {
-    tokens.shift();
-    p = tokens[0];
-  }
-  const slash = p.lastIndexOf("/");
-  if (slash >= 0) p = p.slice(slash + 1);
-  return p;
-}
-function isGitReadOnly(segment) {
-  const tokens = segment.trim().split(/\s+/);
-  if (tokens[0] !== "git") return false;
-  const sub = tokens[1];
-  const READ_ONLY_GIT = /* @__PURE__ */ new Set([
-    "status",
-    "diff",
-    "log",
-    "show",
-    "blame",
-    "branch",
-    "remote",
-    "config",
-    "rev-parse",
-    "rev-list",
-    "ls-files",
-    "ls-tree",
-    "describe",
-    "tag",
-    "stash"
-  ]);
-  if (!sub) return false;
-  if (sub === "config" && tokens.includes("--set")) return false;
-  return READ_ONLY_GIT.has(sub);
-}
-function decideSegment(segment) {
-  const seg = segment.trim();
-  if (!seg) return { verdict: "auto", reason: "empty", matchedRule: "empty" };
-  for (const p of DANGEROUS_PATTERNS) {
-    if (p.re.test(seg)) {
-      if (p.to === "deny") {
-        return { verdict: "deny", reason: p.reason, matchedRule: "dangerous-pattern" };
-      }
-    }
-  }
-  const prog = programOf(seg);
-  if (DENY_PROGRAMS.has(prog)) {
-    if (prog === "rm" && !/\s-r?f?r?\s|\s-fr?\s/.test(seg)) {
-      return { verdict: "ask", reason: "rm \u547D\u4EE4\u9700\u8981\u786E\u8BA4", matchedRule: "rm-soft" };
-    }
-    return { verdict: "deny", reason: `\u7981\u7528\u7A0B\u5E8F: ${prog}`, matchedRule: `deny-prog:${prog}` };
-  }
-  if (prog === "git") {
-    if (isGitReadOnly(seg)) {
-      return { verdict: "auto", reason: "git \u53EA\u8BFB\u5B50\u547D\u4EE4", matchedRule: "git-readonly" };
-    }
-    return { verdict: "ask", reason: "git \u5199\u7C7B\u64CD\u4F5C\uFF08commit/push/checkout \u7B49\uFF09\u9700\u8981\u786E\u8BA4", matchedRule: "git-write" };
-  }
-  if (AUTO_PROGRAMS.has(prog)) {
-    for (const p of DANGEROUS_PATTERNS) {
-      if (p.to === "ask" && p.re.test(seg)) {
-        return { verdict: "ask", reason: p.reason, matchedRule: "dangerous-soft" };
-      }
-    }
-    return { verdict: "auto", reason: `\u767D\u540D\u5355\u7A0B\u5E8F: ${prog}`, matchedRule: `auto-prog:${prog}` };
-  }
-  return { verdict: "ask", reason: `\u672A\u77E5\u7A0B\u5E8F ${prog || "(\u7A7A)"} \u9700\u8981\u786E\u8BA4`, matchedRule: "unknown" };
-}
-function decideCommand(command) {
-  const segments = splitPipeline(command);
-  if (segments.length === 0) {
-    return { verdict: "ask", reason: "\u7A7A\u547D\u4EE4", matchedRule: "empty" };
-  }
-  let worst = { verdict: "auto", reason: "\u5168\u90E8\u767D\u540D\u5355", matchedRule: "all-auto" };
-  for (const seg of segments) {
-    const d = decideSegment(seg);
-    if (d.verdict === "deny") return d;
-    if (d.verdict === "ask" && worst.verdict === "auto") {
-      worst = d;
-    }
-  }
-  return worst;
-}
-
-// ../server/src/watcher.ts
-import { promises as fs21 } from "node:fs";
-import path22 from "node:path";
 
 // ../../node_modules/.pnpm/chokidar@5.0.0/node_modules/chokidar/index.js
-import { EventEmitter as EventEmitter2 } from "node:events";
+import { EventEmitter } from "node:events";
 import { stat as statcb, Stats } from "node:fs";
 import { readdir as readdir2, stat as stat3 } from "node:fs/promises";
 import * as sp2 from "node:path";
@@ -16801,7 +15810,7 @@ var WatchHelper = class {
     return this.fsw._isntIgnored(this.entryPath(entry), entry.stats);
   }
 };
-var FSWatcher = class extends EventEmitter2 {
+var FSWatcher = class extends EventEmitter {
   closed;
   options;
   _closers;
@@ -17331,14 +16340,1599 @@ var FSWatcher = class extends EventEmitter2 {
     return stream;
   }
 };
-function watch2(paths, options = {}) {
+function watch(paths, options = {}) {
   const watcher = new FSWatcher(options);
   watcher.add(paths);
   return watcher;
 }
-var chokidar_default = { watch: watch2, FSWatcher };
+var chokidar_default = { watch, FSWatcher };
+
+// ../server/src/skill-store.ts
+var SkillStore = class {
+  workspace;
+  cache = /* @__PURE__ */ new Map();
+  fullCache = /* @__PURE__ */ new Map();
+  watcher = null;
+  constructor(workspace) {
+    this.workspace = workspace;
+  }
+  async load() {
+    this.cache.clear();
+    this.fullCache.clear();
+    const projectDir = await findExistingDir(this.workspace, ".minicodeide", "skills");
+    const userDir = await findExistingDir(os3.homedir(), ".minicodeide", "skills");
+    await this.scanDir(userDir, "user");
+    await this.scanDir(projectDir, "project");
+  }
+  list() {
+    return [...this.cache.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }
+  get(name) {
+    return this.cache.get(name);
+  }
+  /**
+   * 启动文件监听，skills 目录变更时自动重新 load()。
+   * 与 Agent Profile 的 _startProfileWatcher 设计对齐。
+   */
+  async startWatch() {
+    if (this.watcher) return;
+    const projectDir = await findExistingDir(this.workspace, ".minicodeide", "skills");
+    const userDir = await findExistingDir(os3.homedir(), ".minicodeide", "skills");
+    const dirs = [projectDir, userDir].filter((d) => d !== "");
+    this.watcher = chokidar_default.watch(dirs, {
+      ignoreInitial: true,
+      depth: 2,
+      // 只关心 SKILL.md 文件变化
+      ignored: (p) => {
+        const base = path19.basename(p);
+        return base !== "SKILL.md" && !p.endsWith("/skills") && !dirs.some((d) => p === d);
+      }
+    });
+    const reload = () => {
+      this.load().catch((e) => console.warn("[skills] hot-reload failed:", e));
+    };
+    this.watcher.on("add", reload).on("change", reload).on("unlink", reload);
+    console.log("[skills] watching for changes in", dirs.join(", "));
+  }
+  stopWatch() {
+    this.watcher?.close();
+    this.watcher = null;
+  }
+  /** 加载 skill 全文（懒加载 + 缓存） */
+  async loadFull(name) {
+    const cached = this.fullCache.get(name);
+    if (cached) return cached;
+    const meta = this.cache.get(name);
+    if (!meta) return null;
+    const raw = await fs19.readFile(meta.filePath, "utf-8").catch(() => "");
+    const { body } = parseFrontmatter(raw);
+    const supportFiles = await listSupportFiles(meta.directory).catch(() => []);
+    const full = { ...meta, body, supportFiles };
+    this.fullCache.set(name, full);
+    return full;
+  }
+  /**
+   * 根据用户输入匹配可能需要自动触发的 skill。
+   * 匹配策略：用户输入中的 token 与 skill 的 triggers 列表做子串/全词匹配。
+   * 返回匹配到的 skill meta 列表（按匹配数降序）。
+   *
+   * 使用场景：在 buildMessages() 中检测用户意图，自动加载匹配 skill 全文，
+   * 而不是完全依赖 LLM 看到概览后主动调 use_skill。
+   */
+  matchForInput(input) {
+    if (!input || !input.trim()) return [];
+    const inputLower = input.toLowerCase();
+    const inputTokens = tokenizeInput(inputLower);
+    const matched = [];
+    for (const meta of this.cache.values()) {
+      if (!meta.triggers.length) continue;
+      let score = 0;
+      for (const trigger of meta.triggers) {
+        const tLower = trigger.toLowerCase();
+        if (inputLower.includes(tLower)) {
+          score += tLower.length >= 3 ? 2 : 1;
+          continue;
+        }
+        for (const token of inputTokens) {
+          if (token === tLower || tLower.length >= 3 && token.includes(tLower)) {
+            score += 1;
+            break;
+          }
+        }
+      }
+      if (score > 0) {
+        matched.push({ meta, score });
+      }
+    }
+    return matched.sort((a, b) => b.score - a.score).map((m) => m.meta);
+  }
+  /**
+   * 生成 system prompt 注入文本：仅概览（name + description），不含全文
+   *
+   * 设计：每条 skill 1 行，最多 30 行；超出截断告知 LLM 用 `/api/skills` 查更多
+   */
+  renderForSystem() {
+    const all = this.list();
+    if (all.length === 0) return "";
+    const lines = ["# Available Skills (call `use_skill(name=...)` to load full instructions)"];
+    const cap = 30;
+    for (const s of all.slice(0, cap)) {
+      const triggerHint = s.triggers.length > 0 ? ` (triggers: ${s.triggers.slice(0, 5).join(", ")})` : "";
+      lines.push(`- **${s.name}** [${s.source}]: ${s.description.slice(0, 120)}${triggerHint}`);
+    }
+    if (all.length > cap) {
+      lines.push(`- ... ${all.length - cap} more available; use \`use_skill\` with the exact name.`);
+    }
+    return lines.join("\n");
+  }
+  async scanDir(dir, source) {
+    let entries = [];
+    try {
+      entries = await fs19.readdir(dir);
+    } catch {
+      return;
+    }
+    for (const name of entries) {
+      const skillDir = path19.join(dir, name);
+      let stat4;
+      try {
+        stat4 = await fs19.stat(skillDir);
+      } catch {
+        continue;
+      }
+      if (!stat4.isDirectory()) continue;
+      const skillMd = path19.join(skillDir, "SKILL.md");
+      let raw;
+      try {
+        raw = await fs19.readFile(skillMd, "utf-8");
+      } catch {
+        continue;
+      }
+      const { frontmatter } = parseFrontmatter(raw);
+      const skillName = frontmatter.name ?? name;
+      const description = frontmatter.description ?? "";
+      const userInvocable = frontmatter.user_invocable !== false;
+      let triggers = [];
+      const rawTriggers = frontmatter.triggers;
+      if (Array.isArray(rawTriggers)) {
+        triggers = rawTriggers.map(String).filter((s) => s.length > 0);
+      } else if (typeof rawTriggers === "string" && rawTriggers.length > 0) {
+        triggers = rawTriggers.split(/[,，]\s*/).map((s) => s.trim()).filter((s) => s.length > 0);
+      }
+      const meta = {
+        name: skillName,
+        description,
+        userInvocable,
+        source,
+        filePath: skillMd,
+        directory: skillDir,
+        triggers
+      };
+      this.cache.set(skillName, meta);
+    }
+  }
+};
+function parseFrontmatter(raw) {
+  if (!raw.startsWith("---")) return { frontmatter: {}, body: raw };
+  const end = raw.indexOf("\n---", 3);
+  if (end < 0) return { frontmatter: {}, body: raw };
+  const headerBlock = raw.slice(3, end).trim();
+  const body = raw.slice(end + 4).replace(/^\n/, "");
+  const fm = {};
+  for (const line of headerBlock.split("\n")) {
+    const m = line.match(/^([\w-]+)\s*:\s*(.*)$/);
+    if (!m) continue;
+    let value = m[2].trim();
+    if (typeof value === "string" && /^\[.*\]$/.test(value)) {
+      const inner = value.slice(1, -1);
+      value = inner.split(/,\s*/).map((s) => s.trim().replace(/^["']|["']$/g, "")).filter((s) => s.length > 0);
+    } else {
+      if (value === "true") value = true;
+      else if (value === "false") value = false;
+      else if (typeof value === "string" && /^-?\d+$/.test(value)) value = Number(value);
+      if (typeof value === "string" && /^["'].*["']$/.test(value)) value = value.slice(1, -1);
+    }
+    fm[m[1]] = value;
+  }
+  return { frontmatter: fm, body };
+}
+function tokenizeInput(s) {
+  const out = [];
+  for (const m of s.matchAll(/[a-z0-9_]{2,}/g)) out.push(m[0]);
+  const cjk = [...s].filter((c) => /[\u4e00-\u9fff]/.test(c));
+  for (let i = 0; i < cjk.length; i++) {
+    out.push(cjk[i]);
+    if (i + 1 < cjk.length) out.push(cjk[i] + cjk[i + 1]);
+  }
+  return out;
+}
+async function listSupportFiles(dir) {
+  const out = [];
+  const walk2 = async (cur, rel) => {
+    const entries = await fs19.readdir(cur, { withFileTypes: true }).catch(() => []);
+    for (const e of entries) {
+      const child = path19.join(cur, e.name);
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (e.isDirectory()) {
+        if (e.name.startsWith(".") || e.name === "node_modules") continue;
+        await walk2(child, childRel);
+      } else if (e.isFile() && e.name !== "SKILL.md") {
+        out.push(childRel);
+      }
+    }
+  };
+  await walk2(dir, "");
+  return out.slice(0, 100);
+}
+async function findExistingDir(parent, dirName, subDir) {
+  const exact = path19.join(parent, dirName, subDir);
+  try {
+    const stat4 = await fs19.stat(exact);
+    if (stat4.isDirectory()) return exact;
+  } catch {
+  }
+  try {
+    const entries = await fs19.readdir(parent, { withFileTypes: true });
+    const matched = entries.find(
+      (e) => e.isDirectory() && e.name.toLowerCase() === dirName.toLowerCase() && e.name !== dirName
+    );
+    if (matched) {
+      const alt = path19.join(parent, matched.name, subDir);
+      try {
+        const stat4 = await fs19.stat(alt);
+        if (stat4.isDirectory()) return alt;
+      } catch {
+      }
+    }
+  } catch {
+  }
+  return exact;
+}
+
+// ../server/src/subagent-manager.ts
+import { EventEmitter as EventEmitter2 } from "node:events";
+import * as fsSync from "node:fs";
+import path20 from "node:path";
+var TypedEmitter = class {
+  ee = new EventEmitter2();
+  on(ev, fn) {
+    this.ee.on(ev, fn);
+    return this;
+  }
+  off(ev, fn) {
+    this.ee.off(ev, fn);
+    return this;
+  }
+  emit(ev, payload) {
+    this.ee.emit(ev, payload);
+  }
+};
+var SubagentManager = class extends TypedEmitter {
+  opts;
+  runs = /* @__PURE__ */ new Map();
+  /** parentSessionId → active runIds（用于并发限制 + announce 路由） */
+  byParent = /* @__PURE__ */ new Map();
+  /** runId 幂等：已经 announce 过的不再二次推送 */
+  announced = /* @__PURE__ */ new Set();
+  /** 已推送但还没被父 turn 消费的 announce message（父端 follow-up turn 拉取） */
+  pendingAnnounceByParent = /* @__PURE__ */ new Map();
+  /** 角色 profile 缓存（启动时加载一次，文件变更时可手动 refresh） */
+  profiles = /* @__PURE__ */ new Map();
+  /** fs.watch watcher instance（hot-reload 用） */
+  profileWatcher = null;
+  /** debounce timer for hot-reload */
+  profileReloadTimer = null;
+  /** 等待某个 parent 当前所有 active subagent 完成（或 timeout）。父 turn 末尾用 */
+  async awaitAllForParent(parentSessionId, timeoutMs = 6e4) {
+    const active = this.byParent.get(parentSessionId);
+    if (!active || active.size === 0) return;
+    const deadline = Date.now() + timeoutMs;
+    await new Promise((resolve3) => {
+      const tick = () => {
+        const cur = this.byParent.get(parentSessionId);
+        if (!cur || cur.size === 0) return resolve3();
+        if (Date.now() >= deadline) return resolve3();
+        setTimeout(tick, 100);
+      };
+      tick();
+    });
+  }
+  constructor(opts) {
+    super();
+    this.opts = {
+      maxDepth: 2,
+      maxConcurrentPerParent: 3,
+      runTimeoutMs: 12e4,
+      ...opts
+    };
+    loadAgentProfiles(opts.workspaceRoot).then((map) => {
+      this.profiles = map;
+      if (map.size > 0) {
+        console.log(`[subagents] Loaded ${map.size} agent profiles: ${[...map.keys()].join(", ")}`);
+      }
+    }).catch(() => void 0);
+    this._startProfileWatcher(opts.workspaceRoot);
+  }
+  /** 手动刷新 profile（用户编辑 .minicodeide/agents/ 后调用） */
+  async refreshProfiles() {
+    this.profiles = await loadAgentProfiles(this.opts.workspaceRoot);
+    return this.profiles.size;
+  }
+  /** 返回当前所有 profile 名（用于 tool description 动态填充） */
+  getProfileNames() {
+    return [...this.profiles.values()].map((p) => ({ name: p.name, description: p.description }));
+  }
+  /**
+   * 父 Agent 调 dispatch_subagent 时进入这里。
+   * 立刻返回 runId（不阻塞父 turn），后台跑 runAgent。
+   */
+  async spawn(spec) {
+    const childDepth = spec.parentDepth + 1;
+    if (childDepth > this.opts.maxDepth) {
+      throw new Error(`Subagent depth limit (${this.opts.maxDepth}) reached`);
+    }
+    const activeForParent = this.byParent.get(spec.parentSessionId)?.size ?? 0;
+    if (activeForParent >= this.opts.maxConcurrentPerParent) {
+      throw new Error(
+        `Max concurrent subagents per parent (${this.opts.maxConcurrentPerParent}) reached`
+      );
+    }
+    const child = await this.opts.sessions.create(
+      `[subagent] ${spec.label ?? spec.task.slice(0, 40)}`
+    );
+    const runId = `srun_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const run2 = {
+      runId,
+      childSessionId: child.id,
+      parentSessionId: spec.parentSessionId,
+      label: spec.label ?? "(no-label)",
+      task: spec.task,
+      role: spec.role,
+      status: "running",
+      startedAt: Date.now(),
+      depth: childDepth
+    };
+    this.runs.set(runId, run2);
+    if (!this.byParent.has(spec.parentSessionId)) this.byParent.set(spec.parentSessionId, /* @__PURE__ */ new Set());
+    this.byParent.get(spec.parentSessionId).add(runId);
+    void this.runChild(run2);
+    return { runId, childSessionId: child.id };
+  }
+  /** 父端在新 turn 启动前拉取累积的 announce，作为合成 user 消息合入 */
+  pickPendingAnnouncements(parentSessionId) {
+    const buf = this.pendingAnnounceByParent.get(parentSessionId);
+    if (!buf || buf.length === 0) return [];
+    this.pendingAnnounceByParent.delete(parentSessionId);
+    return buf;
+  }
+  hasPending(parentSessionId) {
+    return (this.pendingAnnounceByParent.get(parentSessionId)?.length ?? 0) > 0;
+  }
+  list(parentSessionId) {
+    const all = [...this.runs.values()];
+    if (parentSessionId) return all.filter((r) => r.parentSessionId === parentSessionId);
+    return all;
+  }
+  async runChild(run2) {
+    const profile = run2.role ? getProfile(this.profiles, run2.role) : void 0;
+    const systemLines = [];
+    if (profile) {
+      systemLines.push(
+        `[Subagent Role: ${profile.name}]`,
+        profile.systemPrompt,
+        "",
+        `[Subagent Context]`,
+        `You are running as a subagent (depth ${run2.depth}/${this.opts.maxDepth}) with role "${profile.name}".`,
+        `Role description: ${profile.description}`,
+        'Your output will be auto-delivered to the requester as a single "[Subagent Completed]" message.'
+      );
+      if (profile.sandbox === "read_only") {
+        systemLines.push("", "[Sandbox: read_only]", "You CANNOT write files. Your job is to read, analyze, and report findings.");
+      }
+    } else {
+      systemLines.push(
+        "[Subagent Context]",
+        `You are running as a subagent (depth ${run2.depth}/${this.opts.maxDepth}).`,
+        'Your output will be auto-delivered to the requester as a single "[Subagent Completed]" message.'
+      );
+    }
+    systemLines.push(
+      "",
+      "[Rules]",
+      "- You CANNOT spawn further subagents (dispatch_subagent is disabled here).",
+      "- You CANNOT modify the parent plan (update_plan is disabled here).",
+      "- Be concise. Produce a final answer in 1 turn if possible; max 8 steps.",
+      "- Do not poll status of other agents. You have no visibility into siblings.",
+      "",
+      `[Subagent Task]: ${run2.task}`
+    );
+    const SUBAGENT_SYSTEM = systemLines.join("\n");
+    const childRegistry = this.buildChildRegistry(profile);
+    const messages = [
+      { role: "system", content: SUBAGENT_SYSTEM },
+      { role: "user", content: run2.task }
+    ];
+    const abort = new AbortController();
+    const timeoutHandle = setTimeout(() => abort.abort(), this.opts.runTimeoutMs);
+    let childTurnId;
+    try {
+      childTurnId = await this.opts.sessions.startTurn(run2.childSessionId, run2.task).catch(() => void 0);
+      await this.opts.sessions.append(run2.childSessionId, { role: "user", content: run2.task });
+      const childCtx = {
+        ...this.opts.childToolCtxFactory(),
+        subagentDepth: run2.depth
+        // 即使子 registry 没有 dispatch tool，也带上 depth 信息
+      };
+      let isolatedPath;
+      if (this.opts.worktrees) {
+        try {
+          const wt = await this.opts.worktrees.createForSubagent(run2.runId);
+          if (wt.isolated) {
+            isolatedPath = wt.path;
+            childCtx.cwd = wt.path;
+          }
+        } catch {
+        }
+      }
+      let assistantBuf = "";
+      const resolvedLlm = typeof this.opts.llm === "function" ? this.opts.llm() : this.opts.llm;
+      const resolvedModel = typeof this.opts.defaultModel === "function" ? this.opts.defaultModel() : this.opts.defaultModel;
+      for await (const ev of runAgent({
+        llm: resolvedLlm,
+        registry: childRegistry,
+        messages,
+        toolCtx: childCtx,
+        signal: abort.signal,
+        maxSteps: 8,
+        model: resolvedModel
+      })) {
+        if (ev.type === "text" && ev.text) {
+          assistantBuf += ev.text;
+          if (childTurnId) {
+            this.opts.sessions.appendChunk(run2.childSessionId, childTurnId, ev.text).catch(() => void 0);
+          }
+          this.emit("child_text", { runId: run2.runId, text: ev.text });
+        }
+        if (ev.type === "tool_call" && ev.toolCall) {
+          this.emit("child_tool", { runId: run2.runId, tool: ev.toolCall.name });
+          if (childTurnId) {
+            this.opts.sessions.appendTool(run2.childSessionId, childTurnId, {
+              name: ev.toolCall.name,
+              args: ev.toolCall.arguments
+            }).catch(() => void 0);
+          }
+        }
+        if (ev.type === "tool_result") {
+          const preview = typeof ev.toolResult === "string" ? ev.toolResult.slice(0, 80).replace(/\n/g, " ") : "";
+          this.emit("child_tool_result", {
+            runId: run2.runId,
+            tool: ev.toolCall?.name ?? "unknown",
+            resultPreview: preview
+          });
+        }
+        if (ev.type === "error") {
+          throw new Error(ev.error ?? "subagent error");
+        }
+      }
+      const finalText = assistantBuf.trim();
+      run2.result = finalText;
+      run2.status = "completed";
+      if (childTurnId) {
+        await this.opts.sessions.endTurn(run2.childSessionId, childTurnId, finalText).catch(() => void 0);
+      }
+    } catch (e) {
+      const isTimeout = abort.signal.aborted;
+      run2.status = isTimeout ? "timeout" : "error";
+      run2.error = e?.message ?? String(e);
+      if (childTurnId) {
+        await this.opts.sessions.interruptTurn(run2.childSessionId, childTurnId, run2.error).catch(() => void 0);
+      }
+    } finally {
+      clearTimeout(timeoutHandle);
+      run2.finishedAt = Date.now();
+      this.byParent.get(run2.parentSessionId)?.delete(run2.runId);
+      this.deliverAnnounce(run2);
+      if (this.opts.worktrees) {
+        this.opts.worktrees.remove(run2.runId, { keepBranch: true }).catch(() => void 0);
+      }
+    }
+  }
+  /** 把 run 结果构建 announce message 并放入父的 pending 队列（zero-token，user 角色注入） */
+  deliverAnnounce(run2) {
+    if (this.announced.has(run2.runId)) return;
+    this.announced.add(run2.runId);
+    const lines = [];
+    lines.push(`[Subagent Completed] runId=${run2.runId} label=${run2.label} outcome=${run2.status}`);
+    if (run2.status === "completed") {
+      lines.push("---");
+      lines.push(run2.result ?? "(empty)");
+    } else {
+      lines.push(`error: ${run2.error ?? "(unknown)"}`);
+    }
+    const msg = lines.join("\n");
+    if (!this.pendingAnnounceByParent.has(run2.parentSessionId)) {
+      this.pendingAnnounceByParent.set(run2.parentSessionId, []);
+    }
+    this.pendingAnnounceByParent.get(run2.parentSessionId).push(msg);
+    this.emit("announce", { run: run2 });
+  }
+  /** 子 Agent 的 registry：拿全 builtin，然后剔除危险/不该有的；profile 可进一步裁剪 */
+  buildChildRegistry(profile) {
+    const r = new ToolRegistry();
+    registerBuiltinTools(r);
+    r.unregister("dispatch_subagent");
+    r.unregister("update_plan");
+    if (profile) {
+      if (profile.allowedTools && profile.allowedTools.length > 0) {
+        const allNames = r.list().map((t) => t.name);
+        for (const name of allNames) {
+          if (!profile.allowedTools.includes(name)) {
+            r.unregister(name);
+          }
+        }
+      } else if (profile.deniedTools && profile.deniedTools.length > 0) {
+        for (const name of profile.deniedTools) {
+          r.unregister(name);
+        }
+      }
+      if (profile.sandbox === "read_only") {
+        r.unregister("write_file");
+        r.unregister("edit_file");
+        r.unregister("run_command");
+      }
+    } else {
+      r.unregister("write_file");
+      r.unregister("edit_file");
+      r.unregister("run_command");
+    }
+    return r;
+  }
+  // --- P3-D5: Agent Profile hot-reload ---
+  /**
+   * 启动 fs.watch 监听 .minicodeide/agents/ 目录变更。
+   * 文件增/删/改 → debounce 500ms → 自动 refreshProfiles。
+   * 无 agents 目录或 fs.watch 不可用 → 静默跳过。
+   */
+  _startProfileWatcher(workspaceRoot) {
+    const agentsDir = path20.join(workspaceRoot, ".minicodeide", "agents");
+    try {
+      const stat4 = fsSync.statSync(agentsDir);
+      if (!stat4.isDirectory()) return;
+    } catch {
+      return;
+    }
+    try {
+      this.profileWatcher = fsSync.watch(agentsDir, (eventType, filename) => {
+        if (!filename || !filename.endsWith(".md")) return;
+        if (this.profileReloadTimer) clearTimeout(this.profileReloadTimer);
+        this.profileReloadTimer = setTimeout(async () => {
+          try {
+            const count = await this.refreshProfiles();
+            console.log(`[subagents] Hot-reloaded ${count} agent profiles (trigger: ${eventType} ${filename})`);
+          } catch (e) {
+            console.error(`[subagents] Hot-reload failed: ${e?.message ?? e}`);
+          }
+        }, 500);
+      });
+      console.log(`[subagents] Watching ${agentsDir} for profile hot-reload`);
+    } catch (e) {
+      console.warn(`[subagents] fs.watch on ${agentsDir} failed: ${e?.message ?? e}. Profiles will NOT auto-reload.`);
+    }
+  }
+  /** 停止 profile watcher（server shutdown 时调用） */
+  stopProfileWatcher() {
+    if (this.profileWatcher) {
+      this.profileWatcher.close();
+      this.profileWatcher = null;
+    }
+    if (this.profileReloadTimer) {
+      clearTimeout(this.profileReloadTimer);
+      this.profileReloadTimer = null;
+    }
+  }
+};
+
+// ../server/src/mcp-client.ts
+import { spawn } from "node:child_process";
+import * as fs20 from "node:fs";
+import * as path21 from "node:path";
+var DEFAULT_ALLOWLIST = {
+  allowedCommands: ["npx", "uvx", "node", "python3", "python", "bunx", "pnpm", "docker"],
+  denyArgs: ["--allow-shell", "--unsafe", "--rm-rf"]
+};
+function loadAllowlist(workspace) {
+  const f = path21.join(workspace, ".minicodeide", "mcp-allowlist.json");
+  if (!fs20.existsSync(f)) return DEFAULT_ALLOWLIST;
+  try {
+    const raw = JSON.parse(fs20.readFileSync(f, "utf8"));
+    return {
+      allowedCommands: raw.allowedCommands ?? DEFAULT_ALLOWLIST.allowedCommands,
+      denyArgs: raw.denyArgs ?? DEFAULT_ALLOWLIST.denyArgs
+    };
+  } catch {
+    return DEFAULT_ALLOWLIST;
+  }
+}
+function validateServerAgainstAllowlist(cfg, allow) {
+  const base = path21.basename(cfg.command).toLowerCase();
+  if (!allow.allowedCommands.map((c) => c.toLowerCase()).includes(base)) {
+    return `command "${cfg.command}" not in allowedCommands. Add it to .minicodeide/mcp-allowlist.json`;
+  }
+  const argsLower = (cfg.args ?? []).map((a) => String(a).toLowerCase());
+  for (const deny of allow.denyArgs ?? []) {
+    const dl = deny.toLowerCase();
+    if (argsLower.some((a) => a.includes(dl))) {
+      return `args contain forbidden token "${deny}"`;
+    }
+  }
+  return null;
+}
+var McpClient = class {
+  constructor(name, config) {
+    this.name = name;
+    this.config = config;
+  }
+  name;
+  config;
+  proc = null;
+  nextId = 1;
+  pending = /* @__PURE__ */ new Map();
+  buf = "";
+  readyPromise = null;
+  tools = [];
+  connected = false;
+  /** P2 修复：自动重连状态 */
+  reconnectAttempts = 0;
+  MAX_RECONNECT = 3;
+  reconnectTimer = null;
+  /** 重连成功/失败回调（McpManager 用于更新工具注册和通知前端） */
+  onReconnect;
+  async connect() {
+    if (this.readyPromise) return this.readyPromise;
+    this.readyPromise = (async () => {
+      const proc = spawn(this.config.command, this.config.args ?? [], {
+        env: { ...process.env, ...this.config.env ?? {} },
+        stdio: ["pipe", "pipe", "pipe"]
+      });
+      this.proc = proc;
+      proc.stdout.setEncoding("utf8");
+      proc.stdout.on("data", (chunk) => this.onStdout(chunk));
+      proc.stderr.on("data", (c) => {
+      });
+      proc.on("exit", (code) => {
+        this.connected = false;
+        for (const [, p] of this.pending) {
+          p.reject(new Error(`MCP server "${this.name}" exited (code=${code})`));
+        }
+        this.pending.clear();
+        if (code !== 0 && this.reconnectAttempts < this.MAX_RECONNECT) {
+          this.scheduleReconnect();
+        }
+      });
+      proc.on("error", (e) => {
+        for (const [, p] of this.pending) p.reject(e);
+        this.pending.clear();
+      });
+      await this.request("initialize", {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "minicodeide", version: "0.1" }
+      });
+      this.notify("notifications/initialized", {});
+      const r = await this.request("tools/list", {});
+      this.tools = r?.tools ?? [];
+      if (this.config.disabledTools?.length) {
+        const disabled = new Set(this.config.disabledTools);
+        this.tools = this.tools.filter((t) => !disabled.has(t.name));
+      }
+      this.connected = true;
+      this.reconnectAttempts = 0;
+    })();
+    return this.readyPromise;
+  }
+  async callTool(name, args) {
+    if (!this.connected) await this.connect();
+    const r = await this.request("tools/call", { name, arguments: args ?? {} });
+    return r;
+  }
+  async close() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.reconnectAttempts = this.MAX_RECONNECT;
+    if (this.proc) {
+      try {
+        this.proc.kill("SIGTERM");
+      } catch {
+      }
+      this.proc = null;
+    }
+    this.connected = false;
+  }
+  /**
+   * P2 修复：指数退避自动重连。
+   * 延迟 = 1s * 2^attempt（1s → 2s → 4s），最多 MAX_RECONNECT 次。
+   */
+  scheduleReconnect() {
+    const attempt = this.reconnectAttempts + 1;
+    const delay = 1e3 * Math.pow(2, attempt - 1);
+    console.log(`[mcp:${this.name}] Scheduling reconnect attempt ${attempt}/${this.MAX_RECONNECT} in ${delay}ms`);
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectAttempts = attempt;
+      this.readyPromise = null;
+      try {
+        await this.connect();
+        console.log(`[mcp:${this.name}] Reconnected successfully (attempt ${attempt})`);
+        this.onReconnect?.(true, attempt);
+      } catch (e) {
+        console.warn(`[mcp:${this.name}] Reconnect failed (attempt ${attempt}): ${e?.message ?? e}`);
+        this.onReconnect?.(false, attempt, e?.message ?? String(e));
+      }
+    }, delay);
+  }
+  request(method, params) {
+    const id = this.nextId++;
+    const req = { jsonrpc: "2.0", id, method, params };
+    return new Promise((resolve3, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`MCP request "${method}" timeout (30s)`));
+      }, 3e4);
+      this.pending.set(id, {
+        resolve: (v) => {
+          clearTimeout(timer);
+          resolve3(v);
+        },
+        reject: (e) => {
+          clearTimeout(timer);
+          reject(e);
+        }
+      });
+      this.proc.stdin.write(JSON.stringify(req) + "\n");
+    });
+  }
+  notify(method, params) {
+    const req = { jsonrpc: "2.0", method, params };
+    try {
+      this.proc.stdin.write(JSON.stringify(req) + "\n");
+    } catch {
+    }
+  }
+  onStdout(chunk) {
+    this.buf += chunk;
+    let nl;
+    while ((nl = this.buf.indexOf("\n")) >= 0) {
+      const line = this.buf.slice(0, nl).trim();
+      this.buf = this.buf.slice(nl + 1);
+      if (!line) continue;
+      try {
+        const msg = JSON.parse(line);
+        if (typeof msg.id === "number" && this.pending.has(msg.id)) {
+          const p = this.pending.get(msg.id);
+          this.pending.delete(msg.id);
+          if (msg.error) p.reject(new Error(`${msg.error.code}: ${msg.error.message}`));
+          else p.resolve(msg.result);
+        }
+      } catch {
+      }
+    }
+  }
+};
+var McpManager = class {
+  constructor(workspace) {
+    this.workspace = workspace;
+  }
+  workspace;
+  clients = /* @__PURE__ */ new Map();
+  async loadAndConnect() {
+    const cfgPath = path21.join(this.workspace, ".minicodeide", "mcp.json");
+    if (!fs20.existsSync(cfgPath)) return [];
+    let cfg;
+    try {
+      cfg = JSON.parse(fs20.readFileSync(cfgPath, "utf8"));
+    } catch (e) {
+      return [{ name: "<config>", ok: false, error: `mcp.json parse error: ${e?.message ?? e}` }];
+    }
+    const allow = loadAllowlist(this.workspace);
+    const out = [];
+    for (const [name, sc] of Object.entries(cfg.servers ?? {})) {
+      const reject = validateServerAgainstAllowlist(sc, allow);
+      if (reject) {
+        out.push({ name, ok: false, error: `denied by allowlist: ${reject}` });
+        continue;
+      }
+      const client = new McpClient(name, sc);
+      try {
+        await client.connect();
+        this.clients.set(name, client);
+        out.push({ name, ok: true, toolCount: client.tools.length });
+      } catch (e) {
+        out.push({ name, ok: false, error: e?.message ?? String(e) });
+      }
+    }
+    return out;
+  }
+  list() {
+    return [...this.clients.values()];
+  }
+  get(name) {
+    return this.clients.get(name);
+  }
+  async closeAll() {
+    for (const c of this.clients.values()) await c.close();
+    this.clients.clear();
+  }
+  /**
+   * 把所有已连接的 MCP tools 注册到 ToolRegistry。
+   * 命名：mcp__<server>__<tool>
+   *
+   * 修复（P1）：将 MCP inputSchema（JSON Schema）转换为 zod schema，
+   * 使 LLM 能通过 tool parameters 字段获得结构化的参数信息，
+   * 而非之前的 z.record(z.string(), z.any()) 万能占位。
+   */
+  registerToolsTo(registry) {
+    for (const client of this.clients.values()) {
+      for (const tool of client.tools) {
+        const fqName = `mcp__${client.name}__${tool.name}`;
+        const desc = (tool.description ?? "").slice(0, 1e3) || `MCP tool ${tool.name} from "${client.name}".`;
+        let zodSchema;
+        try {
+          zodSchema = tool.inputSchema ? jsonSchemaToZod(tool.inputSchema) : external_exports.record(external_exports.string(), external_exports.any());
+        } catch {
+          zodSchema = external_exports.record(external_exports.string(), external_exports.any());
+        }
+        const t = {
+          name: fqName,
+          description: `[MCP:${client.name}] ${desc}`.slice(0, 4e3),
+          schema: zodSchema,
+          parallelSafe: false,
+          // 保守：未知副作用 → 串行
+          async execute(input) {
+            const r = await client.callTool(tool.name, input);
+            if (r?.content && Array.isArray(r.content)) {
+              const text = r.content.map((c) => {
+                if (c?.type === "text") return c.text;
+                if (c?.type === "image") return `[image ${c.mimeType}]`;
+                if (c?.type === "resource") return `[resource ${c.resource?.uri}]`;
+                return JSON.stringify(c);
+              }).join("\n");
+              return { ok: !r.isError, content: text, raw: r };
+            }
+            return r;
+          }
+        };
+        registry.register(t);
+      }
+    }
+  }
+};
+function jsonSchemaToZod(schema) {
+  if (!schema || typeof schema !== "object") return external_exports.any();
+  const type = schema.type;
+  if (schema.anyOf || schema.oneOf) {
+    const variants = schema.anyOf || schema.oneOf;
+    if (variants.length === 1) return jsonSchemaToZod(variants[0]);
+    if (variants.length === 2 && variants.some((v) => v.type === "null")) {
+      const nonNull = variants.find((v) => v.type !== "null");
+      if (nonNull) return jsonSchemaToZod(nonNull).nullable();
+    }
+    return external_exports.any();
+  }
+  if (schema.enum) {
+    const values = schema.enum.filter((v) => v !== null);
+    if (values.length > 0 && values.every((v) => typeof v === "string")) {
+      const [first, ...rest] = values;
+      let zodEnum = external_exports.enum([first, ...rest]);
+      if (schema.enum.includes(null)) zodEnum = zodEnum.nullable();
+      return zodEnum;
+    }
+    return external_exports.any();
+  }
+  switch (type) {
+    case "object": {
+      const properties = schema.properties ?? {};
+      const required = new Set(schema.required ?? []);
+      const shape = {};
+      for (const [key, propSchema] of Object.entries(properties)) {
+        let fieldSchema = jsonSchemaToZod(propSchema);
+        if (propSchema?.description) {
+          fieldSchema = fieldSchema.describe(propSchema.description);
+        }
+        if (!required.has(key)) {
+          shape[key] = fieldSchema.optional();
+        } else {
+          shape[key] = fieldSchema;
+        }
+      }
+      let obj = external_exports.object(shape);
+      if (schema.additionalProperties === false) {
+        obj = obj.strict();
+      }
+      if (Object.keys(properties).length === 0 && schema.additionalProperties && typeof schema.additionalProperties === "object") {
+        return external_exports.record(external_exports.string(), jsonSchemaToZod(schema.additionalProperties));
+      }
+      return obj;
+    }
+    case "array": {
+      if (schema.items) {
+        return external_exports.array(jsonSchemaToZod(schema.items));
+      }
+      return external_exports.array(external_exports.any());
+    }
+    case "string":
+      return external_exports.string();
+    case "number":
+    case "integer":
+      return external_exports.number();
+    case "boolean":
+      return external_exports.boolean();
+    case "null":
+      return external_exports.null();
+    default:
+      return external_exports.any();
+  }
+}
+
+// ../server/src/key-rotator.ts
+var AllKeysCooldownError = class extends Error {
+  constructor(profileId, nextAvailableInMs) {
+    super(
+      `[KeyRotator] all keys for profile '${profileId}' are in cooldown; next slot available in ${Math.ceil(
+        nextAvailableInMs / 1e3
+      )}s`
+    );
+    this.profileId = profileId;
+    this.nextAvailableInMs = nextAvailableInMs;
+  }
+  profileId;
+  nextAvailableInMs;
+};
+var KeyRotator = class {
+  constructor(profileId, keys) {
+    this.profileId = profileId;
+    if (keys.length === 0) throw new Error("KeyRotator: at least 1 key required");
+    this.keys = keys.map((k) => ({ key: k, cooldownUntil: 0, successCount: 0, failCount: 0 }));
+  }
+  profileId;
+  keys;
+  cursor = 0;
+  /**
+   * 拿一个可用 key。round-robin。
+   * 全在冷却 → 抛 AllKeysCooldownError。
+   */
+  pick() {
+    const now = Date.now();
+    for (let i = 0; i < this.keys.length; i++) {
+      const idx = (this.cursor + i) % this.keys.length;
+      const s = this.keys[idx];
+      if (s.cooldownUntil <= now) {
+        this.cursor = (idx + 1) % this.keys.length;
+        return s;
+      }
+    }
+    const nextAt = Math.min(...this.keys.map((k) => k.cooldownUntil));
+    throw new AllKeysCooldownError(this.profileId, Math.max(0, nextAt - now));
+  }
+  markSuccess(key) {
+    const s = this.keys.find((x) => x.key === key);
+    if (s) {
+      s.successCount++;
+      s.cooldownUntil = 0;
+    }
+  }
+  markFailure(key, errKind) {
+    const s = this.keys.find((x) => x.key === key);
+    if (!s) return;
+    s.failCount++;
+    const now = Date.now();
+    let cd = 0;
+    switch (errKind) {
+      case "http_429":
+        cd = 6e4;
+        break;
+      case "http_401":
+        cd = 5 * 6e4;
+        break;
+      case "http_5xx":
+        cd = 1e4;
+        break;
+      case "timeout":
+      case "network":
+        cd = 5e3;
+        break;
+      default:
+        cd = 3e3;
+    }
+    s.cooldownUntil = now + cd;
+  }
+  /** 调试 / metrics */
+  stats() {
+    const now = Date.now();
+    return this.keys.map((k) => ({
+      keyTail: k.key.slice(-6),
+      cooldownMs: Math.max(0, k.cooldownUntil - now),
+      success: k.successCount,
+      fail: k.failCount
+    }));
+  }
+  size() {
+    return this.keys.length;
+  }
+};
+var rotators = /* @__PURE__ */ new Map();
+function getOrCreateRotator(profileId, keys) {
+  const sig = profileId + ":" + keys.length + ":" + keys.map((k) => k.slice(-4)).join(",");
+  const cached = rotators.get(profileId);
+  if (cached && cached.__sig === sig) return cached;
+  const r = new KeyRotator(profileId, keys);
+  r.__sig = sig;
+  rotators.set(profileId, r);
+  return r;
+}
+
+// ../server/src/llm-router.ts
+var MAX_FAILURES = 3;
+var COOLDOWN_MS = 3e4;
+var CircuitBreaker = class {
+  health = /* @__PURE__ */ new Map();
+  getOrCreate(profileId) {
+    if (!this.health.has(profileId)) {
+      this.health.set(profileId, { state: "closed", consecutiveFailures: 0, lastFailureAt: 0 });
+    }
+    return this.health.get(profileId);
+  }
+  /** 判断某个 profile 当前是否可以接受请求 */
+  isAvailable(profileId) {
+    const h = this.getOrCreate(profileId);
+    if (h.state === "closed") return true;
+    if (h.state === "half-open") return true;
+    if (Date.now() - h.lastFailureAt >= COOLDOWN_MS) {
+      h.state = "half-open";
+      return true;
+    }
+    return false;
+  }
+  /** 请求成功：重置状态 */
+  markSuccess(profileId) {
+    const h = this.getOrCreate(profileId);
+    h.state = "closed";
+    h.consecutiveFailures = 0;
+  }
+  /** 请求失败：累加计数，必要时触发熔断 */
+  markFailure(profileId) {
+    const h = this.getOrCreate(profileId);
+    h.consecutiveFailures++;
+    h.lastFailureAt = Date.now();
+    if (h.consecutiveFailures >= MAX_FAILURES) {
+      h.state = "open";
+    }
+  }
+  /** 获取某个 profile 的当前状态（调试/监控用） */
+  getState(profileId) {
+    const h = this.getOrCreate(profileId);
+    if (h.state === "open" && Date.now() - h.lastFailureAt >= COOLDOWN_MS) {
+      h.state = "half-open";
+    }
+    return h.state;
+  }
+};
+var LLMRouter = class {
+  constructor(opts) {
+    this.opts = opts;
+  }
+  opts;
+  name = "router";
+  /** P1 修复：Circuit Breaker 实例，追踪每个 profile 的健康状态 */
+  circuitBreaker = new CircuitBreaker();
+  async *chatStream(messages, opts = {}) {
+    if (this.opts.profiles.length === 0) {
+      throw new Error("LLMRouter: no profiles configured");
+    }
+    let lastErr = null;
+    for (let i = 0; i < this.opts.profiles.length; i++) {
+      const profile = this.opts.profiles[i];
+      if (!this.circuitBreaker.isAvailable(profile.id)) {
+        const next = this.opts.profiles[i + 1];
+        if (next) {
+          this.opts.onSwitch?.({
+            fromProfileId: profile.id,
+            toProfileId: next.id,
+            error: `circuit breaker open (${this.circuitBreaker.getState(profile.id)})`,
+            errorKind: "unknown"
+          });
+          continue;
+        }
+      }
+      const keys = profile.apiKeys && profile.apiKeys.length > 0 ? profile.apiKeys : [profile.apiKey];
+      const rotator = getOrCreateRotator(profile.id, keys);
+      const innerMaxTries = keys.length;
+      let keyChosen = null;
+      let providerStarted = false;
+      for (let attempt = 0; attempt < innerMaxTries; attempt++) {
+        let keyState;
+        try {
+          keyState = rotator.pick();
+        } catch (e) {
+          lastErr = e;
+          break;
+        }
+        keyChosen = keyState.key;
+        const provider = createProvider({ ...profile, apiKey: keyChosen });
+        const model = opts.model ?? profile.model;
+        let started = false;
+        try {
+          const stream = provider.chatStream(messages, { ...opts, model });
+          for await (const chunk of stream) {
+            if (!started) started = true;
+            providerStarted = true;
+            yield chunk;
+          }
+          rotator.markSuccess(keyChosen);
+          this.circuitBreaker.markSuccess(profile.id);
+          return;
+        } catch (e) {
+          lastErr = e;
+          const kind = classifyError2(e);
+          rotator.markFailure(keyChosen, kind === "unknown" ? "unknown" : kind);
+          if (started) {
+            throw e;
+          }
+          const retryableInner = kind === "http_429" || kind === "http_5xx" || kind === "timeout" || kind === "network";
+          if (retryableInner && attempt + 1 < innerMaxTries) {
+            continue;
+          }
+          this.circuitBreaker.markFailure(profile.id);
+          break;
+        }
+      }
+      if (providerStarted) return;
+      const nextProfile = this.opts.profiles[i + 1];
+      if (nextProfile) {
+        const kind = classifyError2(lastErr);
+        this.opts.onSwitch?.({
+          fromProfileId: profile.id,
+          toProfileId: nextProfile.id,
+          error: stringifyError(lastErr),
+          errorKind: kind
+        });
+        continue;
+      }
+      throw lastErr ?? new Error(`LLMRouter: profile '${profile.id}' exhausted, no fallback`);
+    }
+    throw lastErr ?? new Error("LLMRouter: no providers succeeded");
+  }
+  async embed(texts) {
+    let lastErr = null;
+    for (let i = 0; i < this.opts.profiles.length; i++) {
+      const profile = this.opts.profiles[i];
+      const provider = createProvider(profile);
+      if (!provider.embed) {
+        lastErr = new Error(`provider ${profile.id} (${profile.kind ?? "auto"}) has no embed()`);
+        continue;
+      }
+      try {
+        return await provider.embed(texts);
+      } catch (e) {
+        lastErr = e;
+        const next = this.opts.profiles[i + 1];
+        if (next) {
+          this.opts.onSwitch?.({
+            fromProfileId: profile.id,
+            toProfileId: next.id,
+            error: stringifyError(e),
+            errorKind: classifyError2(e)
+          });
+          continue;
+        }
+        throw e;
+      }
+    }
+    throw lastErr ?? new Error("LLMRouter.embed: no providers succeeded");
+  }
+};
+function createProvider(profile) {
+  const kind = profile.kind ?? (isAnthropicEndpoint(profile.baseUrl) ? "anthropic" : "openai");
+  if (kind === "anthropic") {
+    return new AnthropicProvider({
+      baseURL: profile.baseUrl || "https://api.anthropic.com",
+      apiKey: profile.apiKey,
+      defaultModel: profile.model || "claude-3-5-sonnet-20241022",
+      enableCacheControl: true
+    });
+  }
+  return new OpenAICompatProvider({
+    baseURL: profile.baseUrl || "https://api.deepseek.com/v1",
+    apiKey: profile.apiKey || "sk-mock",
+    defaultModel: profile.model || "deepseek-chat",
+    embedModel: profile.embedModel || "text-embedding-3-small",
+    // 走 OpenAI 兼容代理调 Claude 也支持 cache_control
+    enableAnthropicCache: /claude|anthropic/i.test(profile.model ?? ""),
+    // 多模态 vision 支持：默认 true；用户可在 profile 里设为 false
+    supportsVision: profile.supportsVision !== false
+  });
+}
+function classifyError2(e) {
+  const s = stringifyError(e);
+  if (/HTTP 401|unauthorized|invalid.?api.?key/i.test(s)) return "unknown";
+  if (/HTTP 429/.test(s) || /rate.?limit/i.test(s)) return "http_429";
+  if (/HTTP 5\d\d/.test(s)) return "http_5xx";
+  if (/timeout|ETIMEDOUT|ESOCKETTIMEDOUT/i.test(s)) return "timeout";
+  if (/ECONNREFUSED|ENOTFOUND|ECONNRESET|fetch failed|network/i.test(s)) return "network";
+  return "unknown";
+}
+function stringifyError(e) {
+  if (!e) return "";
+  if (typeof e === "string") return e;
+  const any = e;
+  return any?.message ?? String(e);
+}
+
+// ../server/src/reranker.ts
+var IdentityReranker = class {
+  name = "identity";
+  async rerank(_q, cs, topN) {
+    return cs.slice(0, topN ?? cs.length).map((c, i) => ({
+      candidate: c,
+      score: 1 - i / cs.length
+    }));
+  }
+};
+var TransformersReranker = class {
+  name;
+  pipelinePromise = null;
+  modelId;
+  failed = false;
+  constructor(modelId = "Xenova/ms-marco-MiniLM-L-6-v2") {
+    this.modelId = modelId;
+    this.name = `xenova:${modelId.split("/").pop()}`;
+  }
+  async getPipeline() {
+    if (this.failed) return null;
+    if (!this.pipelinePromise) {
+      this.pipelinePromise = (async () => {
+        try {
+          const modName = "@xenova/transformers";
+          const mod = await import(
+            /* @vite-ignore */
+            modName
+          );
+          if (mod.env) {
+            mod.env.allowLocalModels = mod.env.allowLocalModels ?? false;
+            mod.env.useBrowserCache = false;
+          }
+          return await mod.pipeline("text-classification", this.modelId);
+        } catch (e) {
+          console.warn(`[reranker] failed to load ${this.modelId}:`, e.message);
+          this.failed = true;
+          return null;
+        }
+      })();
+    }
+    return this.pipelinePromise;
+  }
+  async rerank(query, candidates, topN) {
+    if (candidates.length === 0) return [];
+    const pipe = await this.getPipeline();
+    if (!pipe) {
+      return candidates.slice(0, topN ?? candidates.length).map((c, i) => ({
+        candidate: c,
+        score: 1 - i / candidates.length
+      }));
+    }
+    try {
+      const inputs = candidates.map((c) => ({
+        text: query,
+        text_pair: c.text.slice(0, 2e3)
+      }));
+      const out = await pipe(inputs, { topk: 1 });
+      const scored = candidates.map((c, i) => {
+        const r = Array.isArray(out[i]) ? out[i][0] : out[i];
+        const s = typeof r?.score === "number" ? r.score : 0;
+        return { candidate: c, score: s };
+      });
+      scored.sort((a, b) => b.score - a.score);
+      return scored.slice(0, topN ?? scored.length);
+    } catch (e) {
+      console.warn("[reranker] rerank failed, fallback to identity:", e.message);
+      return candidates.slice(0, topN ?? candidates.length).map((c, i) => ({
+        candidate: c,
+        score: 1 - i / candidates.length
+      }));
+    }
+  }
+};
+function buildReranker(env2 = process.env) {
+  const v = (env2.RERANKER ?? "off").trim();
+  if (!v || v === "off" || v === "0" || v === "false") return new IdentityReranker();
+  if (v === "on" || v === "1" || v === "true") return new TransformersReranker();
+  return new TransformersReranker(v);
+}
+
+// ../server/src/retrieval.ts
+async function hybridRetrieve(index, embedder, query, topK = 8, reranker) {
+  const RRF_K = 60;
+  const overFetch = reranker && reranker.name !== "identity" ? topK * 3 : topK * 2;
+  const bmHits = index.bm25.search(query, overFetch);
+  let vecHits = [];
+  if (index.vectors.size() > 0) {
+    try {
+      const [v] = await embedder.embed([query]);
+      vecHits = index.vectors.search(v, overFetch);
+    } catch (e) {
+      console.warn("[retrieval] vector search failed, falling back to BM25 only:", e.message);
+    }
+  }
+  const scores = /* @__PURE__ */ new Map();
+  bmHits.forEach((h, rank) => {
+    const id = h.chunk.id;
+    scores.set(id, {
+      id,
+      path: h.chunk.file,
+      startLine: h.chunk.startLine,
+      endLine: h.chunk.endLine,
+      text: h.chunk.text,
+      score: 1 / (RRF_K + rank + 1),
+      sources: ["bm25"]
+    });
+  });
+  vecHits.forEach((h, rank) => {
+    const id = h.item.id;
+    const existing = scores.get(id);
+    if (existing) {
+      existing.score += 1 / (RRF_K + rank + 1);
+      if (!existing.sources.includes("vector")) existing.sources.push("vector");
+    } else {
+      scores.set(id, {
+        id,
+        path: h.item.path,
+        startLine: h.item.startLine,
+        endLine: h.item.endLine,
+        text: h.item.text,
+        score: 1 / (RRF_K + rank + 1),
+        sources: ["vector"]
+      });
+    }
+  });
+  const fused = Array.from(scores.values()).sort((a, b) => b.score - a.score);
+  if (reranker && reranker.name !== "identity" && fused.length > 1) {
+    const candidates = fused.slice(0, overFetch).map((h) => ({
+      id: h.id,
+      text: h.text,
+      meta: h
+    }));
+    try {
+      const reranked = await reranker.rerank(query, candidates, topK);
+      return reranked.map((r) => ({
+        ...r.candidate.meta,
+        rerankScore: r.score
+      }));
+    } catch (e) {
+      console.warn("[retrieval] rerank failed, using RRF order:", e.message);
+    }
+  }
+  return fused.slice(0, topK);
+}
+
+// ../server/src/exec-policy.ts
+var AUTO_PROGRAMS = /* @__PURE__ */ new Set([
+  // 读类
+  "ls",
+  "cat",
+  "head",
+  "tail",
+  "wc",
+  "file",
+  "stat",
+  "pwd",
+  "which",
+  "whoami",
+  "date",
+  "echo",
+  "printf",
+  // git 只读
+  // ↓ git 的子命令在 isGitReadOnly 单独判断
+  // 项目工具（典型 dev-loop，不会改 host）
+  "node",
+  "npm",
+  "pnpm",
+  "yarn",
+  "npx",
+  "tsc",
+  "eslint",
+  "prettier",
+  "vitest",
+  "jest",
+  "mocha",
+  "python",
+  "python3",
+  "pip",
+  "pip3",
+  // 搜索
+  "grep",
+  "rg",
+  "ripgrep",
+  "find",
+  "fd",
+  "ag",
+  // 其他无害
+  "jq",
+  "yq",
+  "tree",
+  "env"
+]);
+var DENY_PROGRAMS = /* @__PURE__ */ new Set([
+  "sudo",
+  "su",
+  "rm",
+  // rm 单独看（有 -rf / 路径敏感）
+  "chmod",
+  "chown",
+  "kill",
+  "killall",
+  "pkill",
+  "shutdown",
+  "reboot",
+  "halt",
+  "dd",
+  "mkfs",
+  "fdisk",
+  "mount",
+  "umount",
+  // 远程执行
+  "ssh",
+  "scp",
+  "sftp",
+  "rsync",
+  // shell 内联执行（用来绕白名单）
+  "eval",
+  "exec",
+  "source",
+  ".",
+  // 包管理（host 级别副作用）
+  "brew",
+  "apt",
+  "apt-get",
+  "yum",
+  "dnf",
+  "pacman",
+  // 加密/解密命令行（常被用来转储敏感数据）
+  "gpg",
+  "openssl"
+]);
+var DANGEROUS_PATTERNS = [
+  { re: /(^|\s)-rf?\s+\/(\s|$)/, reason: "\u5C1D\u8BD5 rm -rf \u6839\u76EE\u5F55", to: "deny" },
+  { re: /(^|\s)-rf?\s+~(\s|$)/, reason: "\u5C1D\u8BD5 rm -rf \u4E3B\u76EE\u5F55", to: "deny" },
+  { re: /(^|\s)\/etc\//, reason: "\u8BBF\u95EE\u7CFB\u7EDF\u914D\u7F6E\u76EE\u5F55 /etc", to: "ask" },
+  { re: /(^|\s)\/Users\/[^/\s]+\/\.ssh/, reason: "\u8BBF\u95EE SSH \u79C1\u94A5\u76EE\u5F55", to: "deny" },
+  { re: /(^|\s)\$HOME\/\.ssh/, reason: "\u8BBF\u95EE SSH \u79C1\u94A5\u76EE\u5F55", to: "deny" },
+  { re: /(^|\s)~\/\.ssh/, reason: "\u8BBF\u95EE SSH \u79C1\u94A5\u76EE\u5F55", to: "deny" },
+  { re: /(^|\s)\.aws\//, reason: "\u8BBF\u95EE AWS \u51ED\u636E", to: "deny" },
+  { re: /(^|\s)127\.0\.0\.1|localhost/, reason: "\u8BBF\u95EE\u672C\u673A\u670D\u52A1", to: "ask" },
+  { re: /(^|\s)169\.254|192\.168|10\.\d|172\.(1[6-9]|2\d|3[01])\./, reason: "\u8BBF\u95EE\u5185\u7F51 IP", to: "ask" },
+  // 反混淆 / 管道执行（curl|bash 等注入手法）
+  { re: /base64\s+-d/, reason: "base64 \u89E3\u7801\u540E\u6267\u884C\u7684\u53CD\u6DF7\u6DC6", to: "deny" },
+  { re: /base64\s+--decode/, reason: "base64 \u89E3\u7801\u540E\u6267\u884C\u7684\u53CD\u6DF7\u6DC6", to: "deny" },
+  { re: /python[23]?\s+-c/, reason: "python -c \u5185\u8054\u6267\u884C", to: "ask" },
+  { re: /node\s+-e\s/, reason: "node -e \u5185\u8054\u6267\u884C\uFF08\u53EF\u80FD\u7ED5\u8FC7\u9ED1\u540D\u5355\uFF09", to: "ask" },
+  { re: /node\s+--eval\s/, reason: "node --eval \u5185\u8054\u6267\u884C\uFF08\u53EF\u80FD\u7ED5\u8FC7\u9ED1\u540D\u5355\uFF09", to: "ask" },
+  { re: /bash\s+-c\s/, reason: "bash -c \u5185\u8054\u6267\u884C", to: "ask" },
+  { re: /sh\s+-c\s/, reason: "sh -c \u5185\u8054\u6267\u884C", to: "ask" },
+  // 危险写目标
+  { re: />\s*\/dev\/(?!null)/, reason: "\u5199\u5165\u7279\u6B8A\u8BBE\u5907\u6587\u4EF6", to: "deny" },
+  { re: />\s*~\/\.bashrc|>\s*~\/\.zshrc|>\s*~\/\.profile/, reason: "\u8986\u5199 shell \u914D\u7F6E\u6587\u4EF6", to: "deny" },
+  { re: />\s*\/etc\//, reason: "\u5199\u5165\u7CFB\u7EDF\u914D\u7F6E\u76EE\u5F55", to: "deny" },
+  // 环境变量泄露
+  { re: /\$\{?AWS_SECRET|AWS_ACCESS_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY/, reason: "\u8BFB\u53D6\u654F\u611F\u73AF\u5883\u53D8\u91CF", to: "deny" },
+  // crontab 注入
+  { re: /crontab\s+-[lei]/, reason: "crontab \u4FEE\u6539\uFF08\u6301\u4E45\u5316\u540E\u95E8\u98CE\u9669\uFF09", to: "deny" },
+  // launchctl / systemctl 持久化
+  { re: /launchctl\s+load|systemctl\s+(enable|start)/, reason: "\u6CE8\u518C\u7CFB\u7EDF\u670D\u52A1", to: "deny" },
+  // curl/wget 管道执行（最危险的注入手法之一）
+  // 注意：单独的 curl 命令通过 decideSegment → ask；但在 pipeline 中跟 bash/sh/python 连接时由 splitPipeline 各段判定
+  { re: /\b(curl|wget)\b.+\|\s*(bash|sh|python[23]?|node|perl|ruby)/, reason: "curl/wget \u7BA1\u9053\u5230\u89E3\u91CA\u5668\uFF08\u8FDC\u7A0B\u4EE3\u7801\u6267\u884C\uFF09", to: "deny" }
+];
+function splitPipeline(raw) {
+  const sub = [];
+  const cleaned = raw.replace(/\$\(([^)]+)\)/g, (_m, inner) => {
+    sub.push(inner);
+    return " ";
+  }).replace(/`([^`]+)`/g, (_m, inner) => {
+    sub.push(inner);
+    return " ";
+  });
+  const parts = cleaned.split(/\|\||&&|\||;|\bthen\b|\bdo\b/g).map((s) => s.trim()).filter(Boolean);
+  return [...parts, ...sub];
+}
+function programOf(segment) {
+  const tokens = segment.trim().split(/\s+/);
+  if (tokens.length === 0) return "";
+  let p = tokens[0];
+  while (/^[A-Z_][A-Z0-9_]*=/.test(p) && tokens.length > 1) {
+    tokens.shift();
+    p = tokens[0];
+  }
+  const slash = p.lastIndexOf("/");
+  if (slash >= 0) p = p.slice(slash + 1);
+  return p;
+}
+function isGitReadOnly(segment) {
+  const tokens = segment.trim().split(/\s+/);
+  if (tokens[0] !== "git") return false;
+  const sub = tokens[1];
+  const READ_ONLY_GIT = /* @__PURE__ */ new Set([
+    "status",
+    "diff",
+    "log",
+    "show",
+    "blame",
+    "branch",
+    "remote",
+    "config",
+    "rev-parse",
+    "rev-list",
+    "ls-files",
+    "ls-tree",
+    "describe",
+    "tag",
+    "stash"
+  ]);
+  if (!sub) return false;
+  if (sub === "config" && tokens.includes("--set")) return false;
+  return READ_ONLY_GIT.has(sub);
+}
+function decideSegment(segment) {
+  const seg = segment.trim();
+  if (!seg) return { verdict: "auto", reason: "empty", matchedRule: "empty" };
+  for (const p of DANGEROUS_PATTERNS) {
+    if (p.re.test(seg)) {
+      if (p.to === "deny") {
+        return { verdict: "deny", reason: p.reason, matchedRule: "dangerous-pattern" };
+      }
+    }
+  }
+  const prog = programOf(seg);
+  if (DENY_PROGRAMS.has(prog)) {
+    if (prog === "rm" && !/\s-r?f?r?\s|\s-fr?\s/.test(seg)) {
+      return { verdict: "ask", reason: "rm \u547D\u4EE4\u9700\u8981\u786E\u8BA4", matchedRule: "rm-soft" };
+    }
+    return { verdict: "deny", reason: `\u7981\u7528\u7A0B\u5E8F: ${prog}`, matchedRule: `deny-prog:${prog}` };
+  }
+  if (prog === "git") {
+    if (isGitReadOnly(seg)) {
+      return { verdict: "auto", reason: "git \u53EA\u8BFB\u5B50\u547D\u4EE4", matchedRule: "git-readonly" };
+    }
+    return { verdict: "ask", reason: "git \u5199\u7C7B\u64CD\u4F5C\uFF08commit/push/checkout \u7B49\uFF09\u9700\u8981\u786E\u8BA4", matchedRule: "git-write" };
+  }
+  if (AUTO_PROGRAMS.has(prog)) {
+    for (const p of DANGEROUS_PATTERNS) {
+      if (p.to === "ask" && p.re.test(seg)) {
+        return { verdict: "ask", reason: p.reason, matchedRule: "dangerous-soft" };
+      }
+    }
+    return { verdict: "auto", reason: `\u767D\u540D\u5355\u7A0B\u5E8F: ${prog}`, matchedRule: `auto-prog:${prog}` };
+  }
+  return { verdict: "ask", reason: `\u672A\u77E5\u7A0B\u5E8F ${prog || "(\u7A7A)"} \u9700\u8981\u786E\u8BA4`, matchedRule: "unknown" };
+}
+function decideCommand(command) {
+  const segments = splitPipeline(command);
+  if (segments.length === 0) {
+    return { verdict: "ask", reason: "\u7A7A\u547D\u4EE4", matchedRule: "empty" };
+  }
+  let worst = { verdict: "auto", reason: "\u5168\u90E8\u767D\u540D\u5355", matchedRule: "all-auto" };
+  for (const seg of segments) {
+    const d = decideSegment(seg);
+    if (d.verdict === "deny") return d;
+    if (d.verdict === "ask" && worst.verdict === "auto") {
+      worst = d;
+    }
+  }
+  return worst;
+}
 
 // ../server/src/watcher.ts
+import { promises as fs21 } from "node:fs";
+import path22 from "node:path";
 var DEFAULT_IGNORED = [
   /node_modules/,
   /\.git\//,
@@ -17369,7 +17963,7 @@ var IndexWatcher = class {
       persistent: true,
       awaitWriteFinish: { stabilityThreshold: 150, pollInterval: 50 }
     });
-    this.watcher.on("add", (p) => this.enqueue(p, "change")).on("change", (p) => this.enqueue(p, "change")).on("unlink", (p) => this.enqueue(p, "unlink"));
+    this.watcher.on("add", (p) => this.enqueue(p, "add")).on("change", (p) => this.enqueue(p, "change")).on("unlink", (p) => this.enqueue(p, "unlink"));
     this.opts.onProgress?.(`[watcher] watching ${this.opts.root}`);
   }
   async stop() {
@@ -17379,6 +17973,8 @@ var IndexWatcher = class {
   enqueue(abs, kind) {
     const rel = path22.relative(this.opts.root, abs);
     if (!rel || rel.startsWith("..")) return;
+    const existing = this.pending.get(rel);
+    if (existing === "unlink" && kind !== "unlink") return;
     this.pending.set(rel, kind);
     if (this.timer) clearTimeout(this.timer);
     this.timer = setTimeout(() => void this.flush(), this.opts.debounceMs ?? 300);
@@ -17462,6 +18058,9 @@ ${c.text}`));
       this.opts.onProgress?.(
         `[watcher] flushed ${batch.length} change(s); +${allNewItems.length} vectors`
       );
+      if (this.opts.onFileChange && batch.length > 0) {
+        this.opts.onFileChange(batch.map(([path27, kind]) => ({ path: path27, kind })));
+      }
       if (allNewItems.length) {
         idx.vectors.save(this.opts.vectorPath()).catch((e) => {
           console.warn("[watcher] vectors.save failed:", e.message);
@@ -17535,6 +18134,8 @@ var Services = class {
   index = null;
   indexing = false;
   watcher;
+  /** 文件变更 SSE 客户端集合 */
+  fsEventClients = /* @__PURE__ */ new Set();
   constructor(workspace) {
     this.workspace = workspace;
   }
@@ -17588,7 +18189,18 @@ var Services = class {
       index: () => this.index,
       embedder: () => this.embedder,
       vectorPath: () => this.vectorPath,
-      onProgress: (m) => console.log(m)
+      onProgress: (m) => console.log(m),
+      onFileChange: (events) => {
+        const data = JSON.stringify({ type: "fs_change", events });
+        for (const client of this.fsEventClients) {
+          try {
+            client.write(`data: ${data}
+
+`);
+          } catch {
+          }
+        }
+      }
     });
     this.watcher.start();
     void this.ensureIndex();
@@ -17710,7 +18322,18 @@ var Services = class {
       index: () => this.index,
       embedder: () => this.embedder,
       vectorPath: () => this.vectorPath,
-      onProgress: (m) => console.log(m)
+      onProgress: (m) => console.log(m),
+      onFileChange: (events) => {
+        const data = JSON.stringify({ type: "fs_change", events });
+        for (const client of this.fsEventClients) {
+          try {
+            client.write(`data: ${data}
+
+`);
+          } catch {
+          }
+        }
+      }
     });
     this.watcher.start();
     void this.ensureIndex();
@@ -18219,6 +18842,14 @@ function registerHandlers(r, s) {
     } catch (e) {
       sendJson(c.res, 200, { ok: false, error: e?.message ?? String(e), url: VSCODE_TARGET });
     }
+  });
+  r.get("/api/fs/events", (c) => {
+    const sse = openSse(c.req, c.res);
+    sse.send({ type: "fs_heartbeat" });
+    s.fsEventClients.add(c.res);
+    c.req.on("close", () => {
+      s.fsEventClients.delete(c.res);
+    });
   });
   r.get("/api/files", async (c) => {
     const rel = c.query.path ?? ".";
@@ -19026,7 +19657,7 @@ ${it.partialAssistant.slice(-2e3)}
   r.get("/api/skills", (c) => sendJson(
     c.res,
     200,
-    s.skills.list().map((sk) => ({ name: sk.name, description: sk.description, source: sk.source, userInvocable: sk.userInvocable }))
+    s.skills.list().map((sk) => ({ name: sk.name, description: sk.description, source: sk.source, userInvocable: sk.userInvocable, triggers: sk.triggers }))
   ));
   r.get("/api/skills/:name", async (c) => {
     const f = await s.skills.loadFull(c.params.name);
@@ -19240,11 +19871,17 @@ ${it.partialAssistant.slice(-2e3)}
       manualRules.push(n);
       return "";
     }).trim();
+    const explicitSkills = [];
+    userMessage = userMessage.replace(/\/skill:([\w-]+)/g, (_m, n) => {
+      explicitSkills.push(n);
+      return "";
+    }).trim();
     const mentionResult = await parseMentions(userMessage, { workspace: s.workspace, index: s.index });
     userMessage = mentionResult.cleanText || userMessage;
     const explicitContext = mentionResult.items;
     const sse = openSse(c.req, c.res);
     if (slashName) sse.send({ type: "slash", command: slashName });
+    if (explicitSkills.length) sse.send({ type: "skills_activated", skills: explicitSkills });
     if (mentionResult.items.length || mentionResult.unresolved.length) {
       sse.send({
         type: "mentions",
@@ -19308,6 +19945,15 @@ ${it.partialAssistant.slice(-2e3)}
       systemExtras: [
         s.projectMemory.renderForSystem(),
         s.skills.renderForSystem(),
+        ...(await Promise.all(
+          explicitSkills.map(async (name) => {
+            const f = await s.skills.loadFull(name);
+            if (!f) return `[Skill "${name}" not found]`;
+            const body2 = f.body?.slice(0, 4e3) ?? "(empty)";
+            return `\u2500\u2500\u2500 Skill: ${f.name} (explicitly selected by user) \u2500\u2500\u2500
+${body2}`;
+          })
+        )).filter(Boolean),
         ruleExtra,
         detectMultiStepHint(userMessage),
         s.recentActivity.render(chatSessionId)

@@ -67,11 +67,49 @@ interface InMemorySession {
   pendingTurn?: { turnId: string; userMessage: string; partialAssistant: string; startedAt: number };
 }
 
+/**
+ * SessionLock —— 同一 Session 的写操作互斥锁。
+ *
+ * 用 Promise 链实现串行队列：每次 acquire 等待上一个 release 后才放行。
+ * 确保同一 session 的 turn 生命周期（startTurn → appendChunk → endTurn）
+ * 和消息 append 不会并发交叉。
+ *
+ * 用法：
+ *   const release = await lock.acquire(sessionId);
+ *   try { ... } finally { release(); }
+ */
+export class SessionLock {
+  private chains = new Map<string, Promise<void>>();
+
+  async acquire(sessionId: string): Promise<() => void> {
+    const prev = this.chains.get(sessionId) ?? Promise.resolve();
+    let release!: () => void;
+    const next = new Promise<void>((resolve) => { release = resolve; });
+    this.chains.set(sessionId, next);
+    await prev;
+    return () => {
+      release();
+      // 清理：仅当 Map 中仍指向本次的 Promise 时才删除，
+      // 避免清理掉后续 acquire 已经 set 的新 entry。
+      if (this.chains.get(sessionId) === next) {
+        this.chains.delete(sessionId);
+      }
+    };
+  }
+
+  /** 检查某个 session 是否正在被锁定（用于快速判断，不阻塞） */
+  isLocked(sessionId: string): boolean {
+    return this.chains.has(sessionId);
+  }
+}
+
 export class SessionStore {
   private dir: string;
   /** session id → 内存缓存（避免每次 list 都扫盘） */
   private cache = new Map<string, InMemorySession>();
   private loaded = false;
+  /** 并发锁：确保同一 session 的 turn 生命周期不会交叉 */
+  public readonly lock = new SessionLock();
 
   constructor(workspace: string) {
     this.dir = path.join(workspace, '.minicodeide', 'sessions');

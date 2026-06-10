@@ -115,6 +115,12 @@ export class McpClient {
   private readyPromise: Promise<void> | null = null;
   public tools: McpToolDef[] = [];
   public connected = false;
+  /** P2 修复：自动重连状态 */
+  private reconnectAttempts = 0;
+  private readonly MAX_RECONNECT = 3;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 重连成功/失败回调（McpManager 用于更新工具注册和通知前端） */
+  public onReconnect?: (ok: boolean, attempt: number, error?: string) => void;
 
   constructor(public name: string, public config: McpServerConfig) {}
 
@@ -138,6 +144,10 @@ export class McpClient {
           p.reject(new Error(`MCP server "${this.name}" exited (code=${code})`));
         }
         this.pending.clear();
+        // P2 修复：异常退出（code !== 0）时尝试自动重连
+        if (code !== 0 && this.reconnectAttempts < this.MAX_RECONNECT) {
+          this.scheduleReconnect();
+        }
       });
       proc.on('error', (e) => {
         for (const [, p] of this.pending) p.reject(e);
@@ -160,6 +170,7 @@ export class McpClient {
         this.tools = this.tools.filter((t) => !disabled.has(t.name));
       }
       this.connected = true;
+      this.reconnectAttempts = 0; // 连接成功后重置重连计数
     })();
     return this.readyPromise;
   }
@@ -172,11 +183,40 @@ export class McpClient {
   }
 
   async close() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.reconnectAttempts = this.MAX_RECONNECT; // 阻止 exit handler 触发重连
     if (this.proc) {
       try { this.proc.kill('SIGTERM'); } catch {/* ignore */}
       this.proc = null;
     }
     this.connected = false;
+  }
+
+  /**
+   * P2 修复：指数退避自动重连。
+   * 延迟 = 1s * 2^attempt（1s → 2s → 4s），最多 MAX_RECONNECT 次。
+   */
+  private scheduleReconnect() {
+    const attempt = this.reconnectAttempts + 1;
+    const delay = 1000 * Math.pow(2, attempt - 1); // 1s, 2s, 4s
+    console.log(`[mcp:${this.name}] Scheduling reconnect attempt ${attempt}/${this.MAX_RECONNECT} in ${delay}ms`);
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectAttempts = attempt;
+      // 重置 readyPromise 以允许重新 connect
+      this.readyPromise = null;
+      try {
+        await this.connect();
+        console.log(`[mcp:${this.name}] Reconnected successfully (attempt ${attempt})`);
+        this.onReconnect?.(true, attempt);
+      } catch (e: any) {
+        console.warn(`[mcp:${this.name}] Reconnect failed (attempt ${attempt}): ${e?.message ?? e}`);
+        this.onReconnect?.(false, attempt, e?.message ?? String(e));
+        // 如果还有重试机会，exit handler 会再次触发 scheduleReconnect
+      }
+    }, delay);
   }
 
   private request(method: string, params: any): Promise<any> {
@@ -269,17 +309,31 @@ export class McpManager {
   /**
    * 把所有已连接的 MCP tools 注册到 ToolRegistry。
    * 命名：mcp__<server>__<tool>
+   *
+   * 修复（P1）：将 MCP inputSchema（JSON Schema）转换为 zod schema，
+   * 使 LLM 能通过 tool parameters 字段获得结构化的参数信息，
+   * 而非之前的 z.record(z.string(), z.any()) 万能占位。
    */
   registerToolsTo(registry: ToolRegistry) {
     for (const client of this.clients.values()) {
       for (const tool of client.tools) {
         const fqName = `mcp__${client.name}__${tool.name}`;
         const desc = (tool.description ?? '').slice(0, 1000) || `MCP tool ${tool.name} from "${client.name}".`;
+
+        // 将 inputSchema 转换为 zod schema，让 LLM 能看到结构化参数
+        let zodSchema: any;
+        try {
+          zodSchema = tool.inputSchema ? jsonSchemaToZod(tool.inputSchema) : z.record(z.string(), z.any());
+        } catch {
+          // 转换失败时 fallback 到万能 schema + description 中注入 schema
+          zodSchema = z.record(z.string(), z.any());
+        }
+
+        // description 中不再冗余 inputSchema JSON（已由 zod schema 提供结构化参数信息）
         const t: Tool = {
           name: fqName,
-          description: `[MCP:${client.name}] ${desc}`,
-          // MCP 工具没有 zod schema；用透传 record；上层 zod 校验只兜底为 object
-          schema: z.record(z.string(), z.any()) as any,
+          description: `[MCP:${client.name}] ${desc}`.slice(0, 4000),
+          schema: zodSchema,
           parallelSafe: false, // 保守：未知副作用 → 串行
           async execute(input: any) {
             const r = await client.callTool(tool.name, input);
@@ -301,5 +355,101 @@ export class McpManager {
         registry.register(t);
       }
     }
+  }
+}
+
+/**
+ * 将 JSON Schema 转换为 zod schema。
+ * 覆盖常见 JSON Schema 类型，复杂场景 fallback 到 z.any()。
+ *
+ * 目的：让 ToolRegistry.toLLMSchemas() 中的 zodToJsonSchema 能产出
+ * 正确的结构化参数描述，而非之前的 { type: "object" } 空泛 schema。
+ */
+function jsonSchemaToZod(schema: any): z.ZodTypeAny {
+  if (!schema || typeof schema !== 'object') return z.any();
+
+  const type = schema.type;
+
+  // anyOf / oneOf → z.union（简化为取第一个可行类型，避免过度复杂）
+  if (schema.anyOf || schema.oneOf) {
+    const variants = (schema.anyOf || schema.oneOf) as any[];
+    if (variants.length === 1) return jsonSchemaToZod(variants[0]);
+    // 对 "type + null" 模式（nullable），用 .nullable()
+    if (variants.length === 2 && variants.some((v: any) => v.type === 'null')) {
+      const nonNull = variants.find((v: any) => v.type !== 'null');
+      if (nonNull) return jsonSchemaToZod(nonNull).nullable();
+    }
+    // 其他 union 场景：用 z.any() 避免过度复杂
+    return z.any();
+  }
+
+  // enum
+  if (schema.enum) {
+    const values = schema.enum.filter((v: any) => v !== null);
+    if (values.length > 0 && values.every((v: any) => typeof v === 'string')) {
+      const [first, ...rest] = values as [string, ...string[]];
+      let zodEnum = z.enum([first, ...rest] as [string, ...string[]]);
+      if (schema.enum.includes(null)) zodEnum = zodEnum.nullable() as any;
+      return zodEnum;
+    }
+    return z.any();
+  }
+
+  switch (type) {
+    case 'object': {
+      const properties = schema.properties ?? {};
+      const required = new Set(schema.required ?? []);
+      const shape: Record<string, z.ZodTypeAny> = {};
+
+      for (const [key, propSchema] of Object.entries(properties)) {
+        let fieldSchema = jsonSchemaToZod(propSchema);
+        // 附加 description
+        if ((propSchema as any)?.description) {
+          fieldSchema = fieldSchema.describe((propSchema as any).description);
+        }
+        if (!required.has(key)) {
+          shape[key] = fieldSchema.optional();
+        } else {
+          shape[key] = fieldSchema;
+        }
+      }
+
+      let obj = z.object(shape);
+
+      // additionalProperties 处理
+      if (schema.additionalProperties === false) {
+        obj = obj.strict();
+      }
+      // 如果 properties 为空但有 additionalProperties schema，用 z.record
+      if (Object.keys(properties).length === 0 && schema.additionalProperties && typeof schema.additionalProperties === 'object') {
+        return z.record(z.string(), jsonSchemaToZod(schema.additionalProperties));
+      }
+
+      return obj;
+    }
+
+    case 'array': {
+      if (schema.items) {
+        return z.array(jsonSchemaToZod(schema.items));
+      }
+      return z.array(z.any());
+    }
+
+    case 'string':
+      return z.string();
+
+    case 'number':
+    case 'integer':
+      return z.number();
+
+    case 'boolean':
+      return z.boolean();
+
+    case 'null':
+      return z.null();
+
+    default:
+      // unknown type → z.any()，不做强制校验
+      return z.any();
   }
 }

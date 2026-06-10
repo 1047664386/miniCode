@@ -29,6 +29,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import chokidar, { type FSWatcher } from 'chokidar';
 
 export interface SkillMeta {
   name: string;
@@ -41,6 +42,8 @@ export interface SkillMeta {
   filePath: string;
   /** skill 根目录绝对路径（用于读取 support files） */
   directory: string;
+  /** 触发关键词列表（来自 frontmatter triggers 字段），用于自动匹配用户输入 */
+  triggers: string[];
 }
 
 export interface SkillFull extends SkillMeta {
@@ -54,6 +57,7 @@ export class SkillStore {
   private workspace: string;
   private cache = new Map<string, SkillMeta>();
   private fullCache = new Map<string, SkillFull>();
+  private watcher: FSWatcher | null = null;
 
   constructor(workspace: string) {
     this.workspace = workspace;
@@ -62,8 +66,10 @@ export class SkillStore {
   async load(): Promise<void> {
     this.cache.clear();
     this.fullCache.clear();
-    const projectDir = path.join(this.workspace, '.minicodeide', 'skills');
-    const userDir = path.join(os.homedir(), '.minicodeide', 'skills');
+    // 尝试大小写变体扫描：.minicodeide / .minicodeIde / .MiniCodeIde
+    // macOS APFS 默认大小写不敏感通常不会出问题，但某些配置下会
+    const projectDir = await findExistingDir(this.workspace, '.minicodeide', 'skills');
+    const userDir = await findExistingDir(os.homedir(), '.minicodeide', 'skills');
     // 注意先加载 user 再加载 project，让 project 同名覆盖 user
     await this.scanDir(userDir, 'user');
     await this.scanDir(projectDir, 'project');
@@ -75,6 +81,36 @@ export class SkillStore {
 
   get(name: string): SkillMeta | undefined {
     return this.cache.get(name);
+  }
+
+  /**
+   * 启动文件监听，skills 目录变更时自动重新 load()。
+   * 与 Agent Profile 的 _startProfileWatcher 设计对齐。
+   */
+  async startWatch(): Promise<void> {
+    if (this.watcher) return;
+    const projectDir = await findExistingDir(this.workspace, '.minicodeide', 'skills');
+    const userDir = await findExistingDir(os.homedir(), '.minicodeide', 'skills');
+    const dirs = [projectDir, userDir].filter((d) => d !== '');
+    this.watcher = chokidar.watch(dirs, {
+      ignoreInitial: true,
+      depth: 2,
+      // 只关心 SKILL.md 文件变化
+      ignored: (p: string) => {
+        const base = path.basename(p);
+        return base !== 'SKILL.md' && !p.endsWith('/skills') && !dirs.some((d) => p === d);
+      },
+    });
+    const reload = () => {
+      this.load().catch((e) => console.warn('[skills] hot-reload failed:', e));
+    };
+    this.watcher.on('add', reload).on('change', reload).on('unlink', reload);
+    console.log('[skills] watching for changes in', dirs.join(', '));
+  }
+
+  stopWatch(): void {
+    this.watcher?.close();
+    this.watcher = null;
   }
 
   /** 加载 skill 全文（懒加载 + 缓存） */
@@ -92,6 +128,49 @@ export class SkillStore {
   }
 
   /**
+   * 根据用户输入匹配可能需要自动触发的 skill。
+   * 匹配策略：用户输入中的 token 与 skill 的 triggers 列表做子串/全词匹配。
+   * 返回匹配到的 skill meta 列表（按匹配数降序）。
+   *
+   * 使用场景：在 buildMessages() 中检测用户意图，自动加载匹配 skill 全文，
+   * 而不是完全依赖 LLM 看到概览后主动调 use_skill。
+   */
+  matchForInput(input: string): SkillMeta[] {
+    if (!input || !input.trim()) return [];
+    const inputLower = input.toLowerCase();
+    // 简单 tokenize：按空格/标点切，保留中文连续序列
+    const inputTokens = tokenizeInput(inputLower);
+    const matched: Array<{ meta: SkillMeta; score: number }> = [];
+
+    for (const meta of this.cache.values()) {
+      if (!meta.triggers.length) continue;
+      let score = 0;
+      for (const trigger of meta.triggers) {
+        const tLower = trigger.toLowerCase();
+        // 全串包含匹配（"部署" 匹配 "帮我部署一下"）
+        if (inputLower.includes(tLower)) {
+          score += tLower.length >= 3 ? 2 : 1; // 长关键词权重高
+          continue;
+        }
+        // token 级匹配（"deploy" 匹配 "how to deploy the app"）
+        for (const token of inputTokens) {
+          if (token === tLower || (tLower.length >= 3 && token.includes(tLower))) {
+            score += 1;
+            break;
+          }
+        }
+      }
+      if (score > 0) {
+        matched.push({ meta, score });
+      }
+    }
+
+    return matched
+      .sort((a, b) => b.score - a.score)
+      .map((m) => m.meta);
+  }
+
+  /**
    * 生成 system prompt 注入文本：仅概览（name + description），不含全文
    *
    * 设计：每条 skill 1 行，最多 30 行；超出截断告知 LLM 用 `/api/skills` 查更多
@@ -102,7 +181,8 @@ export class SkillStore {
     const lines = ['# Available Skills (call `use_skill(name=...)` to load full instructions)'];
     const cap = 30;
     for (const s of all.slice(0, cap)) {
-      lines.push(`- **${s.name}** [${s.source}]: ${s.description.slice(0, 160)}`);
+      const triggerHint = s.triggers.length > 0 ? ` (triggers: ${s.triggers.slice(0, 5).join(', ')})` : '';
+      lines.push(`- **${s.name}** [${s.source}]: ${s.description.slice(0, 120)}${triggerHint}`);
     }
     if (all.length > cap) {
       lines.push(`- ... ${all.length - cap} more available; use \`use_skill\` with the exact name.`);
@@ -137,6 +217,14 @@ export class SkillStore {
       const skillName = (frontmatter.name as string) ?? name;
       const description = (frontmatter.description as string) ?? '';
       const userInvocable = frontmatter.user_invocable !== false; // 默认 true
+      // 解析 triggers：支持数组 [a, b] 或逗号分隔字符串 "a, b"
+      let triggers: string[] = [];
+      const rawTriggers = frontmatter.triggers;
+      if (Array.isArray(rawTriggers)) {
+        triggers = rawTriggers.map(String).filter((s) => s.length > 0);
+      } else if (typeof rawTriggers === 'string' && rawTriggers.length > 0) {
+        triggers = rawTriggers.split(/[,，]\s*/).map((s) => s.trim()).filter((s) => s.length > 0);
+      }
       const meta: SkillMeta = {
         name: skillName,
         description,
@@ -144,13 +232,14 @@ export class SkillStore {
         source,
         filePath: skillMd,
         directory: skillDir,
+        triggers,
       };
       this.cache.set(skillName, meta);
     }
   }
 }
 
-/** 解析 YAML-lite frontmatter（只支持 key: value，不递归） */
+/** 解析 YAML-lite frontmatter（支持 key: value 和 key: [a, b, c] 数组） */
 function parseFrontmatter(raw: string): { frontmatter: Record<string, unknown>; body: string } {
   if (!raw.startsWith('---')) return { frontmatter: {}, body: raw };
   const end = raw.indexOf('\n---', 3);
@@ -162,14 +251,37 @@ function parseFrontmatter(raw: string): { frontmatter: Record<string, unknown>; 
     const m = line.match(/^([\w-]+)\s*:\s*(.*)$/);
     if (!m) continue;
     let value: unknown = m[2].trim();
-    if (value === 'true') value = true;
-    else if (value === 'false') value = false;
-    else if (typeof value === 'string' && /^-?\d+$/.test(value)) value = Number(value);
-    // 去掉引号
-    if (typeof value === 'string' && /^["'].*["']$/.test(value)) value = value.slice(1, -1);
+    // 数组格式：key: [item1, item2] 或 key: [item1, "item2 with spaces"]
+    if (typeof value === 'string' && /^\[.*\]$/.test(value)) {
+      const inner = value.slice(1, -1);
+      value = inner
+        .split(/,\s*/)
+        .map((s) => s.trim().replace(/^["']|["']$/g, ''))
+        .filter((s) => s.length > 0);
+    } else {
+      if (value === 'true') value = true;
+      else if (value === 'false') value = false;
+      else if (typeof value === 'string' && /^-?\d+$/.test(value)) value = Number(value);
+      // 去掉引号
+      if (typeof value === 'string' && /^["'].*["']$/.test(value)) value = value.slice(1, -1);
+    }
     fm[m[1]] = value;
   }
   return { frontmatter: fm, body };
+}
+
+/** 简单 tokenize：按非词字符切，保留中文连续序列；用于 trigger 匹配 */
+function tokenizeInput(s: string): string[] {
+  const out: string[] = [];
+  // 英文/数字 token
+  for (const m of s.matchAll(/[a-z0-9_]{2,}/g)) out.push(m[0]);
+  // 中文：按字 + 二字 bigram
+  const cjk = [...s].filter((c) => /[\u4e00-\u9fff]/.test(c));
+  for (let i = 0; i < cjk.length; i++) {
+    out.push(cjk[i]);
+    if (i + 1 < cjk.length) out.push(cjk[i] + cjk[i + 1]);
+  }
+  return out;
 }
 
 async function listSupportFiles(dir: string): Promise<string[]> {
@@ -189,4 +301,39 @@ async function listSupportFiles(dir: string): Promise<string[]> {
   };
   await walk(dir, '');
   return out.slice(0, 100); // 防 explode
+}
+
+/**
+ * 大小写不敏感地查找目录。
+ * 先尝试精确路径，再遍历父目录找大小写不同的同名目录。
+ * 找不到返回空字符串（scanDir 会静默跳过）。
+ *
+ * 例如：findExistingDir('/home/user', '.minicodeide', 'skills')
+ *   → 先试 /home/user/.minicodeide/skills
+ *   → 再试 /home/user/.MiniCodeIde/skills / .minicodeIde/skills 等变体
+ */
+async function findExistingDir(parent: string, dirName: string, subDir: string): Promise<string> {
+  const exact = path.join(parent, dirName, subDir);
+  try {
+    const stat = await fs.stat(exact);
+    if (stat.isDirectory()) return exact;
+  } catch { /* not found */ }
+
+  // 遍历 parent 下的直接子目录，寻找大小写不同的匹配
+  try {
+    const entries = await fs.readdir(parent, { withFileTypes: true });
+    const matched = entries.find(
+      (e) => e.isDirectory() && e.name.toLowerCase() === dirName.toLowerCase() && e.name !== dirName,
+    );
+    if (matched) {
+      const alt = path.join(parent, matched.name, subDir);
+      try {
+        const stat = await fs.stat(alt);
+        if (stat.isDirectory()) return alt;
+      } catch { /* not found */ }
+    }
+  } catch { /* parent doesn't exist */ }
+
+  // 都没找到，返回原始路径（scanDir 会 graceful 处理不存在的目录）
+  return exact;
 }

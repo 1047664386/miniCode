@@ -33,7 +33,7 @@ async function main() {
   await provider.start(handle);
 
   const providerName = process.env.WECHAT_PROVIDER ?? 'stub';
-  console.log(`[mci-remote] ready. provider=${providerName}, MCI_BASE=${process.env.MCI_BASE ?? 'http://127.0.0.1:5174'}`);
+  console.log(`[mci-remote] ready. provider=${providerName}, MCI_BASE=${process.env.MCI_BASE ?? '(auto-detect: 5175→5174)'}`);
 
   const shutdown = async () => {
     console.log('\n[mci-remote] shutting down…');

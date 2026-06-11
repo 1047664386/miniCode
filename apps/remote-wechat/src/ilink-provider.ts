@@ -94,7 +94,9 @@ function loadCredentials(): LoginCredentials | null {
 // ─── 终端二维码渲染 ────────────────────────────────────────
 async function renderQRInTerminal(url: string): Promise<void> {
   try {
-    const qrcode = await import('qrcode-terminal');
+    const mod = await import('qrcode-terminal');
+    // CJS 模块动态 import 后 generate 在 .default 上
+    const qrcode = mod.default ?? mod;
     qrcode.generate(url, { small: true }, (output: string) => {
       console.log('\n' + output);
     });
@@ -151,6 +153,7 @@ export class ILinkProvider implements Provider {
     const text = msg.text;
     const toUserId = msg.wxUserId;
     const contextToken = msg.contextToken || this.contextTokenCache.get(toUserId) || '';
+    console.log(`[ilink] send: to=${toUserId.slice(0, 12)}, ctxToken=${contextToken ? '有' : '无'}, len=${text.length}`);
 
     // iLink 单条消息限制约 4000 字，自动切片
     const MAX_LEN = 4000;
@@ -174,7 +177,7 @@ export class ILinkProvider implements Provider {
 
       if (!qrcodeUrl) throw new Error('二维码返回为空');
 
-      console.log('[ilink] 请用 iOS 微信扫描以下二维码：');
+      console.log('[ilink] 请用微信扫描以下二维码（iOS 或 Android 微信 ≥ 8.0.70）：');
       await renderQRInTerminal(qrcodeUrl);
 
       const LOGIN_TIMEOUT = 8 * 60 * 1000;
@@ -349,6 +352,7 @@ export class ILinkProvider implements Provider {
   // ─── 发送消息 ───────────────────────────────────────────
   private async sendText(toUserId: string, text: string, contextToken?: string): Promise<void> {
     const ctx = contextToken || this.contextTokenCache.get(toUserId) || '';
+    const baseUrl = this.creds!.baseUrl;
 
     const body = JSON.stringify({
       msg: {
@@ -356,7 +360,7 @@ export class ILinkProvider implements Provider {
         to_user_id: toUserId,
         client_id: generateClientId(),
         message_type: 2,
-        message_state: 'FINISH',
+        message_state: 2,
         context_token: ctx,
         item_list: [
           {
@@ -365,17 +369,22 @@ export class ILinkProvider implements Provider {
           },
         ],
       },
+      base_info: { channel_version: '1.0.3' },
     });
 
-    const resp = await fetch(`${this.creds!.baseUrl}/ilink/bot/sendmessage`, {
+    console.log(`[ilink] sendText → ${baseUrl}/ilink/bot/sendmessage (${text.length} chars)`);
+    const resp = await fetch(`${baseUrl}/ilink/bot/sendmessage`, {
       method: 'POST',
       headers: buildHeaders(this.creds!.botToken),
       body,
       signal: AbortSignal.timeout(15_000),
     });
 
+    const respBody = await resp.text().catch(() => '');
+    console.log(`[ilink] sendText resp: status=${resp.status} body=${respBody.slice(0, 300)}`);
+
     if (!resp.ok) {
-      throw new Error(`sendMessage 失败: ${resp.status}`);
+      throw new Error(`sendMessage 失败: ${resp.status} ${respBody.slice(0, 200)}`);
     }
   }
 }

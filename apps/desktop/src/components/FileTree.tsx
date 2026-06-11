@@ -222,42 +222,9 @@ export function FileTree() {
   }, []);
 
   // 监听后端文件变更 SSE → 刷新文件树
-  useEffect(() => {
-    let es: EventSource | null = null;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const connect = () => {
-      try {
-        es = new EventSource('/api/fs/events');
-        es.onmessage = (ev) => {
-          try {
-            const data = JSON.parse(ev.data);
-            if (data.type === 'fs_change') {
-              // 文件变更事件 → 递增 treeVersion，触发所有已展开 TreeNode 刷新
-              bumpTree();
-              // 同时刷新根目录列表（处理新增/删除的顶层文件）
-              loadTree('.');
-            }
-            // fs_heartbeat 忽略
-          } catch { /* parse error, ignore */ }
-        };
-        es.onerror = () => {
-          // 连接断开，清理后延迟重连
-          es?.close();
-          es = null;
-          reconnectTimer = setTimeout(connect, 5000);
-        };
-      } catch {
-        // EventSource 不可用（极老浏览器），静默降级
-      }
-    };
-
-    connect();
-    return () => {
-      es?.close();
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-    };
-  }, [bumpTree, loadTree]);
+  // 注意：SSE 连接已统一收敛到 App.tsx 的 /api/fs/events EventSource，
+  // 由它在收到 fs_change 事件时调用 bumpTree() + loadTree('.')，
+  // 这里不再单独开 EventSource，避免多占一个浏览器长连接。
 
   useEffect(() => {
     if (!ctxMenu) return;

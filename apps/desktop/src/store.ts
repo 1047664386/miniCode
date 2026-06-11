@@ -19,29 +19,6 @@ import { create } from 'zustand';
  */
 const CLOUD_API = (import.meta as any).env?.VITE_CLOUD_API ?? '';
 
-function sessionApiBase(): string {
-  const user = useStore.getState().authUser;
-  if (user && !user.isAnonymous) {
-    if (CLOUD_API) return CLOUD_API;
-    return '/cloud-api';  // dev proxy → cloud server
-  }
-  return '';
-}
-export function sessionFetch(path: string, init?: RequestInit) {
-  const base = sessionApiBase();
-  const token = useStore.getState().authToken;
-  const headers = new Headers(init?.headers);
-  // Electron file:// 协议下 SameSite=Lax cookie 不会被跨站 fetch 发送，
-  // 所以用 Authorization header 传递 JWT token 作为备选
-  if (base && token && !headers.has('Authorization')) {
-    headers.set('Authorization', `Bearer ${token}`);
-  }
-  return fetch(`${base}${path}`, {
-    ...init,
-    headers,
-    credentials: base ? 'include' : 'omit',
-  });
-}
 /** Always routes to cloud (for auth endpoints that only exist on cloud server). */
 export function cloudFetch(path: string, init?: RequestInit) {
   const base = CLOUD_API || '/cloud-api';
@@ -539,7 +516,7 @@ export const useStore = create<State>((set, get) => ({
   sessionList: [],
   async loadSessions() {
     try {
-      const r = await sessionFetch('/api/sessions');
+      const r = await fetch('/api/sessions');
       if (!r.ok) {
         // 401 等错误 → 不更新 sessionList（保持原值或空数组），避免 .map() 崩溃
         console.warn('[loadSessions] request failed:', r.status);
@@ -553,10 +530,10 @@ export const useStore = create<State>((set, get) => ({
     }
   },
   async createSession(title) {
-    const r = await sessionFetch('/api/sessions', {
+    const r = await fetch('/api/sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ title }),
+      body: JSON.stringify({ title, mode: 'code' }),
     });
     const meta = await r.json();
     set({
@@ -569,7 +546,7 @@ export const useStore = create<State>((set, get) => ({
     return meta.id;
   },
   async switchSession(id) {
-    const r = await sessionFetch(`/api/sessions/${id}`);
+    const r = await fetch(`/api/sessions/${id}`);
     if (!r.ok) return;
     const data = await r.json();
     set({
@@ -577,21 +554,40 @@ export const useStore = create<State>((set, get) => ({
       messages: (data.messages ?? []).map((m: any) => ({
         role: m.role,
         content: m.content,
+        // 恢复后端已有的持久化字段（ts, toolName, pendingEditId, pendingEditPath, uiMeta）
+        ...(m.ts ? { ts: m.ts } : {}),
+        ...(m.toolName ? { _toolName: m.toolName, _toolRole: 'result' as const } : {}),
+        ...(m.pendingEditId ? { pendingEditId: m.pendingEditId } : {}),
+        ...(m.pendingEditPath ? { pendingEditPath: m.pendingEditPath } : {}),
+        ...(m.uiMeta ?? {}),
       })),
       plan: null,
       contextStats: null,
       usage: null,
+      running: false,
+      subagents: [],
+      composerAttachments: [],
     });
+    // 刷新会话列表，使 title / messageCount 保持最新
+    await get().loadSessions();
   },
   async deleteSession(id) {
-    await sessionFetch(`/api/sessions/${id}`, { method: 'DELETE' });
+    await fetch(`/api/sessions/${id}`, { method: 'DELETE' });
     if (get().sessionId === id) {
-      set({ sessionId: null, messages: [] });
+      set({
+        sessionId: null,
+        messages: [],
+        plan: null,
+        contextStats: null,
+        usage: null,
+      });
+      get().clearSubagents();
+      get().clearAttachments();
     }
     await get().loadSessions();
   },
   async renameSession(id, title) {
-    await sessionFetch(`/api/sessions/${id}`, {
+    await fetch(`/api/sessions/${id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title }),
@@ -599,7 +595,7 @@ export const useStore = create<State>((set, get) => ({
     await get().loadSessions();
   },
   async forkSession(id, untilIndex) {
-    const r = await sessionFetch(`/api/sessions/${id}/fork`, {
+    const r = await fetch(`/api/sessions/${id}/fork`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ untilIndex }),
@@ -618,7 +614,7 @@ export const useStore = create<State>((set, get) => ({
    * 注意：不强制自动发，给用户最后一刻 review 的机会。
    */
   async resumeSession(id) {
-    const r = await sessionFetch(`/api/sessions/${id}/resume-info`);
+    const r = await fetch(`/api/sessions/${id}/resume-info`);
     if (!r.ok) return;
     const info = await r.json();
     if (!info.interrupted) {
@@ -627,11 +623,16 @@ export const useStore = create<State>((set, get) => ({
       return;
     }
     // 载入已落盘 messages
-    const histResp = await sessionFetch(`/api/sessions/${id}`);
+    const histResp = await fetch(`/api/sessions/${id}`);
     const data = await histResp.json();
     const messages = (data.messages ?? []).map((m: any) => ({
       role: m.role,
       content: m.content,
+      ...(m.ts ? { ts: m.ts } : {}),
+      ...(m.toolName ? { _toolName: m.toolName, _toolRole: 'result' as const } : {}),
+      ...(m.pendingEditId ? { pendingEditId: m.pendingEditId } : {}),
+      ...(m.pendingEditPath ? { pendingEditPath: m.pendingEditPath } : {}),
+      ...(m.uiMeta ?? {}),
     }));
     // 把 partial 作为最后一条灰色 assistant 显示（标记 interrupted 由 UI 处理）
     if (info.partialAssistant?.trim()) {
@@ -651,7 +652,7 @@ export const useStore = create<State>((set, get) => ({
     } as any);
   },
   async discardResume(id) {
-    await sessionFetch(`/api/sessions/${id}/resume-discard`, { method: 'POST' });
+    await fetch(`/api/sessions/${id}/resume-discard`, { method: 'POST' });
     await get().loadSessions();
   },
   pendingInput: null,

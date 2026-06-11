@@ -58,6 +58,8 @@ export interface SessionMessage {
   /** Pending edit 关联（可选） */
   pendingEditId?: string;
   pendingEditPath?: string;
+  /** 前端渲染元数据（可选），如 _toolRole, _toolArgs, _thinkingMs, thinkFull 等 */
+  uiMeta?: Record<string, unknown>;
 }
 
 interface InMemorySession {
@@ -142,12 +144,59 @@ export class SessionStore {
 
   list(): SessionMeta[] {
     return [...this.cache.values()]
-      .map((s) => s.meta)
+      .map((s) => {
+        // 只统计 user + assistant 消息作为"对话条数"，排除 tool/system 消息
+        const messageCount = s.messages.filter((m) => m.role === 'user' || m.role === 'assistant').length;
+        // 若 title 仍是默认且已有 user 消息，自动推断标题
+        let title = s.meta.title;
+        if ((title === 'New chat' || title === 'Untitled') && messageCount > 0) {
+          const firstUser = s.messages.find((m) => m.role === 'user');
+          if (firstUser?.content.trim()) {
+            const raw = firstUser.content.trim().slice(0, 20);
+            title = raw.length >= 20 ? raw + '…' : raw;
+          }
+        }
+        return { ...s.meta, title, messageCount };
+      })
       .sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
   get(id: string): InMemorySession | undefined {
     return this.cache.get(id);
+  }
+
+  /**
+   * 获取或重建 session（容错用）。
+   * 如果 session 不在内存缓存中，尝试从 JSONL 文件恢复；
+   * 若磁盘也没有，则创建一个空 session（保证后续 append 不会失败）。
+   */
+  async getOrCreate(id: string, opts?: { mode?: SessionMode; workspaceRoot?: string }): Promise<InMemorySession> {
+    const cached = this.cache.get(id);
+    if (cached) return cached;
+    // 尝试从磁盘恢复
+    try {
+      const restored = await this.readJsonl(id);
+      if (restored) {
+        if (!restored.meta.mode) restored.meta.mode = 'code';
+        this.cache.set(id, restored);
+        return restored;
+      }
+    } catch { /* 读取失败则继续创建 */ }
+    // 磁盘也没有 → 用指定 id 创建空 session
+    const now = Date.now();
+    const meta: SessionMeta = {
+      id,
+      title: 'New chat',
+      createdAt: now,
+      updatedAt: now,
+      messageCount: 0,
+      mode: opts?.mode ?? 'code',
+      workspaceRoot: opts?.workspaceRoot,
+    };
+    const sess: InMemorySession = { meta, messages: [] };
+    this.cache.set(id, sess);
+    await this.appendLine(id, { t: 'meta', ...meta });
+    return sess;
   }
 
   async create(
@@ -189,7 +238,7 @@ export class SessionStore {
     });
   }
 
-  /** 追加一条消息；自动设置 title（首条 user 消息的前 40 字符） */
+  /** 追加一条消息；自动设置 title（首条 user 消息的前 20 字符） */
   async append(id: string, msg: Omit<SessionMessage, 'ts'> & { ts?: number }): Promise<void> {
     const sess = this.cache.get(id);
     if (!sess) throw new Error(`Session not found: ${id}`);
@@ -198,9 +247,10 @@ export class SessionStore {
     sess.meta.updatedAt = fullMsg.ts;
     sess.meta.messageCount = sess.messages.length;
 
-    // 首条 user 消息 → 用作标题
+    // 首条 user 消息 → 取前 20 字符用作标题（超长补 …）
     if (sess.meta.title === 'New chat' && msg.role === 'user' && msg.content.trim()) {
-      sess.meta.title = msg.content.trim().slice(0, 40).replace(/\s+/g, ' ');
+      const raw = msg.content.trim().slice(0, 20);
+      sess.meta.title = raw.length >= 20 ? raw + '…' : raw;
       await this.appendLine(id, { t: 'meta', ...sess.meta });
     }
 
@@ -352,6 +402,14 @@ export class SessionStore {
       };
     }
     meta.messageCount = messages.length;
+    // 若 title 仍是默认且已有 user 消息，自动推断标题
+    if ((meta.title === 'New chat' || meta.title === 'Untitled') && messages.length > 0) {
+      const firstUser = messages.find((m) => m.role === 'user');
+      if (firstUser?.content.trim()) {
+        const raw = firstUser.content.trim().slice(0, 20);
+        meta.title = raw.length >= 20 ? raw + '…' : raw;
+      }
+    }
     // 如果有未结束的 turn → 标记为 interrupted
     if (curTurn) {
       meta.interruptedTurn = {

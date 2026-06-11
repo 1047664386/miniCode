@@ -14,8 +14,17 @@ export default defineConfig({
         target: 'http://localhost:4000',
         changeOrigin: true,
         rewrite: (path: string) => path.replace(/^\/cloud-api/, ''),
+        // 超时设置需大于 SSE keepalive（server-node 每 15s 发心跳），
+        // 同时给 LLM 长时间推理留足余量
+        proxyTimeout: 120_000,
+        timeout: 120_000,
       },
-      '/api': 'http://localhost:5175',
+      '/api': {
+        target: 'http://localhost:5175',
+        changeOrigin: true,
+        proxyTimeout: 120_000,
+        timeout: 120_000,
+      },
     },
   },
 });

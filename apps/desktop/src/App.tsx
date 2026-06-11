@@ -184,6 +184,12 @@ export function App() {
             if (data.event === 'skills.changed') {
               useStore.getState().bumpSkills();
             }
+            // 文件变更事件 → 刷新文件树（原先由 FileTree 独立 EventSource 处理，
+            // 合并到这里以减少一个 SSE 长连接，避免浏览器 6-connection 限制导致请求 pending）
+            // 注意：loadTree 内部已递增 treeVersion，不需要额外 bumpTree
+            if (data.type === 'fs_change') {
+              useStore.getState().loadTree('.');
+            }
           } catch { /* ignore */ }
         };
         fsEs.onerror = () => {

@@ -1,7 +1,6 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { useAgentsStore } from './store';
-import { sessionFetch } from '../store';
 import { ModeToggle } from './ModeToggle';
 import { WorkspacePicker } from './WorkspacePicker';
 import { useSpeechRecognition } from '../hooks/useSpeechRecognition';
@@ -50,7 +49,6 @@ export function AgentsMain() {
   const activeId = useAgentsStore((s) => s.activeSessionId);
   const mode = useAgentsStore((s) => s.mode);
   const workspace = useAgentsStore((s) => s.workspaceRoot);
-  const createSession = useAgentsStore((s) => s.createSession);
   const pendingAttachments = useAgentsStore((s) => s.pendingAttachments);
   const removePendingAttachment = useAgentsStore((s) => s.removePendingAttachment);
   const clearPendingAttachments = useAgentsStore((s) => s.clearPendingAttachments);
@@ -96,6 +94,8 @@ export function AgentsMain() {
   const abortRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  /** 追踪 streaming 状态的 ref，供 useEffect 闭包内读取最新值 */
+  const streamingRef = useRef(false);
 
   // ----- 语音（Electron→Vosk / Web→WebSpeech 自动选择）-----
   const speech = useSpeechRecognition({ lang: 'zh-CN' });
@@ -124,20 +124,31 @@ export function AgentsMain() {
   }, []);
 
   // ----- 切换 session → 加载历史 -----
+  // 注意：streaming 期间跳过加载，避免 SSE meta 事件更新 activeId 后
+  // 从服务器 fetch 旧数据覆盖正在流式写入的消息（首条消息合并 bug 的根因）
   useEffect(() => {
     if (!activeId) {
       setMessages([]);
       return;
     }
+    // streaming 中不做 reload —— 当前消息由 SSE 流实时构建
+    if (streamingRef.current) return;
     let cancelled = false;
-    void sessionFetch(`/api/sessions/${activeId}`)
+    void fetch(`/api/sessions/${activeId}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((j) => {
         if (cancelled || !j) return;
+        // 二次检查：fetch 期间可能已开始新的 streaming
+        if (streamingRef.current) return;
         const ms: ChatMsg[] = (j.messages ?? []).map((m: any) => ({
           role: m.role,
           content: m.content,
           ts: m.ts,
+          // 恢复后端已有的持久化字段
+          ...(m.toolName ? { toolName: m.toolName } : {}),
+          ...(m.pendingEditId ? { pendingEditId: m.pendingEditId } : {}),
+          ...(m.pendingEditPath ? { pendingEditPath: m.pendingEditPath } : {}),
+          ...(m.uiMeta ?? {}),
         }));
         setMessages(ms);
       })
@@ -251,19 +262,9 @@ export function AgentsMain() {
 
     if (speech.isListening) speech.stopListening();
 
-    let sid = activeId;
-    if (!sid) {
-      try {
-        const meta = await createSession();
-        sid = meta.id;
-      } catch (e: any) {
-        setMessages((m) => [
-          ...m,
-          { role: 'assistant', content: `⚠️ 创建会话失败: ${e?.message ?? '未知错误'}，请重试。`, ts: Date.now() },
-        ]);
-        return;
-      }
-    }
+    // ── Lazy Session Creation（参考 AI-bot 模式）──
+    // 不再预先创建 session。如果 activeId 为 null，后端自动创建并通过 SSE meta 返回 id。
+    const sid = activeId;
 
     // 把附件拼接到用户消息（V1：作为 markdown 引用块附在末尾）
     let composed = text;
@@ -299,6 +300,7 @@ export function AgentsMain() {
     clearPendingAttachments();
     speech.resetTranscript();
     lastSpeechRef.current = '';
+    streamingRef.current = true;
     setStreaming(true);
 
     const ac = new AbortController();
@@ -306,13 +308,14 @@ export function AgentsMain() {
     let receivedDone = false;
 
     try {
-      const r = await sessionFetch('/api/chat', {
+      // chat 始终走 server-node（有本地 LLM 配置），不通过 sessionFetch 路由到 cloud
+      const r = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           sessionId: sid,
           userMessage: composed,
-          mode: mode === 'agent' ? 'code' : mode === 'ask' ? 'work' : 'plan', // 映射到后端 SessionMode
+          mode: mode === 'ask' ? 'work' : 'code', // 映射到后端 SessionMode（plan 也是 code 场景）
           messages: messages.map((m) => ({ role: m.role, content: m.content })),
           ...(imagePayload.length > 0 ? { images: imagePayload } : {}),
         }),
@@ -343,6 +346,11 @@ export function AgentsMain() {
           if (!dataStr) continue;
           try {
             const data = JSON.parse(dataStr);
+            // ── SSE meta 事件：后端自动创建 session 时返回 sessionId（AI-bot 模式）──
+            if (data.type === 'meta' && data.sessionId) {
+              useAgentsStore.setState({ activeSessionId: data.sessionId });
+              useAgentsStore.getState().loadSessions().catch(() => {});
+            }
             if (data.type === 'text' || evType === 'text') {
               const delta: string = data.text ?? data.delta ?? '';
               if (delta) {
@@ -405,8 +413,11 @@ export function AgentsMain() {
         patchLastMessage((last) => ({ ...last, content: `⚠️ 连接失败: ${e?.message ?? '未知错误'}。请检查网络后重试。` }));
       }
     } finally {
+      streamingRef.current = false;
       setStreaming(false);
       abortRef.current = null;
+      // 刷新 sessionList（后端 append 时自动更新了 title，前端需要同步）
+      useAgentsStore.getState().loadSessions().catch(() => {});
     }
   }
 

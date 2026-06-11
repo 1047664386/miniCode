@@ -13652,10 +13652,53 @@ var SessionStore = class {
     this.loaded = true;
   }
   list() {
-    return [...this.cache.values()].map((s) => s.meta).sort((a, b) => b.updatedAt - a.updatedAt);
+    return [...this.cache.values()].map((s) => {
+      const messageCount = s.messages.filter((m) => m.role === "user" || m.role === "assistant").length;
+      let title = s.meta.title;
+      if ((title === "New chat" || title === "Untitled") && messageCount > 0) {
+        const firstUser = s.messages.find((m) => m.role === "user");
+        if (firstUser?.content.trim()) {
+          const raw = firstUser.content.trim().slice(0, 20);
+          title = raw.length >= 20 ? raw + "\u2026" : raw;
+        }
+      }
+      return { ...s.meta, title, messageCount };
+    }).sort((a, b) => b.updatedAt - a.updatedAt);
   }
   get(id) {
     return this.cache.get(id);
+  }
+  /**
+   * 获取或重建 session（容错用）。
+   * 如果 session 不在内存缓存中，尝试从 JSONL 文件恢复；
+   * 若磁盘也没有，则创建一个空 session（保证后续 append 不会失败）。
+   */
+  async getOrCreate(id, opts) {
+    const cached = this.cache.get(id);
+    if (cached) return cached;
+    try {
+      const restored = await this.readJsonl(id);
+      if (restored) {
+        if (!restored.meta.mode) restored.meta.mode = "code";
+        this.cache.set(id, restored);
+        return restored;
+      }
+    } catch {
+    }
+    const now = Date.now();
+    const meta = {
+      id,
+      title: "New chat",
+      createdAt: now,
+      updatedAt: now,
+      messageCount: 0,
+      mode: opts?.mode ?? "code",
+      workspaceRoot: opts?.workspaceRoot
+    };
+    const sess = { meta, messages: [] };
+    this.cache.set(id, sess);
+    await this.appendLine(id, { t: "meta", ...meta });
+    return sess;
   }
   async create(titleOrOpts) {
     const opts = typeof titleOrOpts === "string" ? { title: titleOrOpts } : titleOrOpts ?? {};
@@ -13687,7 +13730,7 @@ var SessionStore = class {
       remoteUser: wxUserId
     });
   }
-  /** 追加一条消息；自动设置 title（首条 user 消息的前 40 字符） */
+  /** 追加一条消息；自动设置 title（首条 user 消息的前 20 字符） */
   async append(id, msg) {
     const sess = this.cache.get(id);
     if (!sess) throw new Error(`Session not found: ${id}`);
@@ -13696,7 +13739,8 @@ var SessionStore = class {
     sess.meta.updatedAt = fullMsg.ts;
     sess.meta.messageCount = sess.messages.length;
     if (sess.meta.title === "New chat" && msg.role === "user" && msg.content.trim()) {
-      sess.meta.title = msg.content.trim().slice(0, 40).replace(/\s+/g, " ");
+      const raw = msg.content.trim().slice(0, 20);
+      sess.meta.title = raw.length >= 20 ? raw + "\u2026" : raw;
       await this.appendLine(id, { t: "meta", ...sess.meta });
     }
     await this.appendLine(id, { t: "msg", ...fullMsg });
@@ -13827,6 +13871,13 @@ var SessionStore = class {
       };
     }
     meta.messageCount = messages.length;
+    if ((meta.title === "New chat" || meta.title === "Untitled") && messages.length > 0) {
+      const firstUser = messages.find((m) => m.role === "user");
+      if (firstUser?.content.trim()) {
+        const raw2 = firstUser.content.trim().slice(0, 20);
+        meta.title = raw2.length >= 20 ? raw2 + "\u2026" : raw2;
+      }
+    }
     if (curTurn) {
       meta.interruptedTurn = {
         turnId: curTurn.turnId,
@@ -14403,6 +14454,21 @@ var ProviderStore = class {
       if (!this.cfg.active.complete) this.cfg.active.complete = id;
       if (!this.cfg.active.embed && process.env.EMBED_MODEL)
         this.cfg.active.embed = id;
+    }
+    for (const role of ["chat", "complete", "embed", "fast"]) {
+      const activeId = this.cfg.active[role];
+      if (activeId && !this.cfg.profiles.some((p) => p.id === activeId)) {
+        delete this.cfg.active[role];
+      }
+    }
+    if (this.cfg.fallbacks) {
+      for (const role of ["chat", "complete", "embed", "fast"]) {
+        if (this.cfg.fallbacks[role]) {
+          this.cfg.fallbacks[role] = this.cfg.fallbacks[role].filter(
+            (id) => this.cfg.profiles.some((p) => p.id === id)
+          );
+        }
+      }
     }
     return this.cfg;
   }
@@ -21010,14 +21076,25 @@ ${it.partialAssistant.slice(-2e3)}
     const {
       messages = [],
       userMessage: rawUserMessage,
-      mode = "agent",
+      mode: rawMode = "agent",
       sessionId: rawSessionId,
       images = [],
       timeout: clientTimeout,
       profileId: requestedProfileId
     } = body;
-    const persistSession = rawSessionId && s.sessions.get(rawSessionId);
-    const chatSessionId = rawSessionId || `anon:${c.req.headers["x-forwarded-for"] ?? c.req.socket.remoteAddress ?? "local"}`;
+    const mode = rawMode === "work" ? "ask" : rawMode === "code" ? "agent" : rawMode;
+    let sessionId = rawSessionId;
+    let isNewSession = false;
+    if (!sessionId) {
+      const autoTitle = (rawUserMessage ?? "").trim().slice(0, 20) || "New chat";
+      const meta = await s.sessions.create({ title: autoTitle, mode: mode === "ask" ? "work" : "code" });
+      sessionId = meta.id;
+      isNewSession = true;
+    } else if (!s.sessions.get(sessionId)) {
+      await s.sessions.getOrCreate(sessionId).catch(() => void 0);
+    }
+    const persistSession = !!s.sessions.get(sessionId);
+    const chatSessionId = sessionId;
     let userMessage = rawUserMessage;
     let slashName = null;
     const slashed = s.slash.maybeExpand(rawUserMessage);
@@ -21039,6 +21116,7 @@ ${it.partialAssistant.slice(-2e3)}
     userMessage = mentionResult.cleanText || userMessage;
     const explicitContext = mentionResult.items;
     const sse = openSse(c.req, c.res);
+    sse.send({ type: "meta", sessionId, isNew: isNewSession });
     if (slashName) sse.send({ type: "slash", command: slashName });
     if (explicitSkills.length) sse.send({ type: "skills_activated", skills: explicitSkills });
     if (mentionResult.items.length || mentionResult.unresolved.length) {
@@ -21054,9 +21132,9 @@ ${it.partialAssistant.slice(-2e3)}
     let currentTurnId = null;
     let sessionRelease = null;
     if (persistSession) {
-      sessionRelease = await s.sessions.lock.acquire(rawSessionId);
-      await s.sessions.append(rawSessionId, { role: "user", content: rawUserMessage ?? "" }).catch(() => void 0);
-      currentTurnId = await s.sessions.startTurn(rawSessionId, rawUserMessage ?? "").catch(() => null);
+      sessionRelease = await s.sessions.lock.acquire(sessionId);
+      await s.sessions.append(sessionId, { role: "user", content: rawUserMessage ?? "" }).catch(() => void 0);
+      currentTurnId = await s.sessions.startTurn(sessionId, rawUserMessage ?? "").catch(() => null);
     }
     let assistantBuf = "";
     let userAbort = false;
@@ -21171,7 +21249,7 @@ ${body2}`;
           if (ev.type === "text" && ev.text) {
             assistantBuf += ev.text;
             if (persistSession && currentTurnId)
-              s.sessions.appendChunk(rawSessionId, currentTurnId, ev.text).catch(() => void 0);
+              s.sessions.appendChunk(sessionId, currentTurnId, ev.text).catch(() => void 0);
           }
           if (ev.type === "done" && ev.reason) agentDoneReason = ev.reason;
           sse.send(ev);
@@ -21243,7 +21321,7 @@ ${body2}`;
                 task: req.task,
                 label: req.label,
                 role: req.role,
-                parentSessionId: rawSessionId ?? "no-session",
+                parentSessionId: sessionId ?? "no-session",
                 parentTurnId: currentTurnId ?? void 0,
                 parentDepth: 0
               });
@@ -21273,14 +21351,36 @@ ${body2}`;
           if (ev.type === "text" && ev.text) {
             assistantBuf += ev.text;
             if (persistSession && currentTurnId)
-              s.sessions.appendChunk(rawSessionId, currentTurnId, ev.text).catch(() => void 0);
+              s.sessions.appendChunk(sessionId, currentTurnId, ev.text).catch(() => void 0);
           }
           if (ev.type === "tool_call" && persistSession && currentTurnId) {
-            s.sessions.appendTool(rawSessionId, currentTurnId, {
+            s.sessions.appendTool(sessionId, currentTurnId, {
               name: ev.name,
               args: ev.args,
               result: ev.result,
               error: ev.error
+            }).catch(() => void 0);
+            const toolName = ev.name;
+            const toolArgs = ev.args;
+            s.sessions.append(sessionId, {
+              role: "tool",
+              content: toolName ?? "",
+              toolName,
+              uiMeta: {
+                _toolRole: "call",
+                ...toolName ? { _toolName: toolName } : {},
+                ...toolArgs ? { _toolArgs: JSON.stringify(toolArgs).slice(0, 4e3) } : {}
+              }
+            }).catch(() => void 0);
+            s.sessions.append(sessionId, {
+              role: "tool",
+              content: ev.result != null ? String(ev.result).slice(0, 2e3) : ev.error ? `Error: ${ev.error}` : "",
+              toolName,
+              uiMeta: {
+                _toolRole: "result",
+                ...toolName ? { _toolName: toolName } : {},
+                ...toolArgs ? { _toolArgs: JSON.stringify(toolArgs).slice(0, 4e3) } : {}
+              }
             }).catch(() => void 0);
           }
           if (ev.type === "tool_call") {
@@ -21303,31 +21403,31 @@ ${body2}`;
       agentDoneReason = "error";
       sse.send({ type: "error", error: e?.message ?? String(e) });
       if (persistSession && currentTurnId)
-        await s.sessions.interruptTurn(rawSessionId, currentTurnId, e?.message ?? String(e)).catch(() => void 0);
+        await s.sessions.interruptTurn(sessionId, currentTurnId, e?.message ?? String(e)).catch(() => void 0);
     } finally {
       while (subagentEventBuffer.length > 0) {
         const p = subagentEventBuffer.shift();
         sse.send(p);
       }
-      if (rawSessionId) {
+      if (sessionId) {
         try {
-          await s.subagents.awaitAllForParent(rawSessionId, 6e4);
+          await s.subagents.awaitAllForParent(sessionId, 6e4);
         } catch {
         }
-        const pending = s.subagents.pickPendingAnnouncements(rawSessionId);
+        const pending = s.subagents.pickPendingAnnouncements(sessionId);
         for (const ann of pending) sse.send({ type: "subagent_announce", message: ann });
         if (pending.length > 0 && persistSession) {
           for (const ann of pending) {
-            await s.sessions.append(rawSessionId, { role: "user", content: ann }).catch(() => void 0);
+            await s.sessions.append(sessionId, { role: "user", content: ann }).catch(() => void 0);
           }
           sse.send({ type: "subagent_followup", count: pending.length });
         }
       }
       if (persistSession && currentTurnId) {
         if (userAbort)
-          await s.sessions.interruptTurn(rawSessionId, currentTurnId, "user_stop").catch(() => void 0);
+          await s.sessions.interruptTurn(sessionId, currentTurnId, "user_stop").catch(() => void 0);
         else
-          await s.sessions.endTurn(rawSessionId, currentTurnId, assistantBuf).catch(() => void 0);
+          await s.sessions.endTurn(sessionId, currentTurnId, assistantBuf).catch(() => void 0);
       }
       if (sessionRelease) {
         sessionRelease();

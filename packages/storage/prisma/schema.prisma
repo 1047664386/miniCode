@@ -46,7 +46,7 @@ model Session {
   user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   title           String   @default("New chat")
-  mode            String   @default("work") // 'work' | 'code'
+  mode            String   @default("code") // 'work' | 'code'
   workspaceRoot   String?                    // 网页版 Code 模式时指向沙箱路径（M3）
   remoteUser      String?                    // 微信 wxid（可选，复用桌面字段语义）
 
@@ -75,6 +75,7 @@ model Message {
   toolName        String?
   pendingEditId   String?
   pendingEditPath String?
+  uiMeta          Json?    // 前端渲染元数据（_toolRole, _toolArgs, _thinkingMs 等）
 
   @@index([sessionId, ts])
 }

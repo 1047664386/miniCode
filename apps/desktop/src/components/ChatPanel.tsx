@@ -63,7 +63,7 @@ export function ChatPanel() {
     messages, pushMessage, patchLastAssistant, patchMessageAt, resetChat,
     mode, setMode, running, setRunning, loadTree,
     setPlan, setContextStats, setUsage, upsertSubagent,
-    sessionId, createSession,
+    sessionId, createSession, loadSessions,
     resumeDraft, setResumeDraft,
     pendingInput,
     composerAttachments, removeAttachment, clearAttachments,
@@ -262,9 +262,13 @@ export function ChatPanel() {
   const loadProfiles = () => {
     fetch('/api/providers').then((r) => r.json()).then((data: any) => {
       const profiles = (data?.profiles ?? []).filter((p: any) => !p.hash);
-      setProviderProfiles(profiles.map((p: any) => ({ id: p.id, name: p.name, model: p.model })));
+      const mapped = profiles.map((p: any) => ({ id: p.id, name: p.name, model: p.model }));
+      setProviderProfiles(mapped);
       // 同步下拉框选中状态 = 服务端 active chat
-      setSelectedProfileId(data?.active?.chat ?? null);
+      // 但要验证 active ID 确实存在于 profiles 列表中（防止 cloud 侧的 stale ID）
+      const activeId: string | null = data?.active?.chat ?? null;
+      const validActive = activeId && mapped.some((p: { id: string }) => p.id === activeId) ? activeId : null;
+      setSelectedProfileId(validActive);
     }).catch(() => {});
   };
   useEffect(() => { loadProfiles(); }, []);
@@ -423,15 +427,9 @@ export function ChatPanel() {
     const chatAbort = new AbortController();
     chatAbortRef.current = chatAbort;
 
-    // 没有 active session → 自动创建一个；首条消息内容会被 server 用作 title
-    let sid = sessionId;
-    if (!sid) {
-      try {
-        sid = await createSession();
-      } catch {
-        /* server 没起也不阻塞 chat */
-      }
-    }
+    // ── Lazy Session Creation（参考 AI-bot 模式）──
+    // 不再预先创建 session。如果 sessionId 为 null，后端会自动创建并通过 SSE meta 事件返回 id。
+    // 这样可以避免"session 创建了但没消息"的悬空状态。
 
     try {
       // 构建 history：保留 tool_result 消息（让 LLM 知道上轮工具调用结果），
@@ -458,14 +456,16 @@ export function ChatPanel() {
           return { role: m.role, content: m.content };
         });
 
+      // chat 始终走 server-node（有本地 LLM 配置），不通过 sessionFetch 路由到 cloud
+      // session 管理（创建/列表/切换）也已统一走 server-node（fetch），保证数据一致性
       const resp = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           messages: history,
           userMessage: finalText,
-          mode,
-          sessionId: sid,
+          mode: mode === 'ask' ? 'work' : 'code',
+          sessionId,
           profileId: selectedProfileId,
           ...(multimodalImages.length > 0 ? { images: multimodalImages } : {}),
           // 高级设置：超时参数（0 = 不限制）
@@ -504,6 +504,11 @@ export function ChatPanel() {
           try {
             const ev = JSON.parse(json);
             if (ev.type === 'done') receivedDone = true;
+            // ── SSE meta 事件：后端自动创建 session 时返回 sessionId（AI-bot 模式）──
+            if (ev.type === 'meta' && ev.sessionId) {
+              useStore.setState({ sessionId: ev.sessionId });
+              loadSessions().catch(() => {});
+            }
             handleEvent(ev);
           } catch {
             /* */
@@ -536,6 +541,8 @@ export function ChatPanel() {
       setRunning(false);
       // 若 Agent 改了文件，重新拉一下文件树
       loadTree('.');
+      // 刷新 sessionList（后端 append 时自动更新了 title，前端需要同步）
+      loadSessions().catch(() => {});
       // subagent announce 续发已移至 useEffect（避免竞态）
     }
   };

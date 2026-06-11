@@ -138,6 +138,23 @@ export class ProviderStore {
       if (!this.cfg.active.embed && process.env.EMBED_MODEL)
         this.cfg.active.embed = id;
     }
+    // 清理 stale active IDs：指向已不存在的 profile 时移除引用
+    for (const role of ['chat', 'complete', 'embed', 'fast'] as const) {
+      const activeId = this.cfg.active[role];
+      if (activeId && !this.cfg.profiles.some((p) => p.id === activeId)) {
+        delete this.cfg.active[role];
+      }
+    }
+    // 同样清理 stale fallback IDs
+    if (this.cfg.fallbacks) {
+      for (const role of ['chat', 'complete', 'embed', 'fast'] as const) {
+        if (this.cfg.fallbacks[role]) {
+          this.cfg.fallbacks[role] = this.cfg.fallbacks[role]!.filter(
+            (id) => this.cfg.profiles.some((p) => p.id === id),
+          );
+        }
+      }
+    }
     return this.cfg;
   }
 

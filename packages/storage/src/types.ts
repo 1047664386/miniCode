@@ -37,6 +37,8 @@ export interface SessionMessage {
   toolName?: string;
   pendingEditId?: string;
   pendingEditPath?: string;
+  /** 前端渲染元数据（可选），如 _toolRole, _toolArgs, _thinkingMs, thinkFull 等 */
+  uiMeta?: Record<string, unknown>;
 }
 
 export interface ToolCallRecord {

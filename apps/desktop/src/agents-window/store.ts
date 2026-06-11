@@ -13,7 +13,6 @@
  *  - openFiles / previewFile 控制中间可关闭代码预览面板
  */
 import { create } from 'zustand';
-import { sessionFetch } from '../store';
 
 export type AgentsMode = 'agent' | 'ask' | 'plan';
 
@@ -159,11 +158,9 @@ export const useAgentsStore = create<State>((set, get) => ({
   async loadSessions() {
     set({ loading: true });
     try {
-      const { mode } = get();
-      const params = new URLSearchParams();
-      params.set('mode', mode === 'agent' ? 'code' : mode === 'ask' ? 'work' : 'plan');
-      // ⚠️ 不再按 workspaceRoot 过滤 —— 侧栏要展示所有工作区的会话，前端自己分组
-      const r = await sessionFetch(`/api/sessions?${params.toString()}`);
+      // 不按 mode 过滤 —— 历史列表统一展示所有会话（对齐 Cursor/Claude Code 设计）
+      // mode 只影响新建会话的默认值和 composer 行为，不作为会话分类维度
+      const r = await fetch('/api/sessions');
       const list: SessionMeta[] = r.ok ? await r.json() : [];
       set({ sessions: list, loading: false });
     } catch {
@@ -173,12 +170,12 @@ export const useAgentsStore = create<State>((set, get) => ({
 
   async createSession(title?: string) {
     const { mode, workspaceRoot } = get();
-    const r = await sessionFetch('/api/sessions', {
+    const r = await fetch('/api/sessions', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         title,
-        mode: mode === 'agent' ? 'code' : mode === 'ask' ? 'work' : 'plan',
+        mode: mode === 'ask' ? 'work' : 'code',
         workspaceRoot: mode !== 'ask' ? workspaceRoot ?? undefined : undefined,
       }),
     });
@@ -189,8 +186,11 @@ export const useAgentsStore = create<State>((set, get) => ({
   },
 
   async deleteSession(id) {
-    await sessionFetch(`/api/sessions/${id}`, { method: 'DELETE' }).catch(() => undefined);
-    if (get().activeSessionId === id) set({ activeSessionId: null });
+    await fetch(`/api/sessions/${id}`, { method: 'DELETE' }).catch(() => undefined);
+    if (get().activeSessionId === id) {
+      set({ activeSessionId: null });
+      get().clearPendingAttachments();
+    }
     await get().loadSessions();
   },
 
@@ -354,9 +354,13 @@ export const useAgentsStore = create<State>((set, get) => ({
       if (!r.ok) return;
       const data = await r.json();
       const profiles = (data?.profiles ?? []).filter((p: any) => !p.hash);
+      const mapped = profiles.map((p: any) => ({ id: p.id, name: p.name, model: p.model }));
+      // 验证 active ID 确实存在于 profiles 列表中（防止 cloud 侧的 stale ID）
+      const activeId: string | null = data?.active?.chat ?? null;
+      const validActive = activeId && mapped.some((p: { id: string }) => p.id === activeId) ? activeId : null;
       set({
-        providerProfiles: profiles.map((p: any) => ({ id: p.id, name: p.name, model: p.model })),
-        selectedProfileId: data?.active?.chat ?? null,
+        providerProfiles: mapped,
+        selectedProfileId: validActive,
       });
     } catch { /* ignore */ }
   },

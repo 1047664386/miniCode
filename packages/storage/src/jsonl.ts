@@ -51,7 +51,18 @@ export class JsonlStorage implements SessionStorage {
   }
 
   async list(opts: { userId?: string; mode?: SessionMode; workspaceRoot?: string } = {}): Promise<SessionMeta[]> {
-    let arr = [...this.cache.values()].map((s) => s.meta);
+    let arr = [...this.cache.values()].map((s) => {
+      const messageCount = s.messages.length;
+      let title = s.meta.title;
+      if ((title === 'New chat' || title === 'Untitled') && messageCount > 0) {
+        const firstUser = s.messages.find((m) => m.role === 'user');
+        if (firstUser?.content.trim()) {
+          const raw = firstUser.content.trim().slice(0, 20);
+          title = raw.length >= 20 ? raw + '…' : raw;
+        }
+      }
+      return { ...s.meta, title, messageCount };
+    });
     if (opts.mode) arr = arr.filter((m) => (m.mode ?? 'code') === opts.mode);
     if (opts.workspaceRoot) arr = arr.filter((m) => m.workspaceRoot === opts.workspaceRoot);
     if (opts.userId) arr = arr.filter((m) => m.userId === opts.userId);
@@ -66,7 +77,18 @@ export class JsonlStorage implements SessionStorage {
 
   /** 同步 list （桌面后兼容、制存在内存，云端 PgStorage 不提供） */
   listSync(opts: { userId?: string; mode?: SessionMode; workspaceRoot?: string } = {}): SessionMeta[] {
-    let arr = [...this.cache.values()].map((s) => s.meta);
+    let arr = [...this.cache.values()].map((s) => {
+      const messageCount = s.messages.length;
+      let title = s.meta.title;
+      if ((title === 'New chat' || title === 'Untitled') && messageCount > 0) {
+        const firstUser = s.messages.find((m) => m.role === 'user');
+        if (firstUser?.content.trim()) {
+          const raw = firstUser.content.trim().slice(0, 20);
+          title = raw.length >= 20 ? raw + '…' : raw;
+        }
+      }
+      return { ...s.meta, title, messageCount };
+    });
     if (opts.mode) arr = arr.filter((m) => (m.mode ?? 'code') === opts.mode);
     if (opts.workspaceRoot) arr = arr.filter((m) => m.workspaceRoot === opts.workspaceRoot);
     if (opts.userId) arr = arr.filter((m) => m.userId === opts.userId);
@@ -126,7 +148,8 @@ export class JsonlStorage implements SessionStorage {
     sess.meta.updatedAt = fullMsg.ts;
     sess.meta.messageCount = sess.messages.length;
     if (sess.meta.title === 'New chat' && msg.role === 'user' && msg.content.trim()) {
-      sess.meta.title = msg.content.trim().slice(0, 40).replace(/\s+/g, ' ');
+      const raw = msg.content.trim().slice(0, 20);
+      sess.meta.title = raw.length >= 20 ? raw + '…' : raw;
       await this.appendLine(id, { t: 'meta', ...sess.meta });
     }
     await this.appendLine(id, { t: 'msg', ...fullMsg });
@@ -254,6 +277,13 @@ export class JsonlStorage implements SessionStorage {
       };
     }
     meta.messageCount = messages.length;
+    if ((meta.title === 'New chat' || meta.title === 'Untitled') && messages.length > 0) {
+      const firstUser = messages.find((m) => m.role === 'user');
+      if (firstUser?.content.trim()) {
+        const raw = firstUser.content.trim().slice(0, 20);
+        meta.title = raw.length >= 20 ? raw + '…' : raw;
+      }
+    }
     if (curTurn) {
       meta.interruptedTurn = {
         turnId: curTurn.turnId,

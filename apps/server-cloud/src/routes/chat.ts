@@ -57,13 +57,23 @@ interface Deps {
 
 async function runChat(req: FastifyRequest, reply: FastifyReply, app: any, deps: Deps) {
   const body = (req.body ?? {}) as ChatBody;
-  const sessionId = String(body.sessionId ?? '');
+  let sessionId = String(body.sessionId ?? '');
   const text = String(body.userMessage ?? body.text ?? '').trim();
   const mode = String(body.mode ?? 'work').toLowerCase();
   const clientTimeout = body.timeout; // { fetchTimeoutMs?, streamIdleTimeoutMs? } | undefined
-  if (!sessionId || !text) return reply.code(400).send({ error: 'sessionId + userMessage required' });
+  if (!text) return reply.code(400).send({ error: 'userMessage required' });
 
   const storage = new PgStorage(app.prisma, req.userId);
+
+  // ── Lazy Session Creation（参考 AI-bot 模式）──
+  let isNewSession = false;
+  if (!sessionId) {
+    const autoTitle = text.slice(0, 20) || 'New chat';
+    const meta = await storage.create({ title: autoTitle, mode: mode === 'code' ? 'code' : 'work' });
+    sessionId = meta.id;
+    isNewSession = true;
+  }
+
   const sess = await storage.get(sessionId);
   if (!sess) return reply.code(404).send({ error: 'session not found' });
 
@@ -99,6 +109,9 @@ async function runChat(req: FastifyRequest, reply: FastifyReply, app: any, deps:
     reply.raw.write(`event: ${event}\n`);
     reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
   };
+
+  // ── 始终发送 meta 事件，让前端获得确定的 sessionId（AI-bot 模式）──
+  write('meta', { sessionId, isNew: isNewSession });
 
   const ctl = new AbortController();
   req.raw.on('close', () => ctl.abort());
@@ -142,6 +155,17 @@ async function runChat(req: FastifyRequest, reply: FastifyReply, app: any, deps:
           write('text', { delta: ev.text });
         } else if (ev.type === 'tool_call' && ev.toolCall) {
           write('tool_call', { name: ev.toolCall.name, args: ev.toolCall.arguments });
+          // 持久化 tool_call 消息（前端回显时需要 call-result 配对）
+          await storage.append(sessionId, {
+            role: 'tool',
+            content: ev.toolCall.name ?? '',
+            toolName: ev.toolCall.name,
+            uiMeta: {
+              _toolRole: 'call',
+              _toolName: ev.toolCall.name,
+              ...(ev.toolCall.arguments ? { _toolArgs: JSON.stringify(ev.toolCall.arguments).slice(0, 4000) } : {}),
+            },
+          }).catch(() => undefined);
         } else if (ev.type === 'tool_result') {
           // 给 UI 一个简短摘要（避免发巨大 stdout 上来）
           const r = ev.toolResult as any;
@@ -154,6 +178,12 @@ async function runChat(req: FastifyRequest, reply: FastifyReply, app: any, deps:
             else if ('bytes' in r) summary = `wrote ${r.bytes} bytes`;
           }
           write('tool_result', { ok: true, summary });
+          // 持久化 tool_result 消息
+          await storage.append(sessionId, {
+            role: 'tool',
+            content: summary || String(r ?? '').slice(0, 2000),
+            uiMeta: { _toolRole: 'result' },
+          }).catch(() => undefined);
         } else if (ev.type === 'usage') {
           promptTokens = ev.usage?.promptTokens ?? promptTokens;
           completionTokens = ev.usage?.completionTokens ?? completionTokens;

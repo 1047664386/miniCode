@@ -18,6 +18,7 @@ import type {
   SessionStorage,
   ToolCallRecord,
 } from './types.js';
+import { Prisma } from './generated/prisma/index.js';
 
 // 我们不直接引 @prisma/client，避免下游用户不装 prisma 也能 typecheck @mini/storage。
 // 业务方启动时传一个 PrismaClient 进来即可。
@@ -27,6 +28,7 @@ type AnyPrisma = {
   message: any;
   turn: any;
   $executeRaw: any;
+  $queryRaw: any;
   $transaction: any;
 };
 
@@ -36,7 +38,8 @@ function metaFromRow(row: any): SessionMeta {
     title: row.title,
     createdAt: new Date(row.createdAt).getTime(),
     updatedAt: new Date(row.updatedAt).getTime(),
-    messageCount: row.messageCount,
+    // 优先用 _count.messages（动态统计），兜底用 messageCount 列（可能在事务中已自增）
+    messageCount: row._count?.messages ?? row.messageCount ?? 0,
     mode: row.mode as SessionMode,
     workspaceRoot: row.workspaceRoot ?? undefined,
     remoteUser: row.remoteUser ?? undefined,
@@ -53,6 +56,7 @@ function messageFromRow(row: any): SessionMessage {
     toolName: row.toolName ?? undefined,
     pendingEditId: row.pendingEditId ?? undefined,
     pendingEditPath: row.pendingEditPath ?? undefined,
+    uiMeta: row.uiMeta ?? undefined,
   };
 }
 
@@ -68,8 +72,49 @@ export class PgStorage implements SessionStorage {
     const rows = await this.prisma.session.findMany({
       where,
       orderBy: { updatedAt: 'desc' },
+      include: { _count: { select: { messages: true } } },
     });
-    return rows.map(metaFromRow);
+    // 统计每个 session 的 user+assistant 消息数（排除 tool/system），作为有意义的"对话条数"
+    const allIds = rows.map((r: any) => r.id);
+    let chatCountMap = new Map<string, number>();
+    if (allIds.length > 0) {
+      const chatCounts = await this.prisma.message.groupBy({
+        by: ['sessionId'],
+        where: { sessionId: { in: allIds }, role: { in: ['user', 'assistant'] } },
+        _count: { id: true },
+      });
+      chatCountMap = new Map(chatCounts.map((c: any) => [c.sessionId, c._count.id]));
+    }
+    const metas = rows.map((r: any) => {
+      const m = metaFromRow(r);
+      m.messageCount = chatCountMap.get(r.id) ?? 0;
+      return m;
+    });
+    // 对 title 仍是默认值且有消息的 session，从首条 user 消息推断标题
+    const needTitle = metas.filter((m: SessionMeta) => (m.title === 'New chat' || m.title === 'Untitled') && m.messageCount > 0);
+    if (needTitle.length > 0) {
+      const ids = needTitle.map((m: SessionMeta) => m.id);
+      // 使用 DISTINCT ON 确保每个 session 只取 ts 最小的那条 user 消息
+      const firstUserMsgs = await this.prisma.$queryRaw<Array<{ sessionId: string; content: string }>>`
+        SELECT DISTINCT ON ("sessionId") "sessionId", content
+          FROM "Message"
+         WHERE "sessionId" IN (${Prisma.join(ids)})
+           AND role = 'user'
+         ORDER BY "sessionId", ts ASC
+      `;
+      const titleMap = new Map<string, string>();
+      for (const msg of firstUserMsgs) {
+        if (msg.content?.trim()) {
+          const raw = msg.content.trim().slice(0, 20);
+          titleMap.set(msg.sessionId, raw.length >= 20 ? raw + '…' : raw);
+        }
+      }
+      for (const m of needTitle) {
+        const inferred = titleMap.get(m.id);
+        if (inferred) m.title = inferred;
+      }
+    }
+    return metas;
   }
 
   async get(id: string) {
@@ -80,8 +125,11 @@ export class PgStorage implements SessionStorage {
       },
     });
     if (!row) return undefined;
+    // get 已加载全部 messages，直接用 length 比存储列更准确
+    const meta = metaFromRow(row);
+    meta.messageCount = row.messages.length;
     return {
-      meta: metaFromRow(row),
+      meta,
       messages: row.messages.map(messageFromRow),
     };
   }
@@ -94,7 +142,7 @@ export class PgStorage implements SessionStorage {
         id,
         userId: opts.userId ?? this.userId,
         title: opts.title?.trim() || 'New chat',
-        mode: opts.mode ?? 'work',
+        mode: opts.mode ?? 'code',
         workspaceRoot: opts.workspaceRoot,
         remoteUser: opts.remoteUser,
       },
@@ -106,6 +154,7 @@ export class PgStorage implements SessionStorage {
     const row = await this.prisma.session.findFirst({
       where: { userId: this.userId, remoteUser: wxUserId },
       orderBy: { updatedAt: 'desc' },
+      include: { _count: { select: { messages: true } } },
     });
     if (row) return metaFromRow(row);
     return this.create({
@@ -128,6 +177,7 @@ export class PgStorage implements SessionStorage {
           toolName: msg.toolName,
           pendingEditId: msg.pendingEditId,
           pendingEditPath: msg.pendingEditPath,
+          uiMeta: msg.uiMeta ?? undefined,
         },
       }),
       this.prisma.session.update({
@@ -140,11 +190,13 @@ export class PgStorage implements SessionStorage {
       }),
     ]);
     if (msg.role === 'user' && msg.content.trim()) {
-      // 仅当当前 title 仍为 'New chat' 时才覆盖
+      // 仅当当前 title 仍为默认值时才覆盖，取前 20 字符，超长补 …
+      const raw = msg.content.trim().slice(0, 20);
+      const newTitle = raw.length >= 20 ? raw + '…' : raw;
       await this.prisma.$executeRaw`
         UPDATE "Session"
-           SET title = ${msg.content.trim().slice(0, 40).replace(/\s+/g, ' ')}
-         WHERE id = ${id} AND title = 'New chat'
+           SET title = ${newTitle}
+         WHERE id = ${id} AND title IN ('New chat', 'Untitled')
       `;
     }
   }

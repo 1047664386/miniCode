@@ -42,3 +42,12 @@
 - apps/server 已删除，prepare-electron-resources.mjs 硬编码 server-node
 - 用户准备用此项目面试，需要深入掌握 AI 模块
 - 面试重点方向: Agent Loop、上下文压缩、幻觉处理、记忆系统、代码检索、Skill/MCP/子Agent
+
+## 会话模块 Bug 修复 (2026-06-11)
+- **Electron 401 修复**：SameSite=Lax cookie 在 file:// 跨站不发送 → 登录响应返回 JWT token + 前端用 Authorization header 传递
+- **loadSessions 防御性编码**：检查 r.ok + Array.isArray 验证
+- **会话标题自动更新**：ChatPanel/AgentsMain 发消息后 loadSessions 刷新列表
+- **switchSession 字段映射修复**：恢复 toolName/pendingEditId/pendingEditPath/uiMeta
+- **uiMeta 持久化**：SessionMessage 添加 uiMeta 字段，chat handler tool_call 时 append 带 uiMeta 的 tool 消息
+- **deleteSession 状态清理**：清空 plan/contextStats/usage/subagents/attachments
+- **Prisma schema 更新**：Message model 添加 uiMeta Json? 字段（需 migrate）

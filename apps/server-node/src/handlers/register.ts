@@ -1167,20 +1167,39 @@ export function registerHandlers(r: Router, s: Services) {
   r.post('/api/chat', async (c) => {
     const body = (await readBody(c.req, { limit: 10 * 1024 * 1024 })) ?? {};
     const { messages = [], userMessage: rawUserMessage,
-      mode = 'agent', sessionId: rawSessionId,
+      mode: rawMode = 'agent', sessionId: rawSessionId,
       images = [],
       timeout: clientTimeout,
       profileId: requestedProfileId,
     } = body as {
       messages: ChatMessage[]; userMessage: string;
-      mode?: 'ask' | 'agent' | 'plan'; sessionId?: string;
+      mode?: 'ask' | 'agent' | 'plan' | 'work' | 'code'; sessionId?: string;
       images?: Array<{ type: 'image'; media_type: string; data: string }>;
       timeout?: { fetchTimeoutMs?: number; streamIdleTimeoutMs?: number };
       profileId?: string;
     };
-    const persistSession = rawSessionId && s.sessions.get(rawSessionId);
-    const chatSessionId = rawSessionId ||
-      `anon:${(c.req.headers['x-forwarded-for'] as string) ?? c.req.socket.remoteAddress ?? 'local'}`;
+    // 兼容前端传入的 SessionMode（'work'|'code'）→ 映射为 AgentMode
+    const mode = rawMode === 'work' ? 'ask' as const
+      : rawMode === 'code' ? 'agent' as const
+      : (rawMode as 'ask' | 'agent' | 'plan');
+
+    // ── Lazy Session Creation（参考 AI-bot 模式）──
+    // 如果前端没有传 sessionId，或者传了一个缓存中不存在的 id，
+    // 后端自动创建 session 并通过 SSE meta 事件把 id 返回给前端。
+    let sessionId = rawSessionId;
+    let isNewSession = false;
+    if (!sessionId) {
+      // 没有 sessionId → 用首条消息前 20 字符作为 title，自动创建
+      const autoTitle = (rawUserMessage ?? '').trim().slice(0, 20) || 'New chat';
+      const meta = await s.sessions.create({ title: autoTitle, mode: mode === 'ask' ? 'work' : 'code' });
+      sessionId = meta.id;
+      isNewSession = true;
+    } else if (!s.sessions.get(sessionId)) {
+      // 有 sessionId 但缓存中不存在 → 尝试从磁盘恢复或重建
+      await s.sessions.getOrCreate(sessionId).catch(() => undefined);
+    }
+    const persistSession = !!s.sessions.get(sessionId);
+    const chatSessionId = sessionId;
 
     // Slash command 预处理
     let userMessage = rawUserMessage;
@@ -1202,6 +1221,8 @@ export function registerHandlers(r: Router, s: Services) {
     const explicitContext = mentionResult.items;
 
     const sse = openSse(c.req, c.res);
+    // ── 始终发送 meta 事件，让前端获得确定的 sessionId（参考 AI-bot 的 meta 协议）──
+    sse.send({ type: 'meta', sessionId, isNew: isNewSession });
     if (slashName) sse.send({ type: 'slash', command: slashName });
     if (explicitSkills.length) sse.send({ type: 'skills_activated', skills: explicitSkills });
     if (mentionResult.items.length || mentionResult.unresolved.length) {
@@ -1218,9 +1239,9 @@ export function registerHandlers(r: Router, s: Services) {
     let currentTurnId: string | null = null;
     let sessionRelease: (() => void) | null = null;
     if (persistSession) {
-      sessionRelease = await s.sessions.lock.acquire(rawSessionId!);
-      await s.sessions.append(rawSessionId!, { role: 'user', content: rawUserMessage ?? '' }).catch(() => undefined);
-      currentTurnId = await s.sessions.startTurn(rawSessionId!, rawUserMessage ?? '').catch(() => null as any);
+      sessionRelease = await s.sessions.lock.acquire(sessionId);
+      await s.sessions.append(sessionId, { role: 'user', content: rawUserMessage ?? '' }).catch(() => undefined);
+      currentTurnId = await s.sessions.startTurn(sessionId, rawUserMessage ?? '').catch(() => null as any);
     }
 
     let assistantBuf = '';
@@ -1339,7 +1360,7 @@ export function registerHandlers(r: Router, s: Services) {
           if (ev.type === 'text' && ev.text) {
             assistantBuf += ev.text;
             if (persistSession && currentTurnId)
-              s.sessions.appendChunk(rawSessionId!, currentTurnId, ev.text).catch(() => undefined);
+              s.sessions.appendChunk(sessionId, currentTurnId, ev.text).catch(() => undefined);
           }
           if (ev.type === 'done' && ev.reason) agentDoneReason = ev.reason;
           sse.send(ev);
@@ -1407,7 +1428,7 @@ export function registerHandlers(r: Router, s: Services) {
             dispatchSubagent: async (req) => {
               const rr = await s.subagents.spawn({
                 task: req.task, label: req.label, role: req.role,
-                parentSessionId: rawSessionId ?? 'no-session',
+                parentSessionId: sessionId ?? 'no-session',
                 parentTurnId: currentTurnId ?? undefined,
                 parentDepth: 0,
               });
@@ -1433,12 +1454,38 @@ export function registerHandlers(r: Router, s: Services) {
           if (ev.type === 'text' && ev.text) {
             assistantBuf += ev.text;
             if (persistSession && currentTurnId)
-              s.sessions.appendChunk(rawSessionId!, currentTurnId, ev.text).catch(() => undefined);
+              s.sessions.appendChunk(sessionId, currentTurnId, ev.text).catch(() => undefined);
           }
           if (ev.type === 'tool_call' && persistSession && currentTurnId) {
-            s.sessions.appendTool(rawSessionId!, currentTurnId, {
+            s.sessions.appendTool(sessionId, currentTurnId, {
               name: (ev as any).name, args: (ev as any).args,
               result: (ev as any).result, error: (ev as any).error,
+            }).catch(() => undefined);
+            // 持久化 tool_call 消息（前端回显时需要 call-result 配对）
+            const toolName = (ev as any).name as string | undefined;
+            const toolArgs = (ev as any).args;
+            s.sessions.append(sessionId, {
+              role: 'tool',
+              content: toolName ?? '',
+              toolName,
+              uiMeta: {
+                _toolRole: 'call',
+                ...(toolName ? { _toolName: toolName } : {}),
+                ...(toolArgs ? { _toolArgs: JSON.stringify(toolArgs).slice(0, 4000) } : {}),
+              },
+            }).catch(() => undefined);
+            // 持久化 tool_result 消息
+            s.sessions.append(sessionId, {
+              role: 'tool',
+              content: (ev as any).result != null
+                ? String((ev as any).result).slice(0, 2000)
+                : (ev as any).error ? `Error: ${(ev as any).error}` : '',
+              toolName,
+              uiMeta: {
+                _toolRole: 'result',
+                ...(toolName ? { _toolName: toolName } : {}),
+                ...(toolArgs ? { _toolArgs: JSON.stringify(toolArgs).slice(0, 4000) } : {}),
+              },
             }).catch(() => undefined);
           }
           if (ev.type === 'tool_call') {
@@ -1461,7 +1508,7 @@ export function registerHandlers(r: Router, s: Services) {
       agentDoneReason = 'error';
       sse.send({ type: 'error', error: e?.message ?? String(e) });
       if (persistSession && currentTurnId)
-        await s.sessions.interruptTurn(rawSessionId!, currentTurnId, e?.message ?? String(e)).catch(() => undefined);
+        await s.sessions.interruptTurn(sessionId, currentTurnId, e?.message ?? String(e)).catch(() => undefined);
     } finally {
       // flush subagent 事件 buffer
       while (subagentEventBuffer.length > 0) {
@@ -1469,23 +1516,23 @@ export function registerHandlers(r: Router, s: Services) {
         sse.send(p);
       }
 
-      if (rawSessionId) {
-        try { await s.subagents.awaitAllForParent(rawSessionId, 60_000); } catch { /* */ }
-        const pending = s.subagents.pickPendingAnnouncements(rawSessionId);
+      if (sessionId) {
+        try { await s.subagents.awaitAllForParent(sessionId, 60_000); } catch { /* */ }
+        const pending = s.subagents.pickPendingAnnouncements(sessionId);
         for (const ann of pending) sse.send({ type: 'subagent_announce', message: ann });
         // 将 announce 注入父 session，触发 followup
         if (pending.length > 0 && persistSession) {
           for (const ann of pending) {
-            await s.sessions.append(rawSessionId!, { role: 'user', content: ann }).catch(() => undefined);
+            await s.sessions.append(sessionId, { role: 'user', content: ann }).catch(() => undefined);
           }
           sse.send({ type: 'subagent_followup', count: pending.length });
         }
       }
       if (persistSession && currentTurnId) {
         if (userAbort)
-          await s.sessions.interruptTurn(rawSessionId!, currentTurnId, 'user_stop').catch(() => undefined);
+          await s.sessions.interruptTurn(sessionId, currentTurnId, 'user_stop').catch(() => undefined);
         else
-          await s.sessions.endTurn(rawSessionId!, currentTurnId, assistantBuf).catch(() => undefined);
+          await s.sessions.endTurn(sessionId, currentTurnId, assistantBuf).catch(() => undefined);
       }
       // 释放 session 并发锁
       if (sessionRelease) {

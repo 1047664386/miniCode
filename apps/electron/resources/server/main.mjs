@@ -19237,7 +19237,33 @@ function spawnLsp(lang, cwd) {
 }
 
 // ../../packages/server-core/src/bridge/terminal-bridge.ts
-import { spawn as spawn4 } from "node:child_process";
+import { spawn as spawn4, execFile as execFile4 } from "node:child_process";
+var _cachedEnv = null;
+async function resolveShellEnv() {
+  if (_cachedEnv) return _cachedEnv;
+  const shell = process.env.SHELL || (process.platform === "win32" ? "powershell.exe" : "/bin/sh");
+  _cachedEnv = await new Promise((resolve3) => {
+    execFile4(shell, ["-ilc", "env -0"], { timeout: 1e4 }, (err, stdout) => {
+      if (err) {
+        console.warn("[terminal] failed to resolve shell env:", err.message);
+        resolve3({});
+        return;
+      }
+      const env2 = {};
+      for (const line of stdout.split("\0")) {
+        const idx = line.indexOf("=");
+        if (idx > 0) env2[line.slice(0, idx)] = line.slice(idx + 1);
+      }
+      resolve3(env2);
+    });
+  });
+  console.log(
+    "[terminal] shell env resolved (PATH entries:",
+    (_cachedEnv.PATH || "").split(":").length,
+    ")"
+  );
+  return _cachedEnv;
+}
 function attachTerminalBridge(httpServer, opts) {
   const pathPrefix = opts.path ?? "/terminal";
   const wss = new import_websocket_server.default({ noServer: true });
@@ -19261,78 +19287,95 @@ function pickShell(override) {
 }
 function handleConnection2(ws, opts) {
   let child = null;
-  try {
-    const { cmd, args } = pickShell(opts.shell);
-    child = spawn4(cmd, args, {
-      cwd: opts.cwd,
-      env: { ...process.env, TERM: "xterm-256color", COLORTERM: "truecolor" }
-    });
-    console.log(`[terminal] spawned ${cmd} (pid=${child.pid}) cwd=${opts.cwd}`);
-  } catch (e) {
-    safeSend(ws, { type: "data", data: `\r
+  let wsClosed = false;
+  ws.on("close", () => {
+    wsClosed = true;
+  });
+  resolveShellEnv().then((resolvedEnv) => {
+    if (wsClosed) return;
+    try {
+      const { cmd, args } = pickShell(opts.shell);
+      child = spawn4(cmd, args, {
+        cwd: opts.cwd,
+        env: {
+          ...process.env,
+          // 基础环境（保底）
+          ...resolvedEnv,
+          // login shell 解析出的完整 PATH 等
+          TERM: "xterm-256color",
+          COLORTERM: "truecolor",
+          // pipe 模式不支持 job control，禁用 gitstatus 避免 setopt monitor 报错
+          GITSTATUS_DISABLE: "1",
+          POWERLEVEL9K_DISABLE_GITSTATUS: "true"
+        }
+      });
+      console.log(`[terminal] spawned ${cmd} (pid=${child.pid}) cwd=${opts.cwd}`);
+    } catch (e) {
+      safeSend(ws, { type: "data", data: `\r
 [terminal] failed to spawn shell: ${e?.message ?? e}\r
 ` });
-    ws.close(1011, "spawn failed");
-    return;
-  }
-  child.on("error", (err) => {
-    safeSend(ws, { type: "data", data: `\r
-[terminal] shell error: ${err.message}\r
-` });
-  });
-  ws.on("message", (raw) => {
-    if (!child) return;
-    let msg;
-    try {
-      msg = JSON.parse(typeof raw === "string" ? raw : raw.toString("utf-8"));
-    } catch {
+      ws.close(1011, "spawn failed");
       return;
     }
-    switch (msg.type) {
-      case "input": {
-        if (child.stdin.writable && typeof msg.data === "string") {
+    child.on("error", (err) => {
+      safeSend(ws, { type: "data", data: `\r
+[terminal] shell error: ${err.message}\r
+` });
+    });
+    ws.on("message", (raw) => {
+      if (!child) return;
+      let msg;
+      try {
+        msg = JSON.parse(typeof raw === "string" ? raw : raw.toString("utf-8"));
+      } catch {
+        return;
+      }
+      switch (msg.type) {
+        case "input": {
+          if (child.stdin.writable && typeof msg.data === "string") {
+            try {
+              child.stdin.write(msg.data);
+            } catch {
+            }
+          }
+          break;
+        }
+        case "signal": {
           try {
-            child.stdin.write(msg.data);
+            child.kill(msg.sig === "SIGTERM" ? "SIGTERM" : "SIGINT");
           } catch {
           }
+          break;
         }
-        break;
-      }
-      case "signal": {
-        try {
-          child.kill(msg.sig === "SIGTERM" ? "SIGTERM" : "SIGINT");
-        } catch {
+        case "resize": {
+          break;
         }
-        break;
       }
-      case "resize": {
-        break;
+    });
+    const forward = (data) => {
+      safeSend(ws, { type: "data", data: data.toString("utf-8") });
+    };
+    child.stdout.on("data", forward);
+    child.stderr.on("data", forward);
+    child.on("exit", (code) => {
+      safeSend(ws, { type: "exit", code: code ?? 0 });
+      try {
+        ws.close();
+      } catch {
       }
-    }
-  });
-  const forward = (data) => {
-    safeSend(ws, { type: "data", data: data.toString("utf-8") });
-  };
-  child.stdout.on("data", forward);
-  child.stderr.on("data", forward);
-  child.on("exit", (code) => {
-    safeSend(ws, { type: "exit", code: code ?? 0 });
-    try {
-      ws.close();
-    } catch {
-    }
-  });
-  ws.on("close", () => {
-    try {
-      child?.kill();
-    } catch {
-    }
-  });
-  ws.on("error", () => {
-    try {
-      child?.kill();
-    } catch {
-    }
+    });
+    ws.on("error", () => {
+      try {
+        child?.kill();
+      } catch {
+      }
+    });
+    ws.on("close", () => {
+      try {
+        child?.kill();
+      } catch {
+      }
+    });
   });
 }
 function safeSend(ws, obj) {

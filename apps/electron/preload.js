@@ -55,13 +55,18 @@ if (location.protocol === 'file:') {
     window.EventSource = PatchedES;
   }
 
-  // WebSocket：lsp 用了 ws://
+  // WebSocket：lsp / terminal 等用了 ws://
   if (typeof window.WebSocket === 'function') {
     const OrigWS = window.WebSocket;
     function PatchedWS(url, protocols) {
-      // /lsp/xxx 之类的相对 ws 路径 → 实际 server 在 5174
-      if (typeof url === 'string' && (url.startsWith('/lsp') || url.startsWith('/ws'))) {
+      // 相对路径形式（如 /lsp/xxx、/terminal）→ 实际 server 在 5174
+      if (typeof url === 'string' && url.startsWith('/')) {
         url = SERVER_BASE.replace('http://', 'ws://') + url;
+      }
+      // file:// 协议下产生的无效 ws:///path 形式也要修复
+      else if (typeof url === 'string' && url.startsWith('ws:///')) {
+        const wsPath = url.slice(5); // 提取 /path 部分
+        url = SERVER_BASE.replace('http://', 'ws://') + wsPath;
       }
       return protocols ? new OrigWS(url, protocols) : new OrigWS(url);
     }

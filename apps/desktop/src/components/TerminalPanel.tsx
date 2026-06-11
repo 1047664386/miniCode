@@ -92,55 +92,79 @@ export function TerminalPanel({ visible }: { visible: boolean }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // 建连
+  // 建连：自己构造正确的 WebSocket URL，不完全依赖 preload 补丁
   useEffect(() => {
     if (!visible) return;
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const url = `${proto}://${location.host}/terminal`;
     let closed = false;
-    const ws = new WebSocket(url);
-    wsRef.current = ws;
-    ws.onopen = () => {
-      if (closed) return;
-      setStatus('open');
-    };
-    ws.onmessage = (ev) => {
+    let ws: WebSocket | null = null;
+
+    // 异步获取 server URL 再建连，兼容 file:// 协议
+    (async () => {
+      let wsUrl: string;
       try {
-        const msg: Msg = JSON.parse(typeof ev.data === 'string' ? ev.data : '');
-        if (msg.type === 'data') {
-          const segs = parseAnsi(msg.data, styleRef.current);
-          if (segs.length) styleRef.current = { ...segs[segs.length - 1], text: '' };
-          setOutput((prev) => {
-            const merged = [...prev, ...segs];
-            // 估算行数，超量截
-            let lines = 0;
-            for (const s of merged) lines += (s.text.match(/\n/g)?.length ?? 0);
-            if (lines > MAX_LINES) {
-              // 简单丢弃前 25%
-              return merged.slice(Math.floor(merged.length / 4));
-            }
-            return merged;
-          });
-        } else if (msg.type === 'exit') {
-          setOutput((p) => [
-            ...p,
-            { text: `\n[process exited with code ${msg.code}]\n`, fg: '#888' },
-          ]);
+        const electronAPI = (window as any).electronAPI;
+        if (electronAPI?.getServerUrl) {
+          // Electron 环境（preload 可用）：通过 IPC 拿 server 地址
+          const serverUrl: string = await electronAPI.getServerUrl();
+          wsUrl = serverUrl.replace(/^http/, 'ws') + '/terminal';
+        } else {
+          // 纯浏览器环境
+          const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+          wsUrl = `${proto}://${location.host}/terminal`;
         }
       } catch {
-        /* */
+        // fallback
+        const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+        wsUrl = `${proto}://${location.host}/terminal`;
       }
-    };
-    ws.onclose = () => {
-      if (!closed) setStatus('closed');
-    };
-    ws.onerror = () => {
-      if (!closed) setStatus('closed');
-    };
+
+      // 如果在等 async 期间组件已经卸载，不再建连
+      if (closed) return;
+
+      ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (closed) return;
+        setStatus('open');
+      };
+      ws.onmessage = (ev) => {
+        try {
+          const msg: Msg = JSON.parse(typeof ev.data === 'string' ? ev.data : '');
+          if (msg.type === 'data') {
+            const segs = parseAnsi(msg.data, styleRef.current);
+            if (segs.length) styleRef.current = { ...segs[segs.length - 1], text: '' };
+            setOutput((prev) => {
+              const merged = [...prev, ...segs];
+              let lines = 0;
+              for (const s of merged) lines += (s.text.match(/\n/g)?.length ?? 0);
+              if (lines > MAX_LINES) {
+                return merged.slice(Math.floor(merged.length / 4));
+              }
+              return merged;
+            });
+          } else if (msg.type === 'exit') {
+            setOutput((p) => [
+              ...p,
+              { text: `\n[process exited with code ${msg.code}]\n`, fg: '#888' },
+            ]);
+          }
+        } catch {
+          /* */
+        }
+      };
+      ws.onclose = () => {
+        if (!closed) setStatus('closed');
+      };
+      ws.onerror = () => {
+        if (!closed) setStatus('closed');
+      };
+    })();
+
     return () => {
       closed = true;
       try {
-        ws.close();
+        ws?.close();
       } catch {
         /* */
       }

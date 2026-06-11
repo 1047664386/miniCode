@@ -17,7 +17,7 @@
  *   工作区默认放 ~/MiniCodeIDE（用户可在 UI 改）
  */
 const { app, BrowserWindow, dialog, ipcMain, shell, globalShortcut } = require('electron');
-const { spawn } = require('node:child_process');
+const { spawn, execFile } = require('node:child_process');
 const path = require('node:path');
 const fs = require('node:fs');
 const http = require('node:http');
@@ -32,6 +32,36 @@ process.stdout?.on('error', (err) => {
   if (err.code === 'EPIPE') return; // 管道断开，安全忽略
 });
 
+/**
+ * 解析用户 login shell 的完整环境变量。
+ * macOS GUI 应用（Launchpad / Dock / Spotlight 启动）继承的 PATH 极精简，
+ * 导致 git、npm、pnpm 等工具找不到。这里用和 VS Code 相同的方案：
+ * 启动 login shell 跑一次 env，拿到完整 PATH 后缓存。
+ */
+let _resolvedShellEnv = null;
+function resolveShellEnv() {
+  if (_resolvedShellEnv) return Promise.resolve(_resolvedShellEnv);
+  const shell = process.env.SHELL || '/bin/sh';
+  _resolvedShellEnv = new Promise((resolve) => {
+    execFile(shell, ['-ilc', 'env -0'], { timeout: 10_000 }, (err, stdout) => {
+      if (err) {
+        console.warn('[electron] failed to resolve shell env:', err.message);
+        resolve({});
+        return;
+      }
+      const env = {};
+      for (const line of stdout.split('\0')) {
+        const idx = line.indexOf('=');
+        if (idx > 0) env[line.slice(0, idx)] = line.slice(idx + 1);
+      }
+      console.log('[electron] shell env resolved (PATH entries:',
+        (env.PATH || '').split(':').length, ')');
+      resolve(env);
+    });
+  });
+  return _resolvedShellEnv;
+}
+
 const IS_DEV = process.env.ELECTRON_DEV === '1';
 const SERVER_PORT = Number(process.env.MINI_PORT ?? 5174);
 const VSCODE_PORT = Number(process.env.VSCODE_PORT ?? 8000);
@@ -44,17 +74,17 @@ let codeServerProcess = null;
 let mainWindow = null;
 
 // ----- Server 子进程 -----
-function startServer() {
+async function startServer() {
   if (IS_DEV) {
     console.log('[electron] DEV mode — assuming server is already running on', SERVER_PORT);
-    return Promise.resolve();
+    return;
   }
   const serverEntry = path.join(process.resourcesPath, 'server', 'main.mjs');
   if (!fs.existsSync(serverEntry)) {
     console.error('[electron] server entry not found:', serverEntry);
     dialog.showErrorBox('Startup failed', `Server bundle missing at ${serverEntry}`);
     app.quit();
-    return Promise.reject(new Error('server bundle missing'));
+    throw new Error('server bundle missing');
   }
   // 用户工作区：用户配置 > 默认
   let workspace = DEFAULT_WORKSPACE;
@@ -69,10 +99,14 @@ function startServer() {
   }
   fs.mkdirSync(workspace, { recursive: true });
 
+  // 解析 login shell 的完整环境，确保 git/npm/pnpm 在 PATH 中
+  const shellEnv = await resolveShellEnv();
+
   console.log('[electron] starting server, workspace:', workspace);
   serverProcess = spawn(process.execPath, [serverEntry], {
     env: {
       ...process.env,
+      ...shellEnv,           // login shell 解析出的完整 PATH 等
       PORT: String(SERVER_PORT),
       WORKSPACE: workspace,
       // 默认开 json 日志（方便 Electron 主进程采集到 stdout 后转发到日志文件）

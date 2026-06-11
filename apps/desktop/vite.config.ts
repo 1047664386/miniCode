@@ -25,6 +25,18 @@ export default defineConfig({
         proxyTimeout: 120_000,
         timeout: 120_000,
       },
+      // WebSocket 代理：终端
+      '/terminal': {
+        target: 'http://localhost:5175',
+        changeOrigin: true,
+        ws: true,
+      },
+      // WebSocket 代理：LSP
+      '/lsp': {
+        target: 'http://localhost:5175',
+        changeOrigin: true,
+        ws: true,
+      },
     },
   },
 });
